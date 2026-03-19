@@ -491,7 +491,7 @@ def get_html_setup_page():
         <h1>MetarMap Setup</h1>
         <div class="info-box">
             <p><strong>Same settings as the app.</strong> Leave WiFi blank to update display/brightness (device reboots to apply). Fill WiFi + tap Save &amp; Restart to set network and reboot.</p>
-            <p><strong>IP:</strong> 192.168.4.1 &nbsp;|&nbsp; <a href="/">Setup</a> &nbsp; <a href="/page/airports">Airports</a> &nbsp; <a href="/page/weather">Weather</a> &nbsp; <a href="/page/help">Help</a></p>
+            <p><strong>IP:</strong> 192.168.4.1 &nbsp;|&nbsp; <a href="/">Setup</a> &nbsp; <a href="/page/airports">Airports</a> &nbsp; <a href="/page/weather">Weather</a> &nbsp; <a href="/page/help">Help</a> &nbsp; <a href="/page/update">Update</a></p>
         </div>
         <form action="/configure" method="post">
             <div class="config-section">
@@ -659,7 +659,7 @@ def get_html_airports_page():
     .note{font-size:12px;color:#666;margin-top:5px;} #msg{margin-top:10px;font-weight:bold;}
     </style></head><body>
     <h1>Airports</h1>
-    <div class="nav"><a href="/">Setup</a> <a href="/page/airports">Airports</a> <a href="/page/weather">Weather</a> <a href="/page/help">Help</a></div>
+    <div class="nav"><a href="/">Setup</a> <a href="/page/airports">Airports</a> <a href="/page/weather">Weather</a> <a href="/page/help">Help</a> <a href="/page/update">Update</a></div>
     <p class="note">One airport code per line (3-4 letters/digits, e.g. KORD, LAX, 0A0). Order = LED order. Use empty line or SKIP for a blank slot.</p>
     <button type="button" class="btn" onclick="fetchList()">Fetch from MetarMap</button>
     <form id="f" onsubmit="return saveList(event)">
@@ -699,7 +699,7 @@ def get_html_weather_page():
     #msg{margin-top:10px;font-weight:bold;} .note{font-size:12px;color:#666;}
     </style></head><body>
     <h1>Weather conditions</h1>
-    <div class="nav"><a href="/">Setup</a> <a href="/page/airports">Airports</a> <a href="/page/weather">Weather</a> <a href="/page/help">Help</a></div>
+    <div class="nav"><a href="/">Setup</a> <a href="/page/airports">Airports</a> <a href="/page/weather">Weather</a> <a href="/page/help">Help</a> <a href="/page/update">Update</a></div>
     <p class="note">ON = this condition can light the LEDs. OFF = effect disabled.</p>
     <div id="toggles"></div>
     <button type="button" class="btn" onclick="saveWeather()">Save</button>
@@ -739,7 +739,7 @@ def get_html_help_page():
     ul{margin:8px 0;padding-left:20px;} p{margin:8px 0;}
     </style></head><body>
     <h1>Help &amp; Instructions</h1>
-    <div class="nav"><a href="/">Setup</a> <a href="/page/airports">Airports</a> <a href="/page/weather">Weather</a> <a href="/page/help">Help</a></div>
+    <div class="nav"><a href="/">Setup</a> <a href="/page/airports">Airports</a> <a href="/page/weather">Weather</a> <a href="/page/help">Help</a> <a href="/page/update">Update</a></div>
     <div class="card"><h3>Quick start</h3>
     <p>1. Connect to the MetarMap WiFi (e.g. MetarMap-Setup).<br>2. Setup: enter WiFi name and password, tap Save &amp; Restart (or leave blank to only change display).<br>3. Airports: add codes (e.g. KORD, LAX), Save to MetarMap.<br>Done.</p></div>
     <div class="card"><h3>What is a MetarMap?</h3>
@@ -758,6 +758,23 @@ def get_html_help_page():
     <p><b>NO DATA AFTER 180 SEC:</b> Check WiFi and internet; power-cycle router and device.</p>
     <p><b>Some airports never show data:</b> API may not have that station; try removing or replacing the code.</p>
     <p><b>Matrix text wrong:</b> Try a different Matrix layout in Setup.</p></div>
+    </body></html>"""
+    return html
+
+def get_html_update_page():
+    html = """<!DOCTYPE html>
+    <html><head><meta name="viewport" content="width=device-width"><title>MetarMap Update</title>
+    <style>body{font-family:Arial;margin:12px;} .nav{margin-bottom:12px;} a{margin-right:8px;}
+    .card{background:#f5f5f5;padding:12px;margin:8px 0;border-radius:6px;}
+    button{background:#0d6efd;color:#fff;border:none;padding:10px 16px;border-radius:6px;font-size:16px;}
+    </style></head><body>
+    <h1>MetarMap firmware update</h1>
+    <div class="nav"><a href="/">Setup</a> <a href="/page/airports">Airports</a> <a href="/page/weather">Weather</a> <a href="/page/help">Help</a> <a href="/page/update">Update</a></div>
+    <div class="card">
+    <p><b>When MetarMap is connected to your WiFi</b> (after Save &amp; Reboot), open <code>http://&lt;pico-ip&gt;:8080</code> in a browser or use the app&apos;s &quot;Install update&quot; button. The device must have internet to download.</p>
+    <p>From this page (AP mode): try Install update below. It only works if the Pico has internet access.</p>
+    <form method="post" action="/start-update"><button type="submit">Install update now</button></form>
+    </div>
     </body></html>"""
     return html
 
@@ -898,6 +915,30 @@ def run_server():
                 conn.send('HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: ' + str(len(page)) + '\r\n\r\n')
                 conn.sendall(page)
                 conn.close()
+            elif first_line.startswith("GET ") and "/page/update" in first_line:
+                page = get_html_update_page()
+                conn.send('HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: ' + str(len(page)) + '\r\n\r\n')
+                conn.sendall(page)
+                conn.close()
+            elif first_line.startswith("POST ") and "/start-update" in first_line:
+                print("Handling POST /start-update - OTA install from browser/app")
+                try:
+                    import updater
+                    ok = updater.install_latest()
+                    if ok:
+                        send_json_response(conn, True, 'Installing update; device will reboot.')
+                        conn.close()
+                        set_leds(10, 0, 10)
+                        time.sleep(2)
+                        clear_leds()
+                        machine.reset()
+                    else:
+                        send_json_response(conn, False, 'Update failed (no internet or download error). Connect Pico to WiFi and use http://<pico-ip>:8080 or the app.')
+                        conn.close()
+                except Exception as e:
+                    print("start-update error:", e)
+                    send_json_response(conn, False, 'Update error: ' + str(e))
+                    conn.close()
             elif first_line.startswith("GET ") and "/airports" in first_line:
                 print("Handling GET /airports - fetch airport list from Pico")
                 try:

@@ -58,10 +58,18 @@ BATCH_SIZE = 5  # Reduced from 5 for better memory management
 BATCH_DELAY = 1  # Delay between batches in seconds
 CYCLE_DELAY = 10  # Seconds between full airport list cycles; loaded from config
 
+# ===== FIRMWARE VERSION (for OTA update check) =====
+FIRMWARE_VERSION = "1.0.0"
+
+# ===== OTA UPDATE BUTTON (GPIO for "install update"); set -1 to use app/browser only =====
+UPDATE_BUTTON_PIN = -1
+
 # ===== DATA TIMEOUT SETTINGS =====
 NO_DATA_TIMEOUT = 180  #  without any data before showing warning
 last_successful_data_time = None  # Track when we last got ANY airport data
 no_data_warning_active = False  # Track if we're currently showing the warning
+update_available = False  # Set True when OTA check finds newer version
+update_info = None  # Parsed version.json when update_available
 
 # ===== MATRIX WIRING PATTERN =====
 # CHANGE THIS TO THE PATTERN THAT WORKED FOR YOU:
@@ -256,7 +264,7 @@ except Exception as e:
 
 # WS2811 LED configuration
 LED_PIN = 0
-NUM_LEDS = 5
+NUM_LEDS = 200
 
 try:
     led = neopixel.NeoPixel(machine.Pin(LED_PIN), NUM_LEDS)
@@ -1452,6 +1460,20 @@ try:
             process_airports_in_batches(airports, process_first_pass, description="First pass")
     process_airports_in_batches(airports, process_second_pass, description="Second pass")
 
+    # OTA: check for new firmware once per boot; scroll message if available
+    try:
+        import updater
+        has_update, version_info = updater.check_for_new_version(FIRMWARE_VERSION)
+        if has_update and version_info:
+            update_available = True
+            update_info = version_info
+            print("OTA: New version available", version_info.get("version"))
+            if led_matrix is not None and DISPLAY_TYPE == "LED_MATRIX":
+                msg_color = apply_auto_brightness((255, 140, 0))
+                scroll_single_text_ultra_smooth("NEW UPDATE AVAILABLE PRESS BUTTON TO INSTALL", msg_color)
+    except Exception as e:
+        print("OTA check error:", e)
+
     # NTP sync once for sleep schedule (time.localtime())
     ntptime_synced = False
     def maybe_sync_ntp():
@@ -1493,7 +1515,63 @@ try:
             print("Sleep clear err:", e)
 
     displays_sleeping = False
+    update_button = None
+    if UPDATE_BUTTON_PIN >= 0:
+        try:
+            update_button = Pin(UPDATE_BUTTON_PIN, Pin.IN, Pin.PULL_UP)
+        except Exception:
+            update_button = None
+
+    # OTA: HTTP server on port 8080 so app/browser can trigger install (when on same network)
+    update_socket = None
+    try:
+        update_socket = socket.socket()
+        update_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        update_socket.bind(("0.0.0.0", 8080))
+        update_socket.listen(1)
+        update_socket.settimeout(0.1)
+        print("OTA update server on port 8080")
+    except Exception as e:
+        print("OTA server failed:", e)
+        update_socket = None
+
+    UPDATE_PAGE_HTML = """<!DOCTYPE html><html><head><meta name="viewport" content="width=device-width"><title>MetarMap Update</title></head><body><h1>MetarMap</h1><p>Install latest firmware from GitHub.</p><form method="post" action="/start-update"><button type="submit">Install update</button></form><p><small>Device will reboot and apply after download.</small></p></body></html>"""
+
     while True:
+        # OTA: if update available and button pressed, install now
+        if update_available and update_info and update_button is not None:
+            if update_button.value() == 0:
+                time.sleep_ms(50)
+                if update_button.value() == 0:
+                    try:
+                        import updater
+                        updater.install_pending_update(update_info)
+                    except Exception as e:
+                        print("OTA install error:", e)
+        # OTA: handle HTTP request on port 8080 (app or browser)
+        if update_socket is not None:
+            try:
+                conn, _ = update_socket.accept()
+                conn.settimeout(5.0)
+                req = conn.recv(1024).decode("utf-8", "ignore")
+                first = req.split("\n")[0].strip() if req else ""
+                if first.startswith("POST ") and "/start-update" in first:
+                    if update_available and update_info:
+                        conn.send(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nInstalling...")
+                        conn.close()
+                        import updater
+                        updater.install_pending_update(update_info)
+                    else:
+                        conn.send(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nNo update available.")
+                        conn.close()
+                else:
+                    conn.send(b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n")
+                    conn.send(UPDATE_PAGE_HTML.encode("utf-8"))
+                    conn.close()
+            except OSError:
+                pass
+            except Exception as e:
+                print("OTA server handle:", e)
         check_ldr_and_refresh()
         maybe_sync_ntp()
         ensure_wifi_connected()
