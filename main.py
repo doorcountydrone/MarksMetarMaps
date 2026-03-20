@@ -11,13 +11,6 @@ import ssd1306
 import framebuf
 import os  # Added missing import
 
-# --- RUNNING FROM THONNY vs POWER CYCLE ---
-# Thonny's REPL and IDE connection use extra RAM and can fragment the heap.
-# That often causes ENOMEM (out of memory) when fetching METAR over HTTPS.
-# For reliable operation: save this file in Thonny, then unplug/replug the
-# Pico (or press reset) so it boots without Thonny. Same code runs with more
-# free memory and no REPL overhead.
-
 machine.freq(230_000_000)
 
 # Import brightness settings from wifi_manager
@@ -59,6 +52,8 @@ BATCH_DELAY = 1  # Delay between batches in seconds
 CYCLE_DELAY = 10  # Seconds between full airport list cycles; loaded from config
 
 # ===== FIRMWARE VERSION (for OTA update check) =====
+# Device reports this string; GitHub Pages version.json "version" must be higher to offer OTA.
+# After you flash new code, this should match what you published (or stay lower until user updates).
 FIRMWARE_VERSION = "1.0.0"
 
 # ===== OTA UPDATE BUTTON (GPIO for "install update"); set -1 to use app/browser only =====
@@ -1191,7 +1186,7 @@ def get_weather_conditions_with_retry(raw_text, airport, led, index, min_brightn
                             led.write()
                             time.sleep(.5)
                         if weather_enabled.get("CLR", True) and any(conditions_present[14:15]):
-                            num_steps = 1000
+                            num_steps = 600
                             white_color = (255, 255, 255)
                             green_color = (0, 255, 0)
                             step_size = tuple((b - w) / num_steps for w, b in zip(white_color, green_color))
@@ -1332,6 +1327,7 @@ if not connect_to_wifi(WIFI_SSID, WIFI_PASSWORD):
 sync_ntp_once()
 flight_categories = {}
 last_successful_data_time = time.time()
+print(f"Firmware version: {FIRMWARE_VERSION}")
 print(f"Data timeout monitoring started. Timeout: {NO_DATA_TIMEOUT} seconds")
 
 print("\n=== Testing auto-brightness ===")
@@ -1425,6 +1421,26 @@ def process_main_loop_batch(batch_airports, batch_start_index):
     return any_data_received
 
 try:
+    # OTA: check before long METAR batches so serial shows result within seconds of WiFi
+    print("OTA: checking GitHub Pages for newer firmware...")
+    try:
+        import updater
+        gc.collect()
+        has_update, version_info = updater.check_for_new_version(FIRMWARE_VERSION)
+        if has_update and version_info:
+            update_available = True
+            update_info = version_info
+            print("OTA: New version available", version_info.get("version"))
+            if led_matrix is not None and DISPLAY_TYPE == "LED_MATRIX":
+                msg_color = apply_auto_brightness((255, 140, 0))
+                scroll_single_text_ultra_smooth("NEW UPDATE AVAILABLE PRESS BUTTON TO INSTALL", msg_color)
+    except SyntaxError as e:
+        print("OTA check error: invalid syntax in updater.py — re-copy pico/updater.py to the Pico.")
+        print(e)
+    except Exception as e:
+        print("OTA check error:", e)
+    gc.collect()
+
     current_ldr_brightness = map_ldr_to_brightness(read_ldr_value(), MIN_BRIGHTNESS, MAX_BRIGHTNESS)
     last_ldr_refresh_time = time.time()
     bulk_ok = False
@@ -1459,20 +1475,6 @@ try:
         if not MATRIX_ONLY:
             process_airports_in_batches(airports, process_first_pass, description="First pass")
     process_airports_in_batches(airports, process_second_pass, description="Second pass")
-
-    # OTA: check for new firmware once per boot; scroll message if available
-    try:
-        import updater
-        has_update, version_info = updater.check_for_new_version(FIRMWARE_VERSION)
-        if has_update and version_info:
-            update_available = True
-            update_info = version_info
-            print("OTA: New version available", version_info.get("version"))
-            if led_matrix is not None and DISPLAY_TYPE == "LED_MATRIX":
-                msg_color = apply_auto_brightness((255, 140, 0))
-                scroll_single_text_ultra_smooth("NEW UPDATE AVAILABLE PRESS BUTTON TO INSTALL", msg_color)
-    except Exception as e:
-        print("OTA check error:", e)
 
     # NTP sync once for sleep schedule (time.localtime())
     ntptime_synced = False
@@ -1537,18 +1539,25 @@ try:
 
     UPDATE_PAGE_HTML = """<!DOCTYPE html><html><head><meta name="viewport" content="width=device-width"><title>MetarMap Update</title></head><body><h1>MetarMap</h1><p>Install latest firmware from GitHub.</p><form method="post" action="/start-update"><button type="submit">Install update</button></form><p><small>Device will reboot and apply after download.</small></p></body></html>"""
 
-    while True:
-        # OTA: if update available and button pressed, install now
-        if update_available and update_info and update_button is not None:
+    def service_ota_http_and_button():
+        """OTA button + port 8080. Call often (including during METAR batch waits) so app/browser are not starved."""
+        if update_button is not None and update_button.value() == 0:
+            # Physical button: re-check version if boot-time check didn't set update_available.
             if update_button.value() == 0:
                 time.sleep_ms(50)
                 if update_button.value() == 0:
                     try:
                         import updater
-                        updater.install_pending_update(update_info)
+                        if update_available and update_info:
+                            updater.install_pending_update(update_info)
+                        else:
+                            has_update, version_info = updater.check_for_new_version(FIRMWARE_VERSION)
+                            if has_update and version_info:
+                                updater.install_pending_update(version_info)
+                            else:
+                                print("OTA button: no update available")
                     except Exception as e:
                         print("OTA install error:", e)
-        # OTA: handle HTTP request on port 8080 (app or browser)
         if update_socket is not None:
             try:
                 conn, _ = update_socket.accept()
@@ -1556,14 +1565,33 @@ try:
                 req = conn.recv(1024).decode("utf-8", "ignore")
                 first = req.split("\n")[0].strip() if req else ""
                 if first.startswith("POST ") and "/start-update" in first:
-                    if update_available and update_info:
-                        conn.send(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nInstalling...")
-                        conn.close()
+                    try:
                         import updater
-                        updater.install_pending_update(update_info)
-                    else:
-                        conn.send(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nNo update available.")
-                        conn.close()
+                        # Re-check on-demand so the app doesn't depend on boot-time update_available.
+                        if update_available and update_info:
+                            has_update = True
+                            version_info = update_info
+                        else:
+                            has_update, version_info = updater.check_for_new_version(FIRMWARE_VERSION)
+                        if has_update and version_info:
+                            conn.send(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nInstalling...")
+                            try:
+                                conn.flush()
+                            except Exception:
+                                pass
+                            time.sleep_ms(200)
+                            conn.close()
+                            updater.install_pending_update(version_info)
+                        else:
+                            conn.send(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nNo update available.")
+                            conn.close()
+                    except Exception as e:
+                        print("OTA POST /start-update error:", e)
+                        try:
+                            conn.send(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nUpdate error.")
+                            conn.close()
+                        except Exception:
+                            pass
                 else:
                     conn.send(b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n")
                     conn.send(UPDATE_PAGE_HTML.encode("utf-8"))
@@ -1572,6 +1600,18 @@ try:
                 pass
             except Exception as e:
                 print("OTA server handle:", e)
+
+    def sleep_with_ota_poll(total_seconds):
+        """Sleep in short slices while servicing OTA HTTP (so POST /start-update is not blocked by long waits)."""
+        remaining = float(total_seconds)
+        while remaining > 0:
+            service_ota_http_and_button()
+            chunk = 0.25 if remaining >= 0.25 else remaining
+            time.sleep(chunk)
+            remaining -= chunk
+
+    while True:
+        service_ota_http_and_button()
         check_ldr_and_refresh()
         maybe_sync_ntp()
         ensure_wifi_connected()
@@ -1581,7 +1621,7 @@ try:
                 displays_sleeping = True
                 t = local_time()
                 print("Current time (local): %04d-%02d-%02d %02d:%02d:%02d - Display sleep: off until %02d:%02d" % (t[0], t[1], t[2], t[3], t[4], t[5], WAKE_AT_HOUR, WAKE_AT_MIN))
-            time.sleep(CYCLE_DELAY)
+            sleep_with_ota_poll(CYCLE_DELAY)
             continue
         just_woke_from_sleep = displays_sleeping
         displays_sleeping = False
@@ -1594,17 +1634,18 @@ try:
             print("NO DATA warning active - displaying warning and checking connection...")
             ensure_wifi_connected()
             display_no_data_warning()
-            time.sleep(5)
+            sleep_with_ota_poll(5)
             continue
         elif no_data_warning_active and DISPLAY_TYPE != "LED_MATRIX":
             print("NO DATA warning active (no display to show warning)")
             ensure_wifi_connected()
-            time.sleep(5)
+            sleep_with_ota_poll(5)
             continue
         any_data_received = False
         total_airports = len(airports)
         num_batches = (total_airports + BATCH_SIZE - 1) // BATCH_SIZE
         for batch_num in range(num_batches):
+            service_ota_http_and_button()
             batch_start = batch_num * BATCH_SIZE
             batch_end = min(batch_start + BATCH_SIZE, total_airports)
             batch_airports = airports[batch_start:batch_end]
@@ -1615,13 +1656,13 @@ try:
             print(f"Free memory after batch: {gc.mem_free()} bytes")
             if batch_num < num_batches - 1:
                 print(f"Waiting {BATCH_DELAY} seconds before next batch...")
-                time.sleep(BATCH_DELAY)
+                sleep_with_ota_poll(BATCH_DELAY)
         if not any_data_received:
             print("No data received for any airport in this cycle")
             check_data_timeout()
         print(f"\nCompleted full cycle of {len(airports)} airports")
         print(f"Waiting {CYCLE_DELAY} seconds before next cycle...")
-        time.sleep(CYCLE_DELAY)
+        sleep_with_ota_poll(CYCLE_DELAY)
 
 except Exception as main_exception:
     print("Main script exception:", main_exception)
@@ -1642,3 +1683,5 @@ finally:
             led_matrix.write()
     except:
         pass
+
+
