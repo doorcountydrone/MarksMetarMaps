@@ -490,19 +490,22 @@ def get_html_setup_page():
     <body>
         <h1>MetarMap Setup</h1>
         <div class="info-box">
-            <p><strong>Same settings as the app.</strong> Leave WiFi blank to update display/brightness (device reboots to apply). Fill WiFi + tap Save &amp; Restart to set network and reboot.</p>
+            <p><strong>MetarMap setup Wi‑Fi (connect your phone here):</strong> SSID <strong>""" + AP_SSID + """</strong> &mdash; password <strong>""" + AP_PASSWORD + """</strong> (defaults in this firmware; edit <code>wifi_manager.py</code> if you changed them).</p>
+            <p><strong>Same settings as the app.</strong> The fields below are your <em>home router</em> Wi‑Fi for the Pico to join, not the AP password above. Leave WiFi blank to update display/brightness (device reboots to apply). Fill WiFi + tap Save &amp; Restart to set network and reboot.</p>
             <p><strong>IP:</strong> 192.168.4.1 &nbsp;|&nbsp; <a href="/">Setup</a> &nbsp; <a href="/page/airports">Airports</a> &nbsp; <a href="/page/weather">Weather</a> &nbsp; <a href="/page/help">Help</a> &nbsp; <a href="/page/update">Update</a></p>
         </div>
         <form action="/configure" method="post">
             <div class="config-section">
-                <div class="section-title">WiFi (optional)</div>
+                <div class="section-title">Home Wi‑Fi (optional)</div>
                 <div class="form-group">
-                    <label for="ssid">WiFi network (SSID)</label>
-                    <input type="text" id="ssid" name="ssid" placeholder="Leave blank to only change display settings">
+                    <label for="ssid">Router network name (SSID)</label>
+                    <input type="text" id="ssid" name="ssid" placeholder="Your home/office router—not """ + AP_SSID + """">
+                    <div class="note">The network MetarMap should join after setup—not the MetarMap AP password.</div>
                 </div>
                 <div class="form-group">
-                    <label for="password">WiFi password</label>
-                    <input type="password" id="password" name="password" placeholder="Leave blank for display-only">
+                    <label for="password">Router Wi‑Fi password</label>
+                    <input type="password" id="password" name="password" placeholder="Router password—not """ + AP_PASSWORD + """ unless that is your router password">
+                    <div class="note">Password for your router above, not the setup AP password (unless they match by coincidence).</div>
                 </div>
             </div>
             <div class="config-section">
@@ -741,11 +744,14 @@ def get_html_help_page():
     <h1>Help &amp; Instructions</h1>
     <div class="nav"><a href="/">Setup</a> <a href="/page/airports">Airports</a> <a href="/page/weather">Weather</a> <a href="/page/help">Help</a> <a href="/page/update">Update</a></div>
     <div class="card"><h3>Quick start</h3>
-    <p>1. Connect to the MetarMap WiFi (e.g. MetarMap-Setup).<br>2. Setup: enter WiFi name and password, tap Save &amp; Restart (or leave blank to only change display).<br>3. Airports: add codes (e.g. KORD, LAX), Save to MetarMap.<br>Done.</p></div>
+    <p>1. Join MetarMap setup Wi‑Fi: SSID <strong>""" + AP_SSID + """</strong>, password <strong>""" + AP_PASSWORD + """</strong> (unless you changed AP in firmware).<br>2. Setup: enter your <em>home router</em> name and password—not the AP password—then Save &amp; Restart (or leave blank to only change display).<br>3. Airports: add codes (e.g. KORD, LAX), Save to MetarMap.<br>Done.</p></div>
     <div class="card"><h3>What is a MetarMap?</h3>
     <p>MetarMap is a hardware project with a Raspberry Pi Pico W. It fetches real-time aviation weather (METAR), shows flight categories (VFR/MVFR/IFR/LIFR) and weather on an LED strip and optional matrix/OLED. On startup it shows all airports' flight categories at once for a few seconds, then cycles with weather effects.</p></div>
     <div class="card"><h3>Setup (WiFi / display)</h3>
+    <p><strong>Router vs AP:</strong> The WiFi fields on Setup are your <em>router</em> credentials so the Pico can reach the internet—not the password for joining <strong>""" + AP_SSID + """</strong> on your phone (default AP password: <strong>""" + AP_PASSWORD + """</strong>).</p>
     <p>Leave WiFi blank to update display/brightness (device reboots to apply). Fill WiFi to set network and restart. Display type, matrix layout, min/max brightness (use same for no LDR), batch size, cycle delay, scroll speed, &quot;Strip: flight colors only&quot; = matrix only.</p></div>
+    <div class="card"><h3>Firmware updates (manual)</h3>
+    <p>After boot, MetarMap <em>checks</em> online whether a newer firmware exists; it does <strong>not</strong> install by itself. Use <strong>Update</strong> &rarr; Install, open <code>http://&lt;pico-ip&gt;:8080</code> on your home network, or the Android app&apos;s install button when you want to upgrade.</p></div>
     <div class="card"><h3>Airports</h3>
     <p>One code per line. Order = LED order. Fetch from MetarMap loads current list; Save to MetarMap writes your list. Use empty line or SKIP for blank slot. 3&ndash;4 letters or digits (e.g. KORD, 0A0).</p></div>
     <div class="card"><h3>Weather</h3>
@@ -771,7 +777,8 @@ def get_html_update_page():
     <h1>MetarMap firmware update</h1>
     <div class="nav"><a href="/">Setup</a> <a href="/page/airports">Airports</a> <a href="/page/weather">Weather</a> <a href="/page/help">Help</a> <a href="/page/update">Update</a></div>
     <div class="card">
-    <p><b>When MetarMap is connected to your WiFi</b> (after Save &amp; Reboot), open <code>http://&lt;pico-ip&gt;:8080</code> in a browser or use the app&apos;s &quot;Install update&quot; button. The device must have internet to download.</p>
+    <p><b>Not automatic:</b> Updates are only <em>detected</em> at boot; nothing installs until you start it (this button, <code>:8080</code> on your LAN, or the app).</p>
+    <p><b>When MetarMap is connected to your WiFi</b> (after Save &amp; Reboot), open <code>http://&lt;pico-ip&gt;:8080</code> in a browser or use the app&apos;s &quot;Install firmware update&quot; button. The device must have internet to download.</p>
     <p>From this page (AP mode): try Install update below. It only works if the Pico has internet access.</p>
     <form method="post" action="/start-update"><button type="submit">Install update now</button></form>
     </div>
@@ -1187,3 +1194,4 @@ def start():
     gc.collect()
     set_leds(12, 12, 0, STARTUP_BRIGHTNESS)
     run_server()
+
