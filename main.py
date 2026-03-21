@@ -54,7 +54,7 @@ CYCLE_DELAY = 10  # Seconds between full airport list cycles; loaded from config
 # ===== FIRMWARE VERSION (for OTA update check) =====
 # Device reports this string; GitHub Pages version.json "version" must be higher to offer OTA.
 # After you flash new code, this should match what you published (or stay lower until user updates).
-FIRMWARE_VERSION = "1.0.1"
+FIRMWARE_VERSION = "1.0.0"
 
 # ===== OTA UPDATE BUTTON (GPIO for "install update"); set -1 to use app/browser only =====
 UPDATE_BUTTON_PIN = -1
@@ -1463,7 +1463,7 @@ try:
         except Exception:
             update_button = None
 
-    UPDATE_PAGE_HTML = """<!DOCTYPE html><html><head><meta name="viewport" content="width=device-width"><title>MetarMap Update</title></head><body><h1>MetarMap</h1><p>Install latest firmware from GitHub.</p><form method="post" action="/start-update"><button type="submit">Install update</button></form><p><small>Device will reboot and apply after download.</small></p></body></html>"""
+    UPDATE_PAGE_HTML = """<!DOCTYPE html><html><head><meta name="viewport" content="width=device-width"><title>MetarMap Update</title></head><body><h1>MetarMap</h1><p>Firmware is <strong>not</strong> installed automatically; the device only checks at boot. Use this page when you want to download and install.</p><p>Install latest firmware from GitHub.</p><form method="post" action="/start-update"><button type="submit">Install update</button></form><p><small>Device will reboot and apply after download.</small></p></body></html>"""
 
     def open_ota_listen_socket():
         try:
@@ -1734,9 +1734,4 @@ finally:
             led_matrix.write()
     except:
         pass
-
-
-
-
-
 
