@@ -54,7 +54,7 @@ CYCLE_DELAY = 10  # Seconds between full airport list cycles; loaded from config
 # ===== FIRMWARE VERSION (for OTA update check) =====
 # Device reports this string; GitHub Pages version.json "version" must be higher to offer OTA.
 # After you flash new code, this should match what you published (or stay lower until user updates).
-FIRMWARE_VERSION = "1.0.0"
+FIRMWARE_VERSION = "1.0.1"
 
 # ===== OTA UPDATE BUTTON (GPIO for "install update"); set -1 to use app/browser only =====
 UPDATE_BUTTON_PIN = -1
@@ -1404,10 +1404,12 @@ def process_second_pass(airport, index):
     else:
         print(f"Second pass - {airport}: No data received")
 
-def process_main_loop_batch(batch_airports, batch_start_index):
+def process_main_loop_batch(batch_airports, batch_start_index, poll_callback=None):
     check_ldr_and_refresh()
     any_data_received = False
     for i_in_batch, airport in enumerate(batch_airports):
+        if poll_callback is not None:
+            poll_callback()
         index = batch_start_index + i_in_batch
         if index >= NUM_LEDS:
             continue
@@ -1428,6 +1430,8 @@ def process_main_loop_batch(batch_airports, batch_start_index):
             gc.collect()
         else:
             print(f"No data for {airport}")
+        if poll_callback is not None:
+            poll_callback()
     return any_data_received
 
 try:
@@ -1461,17 +1465,23 @@ try:
 
     UPDATE_PAGE_HTML = """<!DOCTYPE html><html><head><meta name="viewport" content="width=device-width"><title>MetarMap Update</title></head><body><h1>MetarMap</h1><p>Install latest firmware from GitHub.</p><form method="post" action="/start-update"><button type="submit">Install update</button></form><p><small>Device will reboot and apply after download.</small></p></body></html>"""
 
-    update_socket = None
-    try:
-        update_socket = socket.socket()
-        update_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        update_socket.bind(("0.0.0.0", 8080))
-        update_socket.listen(1)
-        update_socket.settimeout(0.1)
+    def open_ota_listen_socket():
+        try:
+            s = socket.socket()
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            s.bind(("0.0.0.0", 8080))
+            s.listen(1)
+            s.settimeout(0.1)
+            return s
+        except Exception as ex:
+            print("OTA bind 8080 failed:", ex)
+            return None
+
+    update_socket = open_ota_listen_socket()
+    if update_socket is not None:
         print("OTA update server on port 8080 (listening during METAR startup)")
-    except Exception as e:
-        print("OTA server failed:", e)
-        update_socket = None
+    else:
+        print("OTA: will retry binding 8080 every few seconds")
 
     try:
         import network
@@ -1482,7 +1492,10 @@ try:
     except Exception:
         pass
 
+    _ota_rebind_after = 0.0
+
     def service_ota_http_and_button():
+        global update_socket, _ota_rebind_after
         """OTA button + port 8080."""
         if update_button is not None and update_button.value() == 0:
             if update_button.value() == 0:
@@ -1500,11 +1513,21 @@ try:
                                 print("OTA button: no update available")
                     except Exception as e:
                         print("OTA install error:", e)
+        if update_socket is None:
+            tnow = time.time()
+            if tnow >= _ota_rebind_after:
+                _ota_rebind_after = tnow + 5.0
+                update_socket = open_ota_listen_socket()
+                if update_socket is not None:
+                    print("OTA: port 8080 listen (re)started")
         if update_socket is not None:
             try:
                 conn, _ = update_socket.accept()
                 conn.settimeout(5.0)
                 req = conn.recv(2048).decode("utf-8", "ignore")
+                if not req:
+                    conn.close()
+                    return
                 first = req.split("\n")[0].strip() if req else ""
                 if first.startswith("POST ") and "/start-update" in first:
                     try:
@@ -1535,8 +1558,15 @@ try:
                         except Exception:
                             pass
                 else:
-                    conn.send(b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n")
-                    conn.send(UPDATE_PAGE_HTML.encode("utf-8"))
+                    _html = UPDATE_PAGE_HTML.encode("utf-8")
+                    _cl = len(_html)
+                    conn.send(
+                        (
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n"
+                            "Connection: close\r\nContent-Length: %d\r\n\r\n" % _cl
+                        ).encode("utf-8")
+                    )
+                    conn.send(_html)
                     conn.close()
             except OSError:
                 pass
@@ -1628,99 +1658,6 @@ try:
             print("Sleep clear err:", e)
 
     displays_sleeping = False
-    update_button = None
-    if UPDATE_BUTTON_PIN >= 0:
-        try:
-            update_button = Pin(UPDATE_BUTTON_PIN, Pin.IN, Pin.PULL_UP)
-        except Exception:
-            update_button = None
-
-    # OTA: HTTP server on port 8080 so app/browser can trigger install (when on same network)
-    update_socket = None
-    try:
-        update_socket = socket.socket()
-        update_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        update_socket.bind(("0.0.0.0", 8080))
-        update_socket.listen(1)
-        update_socket.settimeout(0.1)
-        print("OTA update server on port 8080")
-    except Exception as e:
-        print("OTA server failed:", e)
-        update_socket = None
-
-    UPDATE_PAGE_HTML = """<!DOCTYPE html><html><head><meta name="viewport" content="width=device-width"><title>MetarMap Update</title></head><body><h1>MetarMap</h1><p>Install latest firmware from GitHub.</p><form method="post" action="/start-update"><button type="submit">Install update</button></form><p><small>Device will reboot and apply after download.</small></p></body></html>"""
-
-    def service_ota_http_and_button():
-        """OTA button + port 8080. Call often (including during METAR batch waits) so app/browser are not starved."""
-        if update_button is not None and update_button.value() == 0:
-            # Physical button: re-check version if boot-time check didn't set update_available.
-            if update_button.value() == 0:
-                time.sleep_ms(50)
-                if update_button.value() == 0:
-                    try:
-                        import updater
-                        if update_available and update_info:
-                            updater.install_pending_update(update_info)
-                        else:
-                            has_update, version_info = updater.check_for_new_version(FIRMWARE_VERSION)
-                            if has_update and version_info:
-                                updater.install_pending_update(version_info)
-                            else:
-                                print("OTA button: no update available")
-                    except Exception as e:
-                        print("OTA install error:", e)
-        if update_socket is not None:
-            try:
-                conn, _ = update_socket.accept()
-                conn.settimeout(5.0)
-                req = conn.recv(1024).decode("utf-8", "ignore")
-                first = req.split("\n")[0].strip() if req else ""
-                if first.startswith("POST ") and "/start-update" in first:
-                    try:
-                        import updater
-                        # Re-check on-demand so the app doesn't depend on boot-time update_available.
-                        if update_available and update_info:
-                            has_update = True
-                            version_info = update_info
-                        else:
-                            has_update, version_info = updater.check_for_new_version(FIRMWARE_VERSION)
-                        if has_update and version_info:
-                            conn.send(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nInstalling...")
-                            try:
-                                conn.flush()
-                            except Exception:
-                                pass
-                            time.sleep_ms(200)
-                            conn.close()
-                            updater.install_pending_update(version_info)
-                        else:
-                            print("OTA POST /start-update: no newer firmware (recheck)")
-                            conn.send(b"HTTP/1.1 409 Conflict\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nNo update available.")
-                            conn.close()
-                    except Exception as e:
-                        print("OTA POST /start-update error:", e)
-                        try:
-                            conn.send(b"HTTP/1.1 500 Internal Server Error\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nUpdate error.")
-                            conn.close()
-                        except Exception:
-                            pass
-                else:
-                    conn.send(b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n")
-                    conn.send(UPDATE_PAGE_HTML.encode("utf-8"))
-                    conn.close()
-            except OSError:
-                pass
-            except Exception as e:
-                print("OTA server handle:", e)
-
-    def sleep_with_ota_poll(total_seconds):
-        """Sleep in short slices while servicing OTA HTTP (so POST /start-update is not blocked by long waits)."""
-        remaining = float(total_seconds)
-        while remaining > 0:
-            service_ota_http_and_button()
-            chunk = 0.25 if remaining >= 0.25 else remaining
-            time.sleep(chunk)
-            remaining -= chunk
 
     while True:
         service_ota_http_and_button()
@@ -1763,7 +1700,9 @@ try:
             batch_airports = airports[batch_start:batch_end]
             print(f"\n--- Main Loop Batch {batch_num + 1}/{num_batches} (Airports {batch_start}-{batch_end-1}) ---")
             print(f"Free memory before batch: {gc.mem_free()} bytes")
-            batch_data_received = process_main_loop_batch(batch_airports, batch_start)
+            batch_data_received = process_main_loop_batch(
+                batch_airports, batch_start, poll_callback=service_ota_http_and_button
+            )
             any_data_received = any_data_received or batch_data_received
             print(f"Free memory after batch: {gc.mem_free()} bytes")
             if batch_num < num_batches - 1:
@@ -1795,6 +1734,8 @@ finally:
             led_matrix.write()
     except:
         pass
+
+
 
 
 
