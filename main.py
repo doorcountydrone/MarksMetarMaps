@@ -54,7 +54,7 @@ CYCLE_DELAY = 10  # Seconds between full airport list cycles; loaded from config
 # ===== FIRMWARE VERSION (for OTA update check) =====
 # Device reports this string; GitHub Pages version.json "version" must be higher to offer OTA.
 # After you flash new code, this should match what you published (or stay lower until user updates).
-FIRMWARE_VERSION = "1.0.1"
+FIRMWARE_VERSION = "1.0.0"
 
 # ===== OTA UPDATE BUTTON (GPIO for "install update"); set -1 to use app/browser only =====
 UPDATE_BUTTON_PIN = -1
@@ -1734,6 +1734,7 @@ finally:
             led_matrix.write()
     except:
         pass
+
 
 
 
