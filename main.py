@@ -56,8 +56,10 @@ CYCLE_DELAY = 10  # Seconds between full airport list cycles; loaded from config
 # After you flash new code, this should match what you published (or stay lower until user updates).
 FIRMWARE_VERSION = "1.0.1"
 
-# ===== OTA UPDATE BUTTON (GPIO for "install update"); set -1 to use app/browser only =====
-UPDATE_BUTTON_PIN = -1
+# ===== OTA UPDATE BUTTON (GPIO for short-press "install update") =====
+# Same pin as force-AP at boot: long hold (3s) during startup = setup AP mode; short press while running = start OTA if available.
+# Set to -1 to disable physical button (use app or http://<ip>:8080 only).
+UPDATE_BUTTON_PIN = FORCE_AP_BUTTON_PIN
 
 # ===== DATA TIMEOUT SETTINGS =====
 NO_DATA_TIMEOUT = 180  #  without any data before showing warning
@@ -65,6 +67,26 @@ last_successful_data_time = None  # Track when we last got ANY airport data
 no_data_warning_active = False  # Track if we're currently showing the warning
 update_available = False  # Set True when OTA check finds newer version
 update_info = None  # Parsed version.json when update_available
+_ota_button_prev = 1  # 1 = released (pull-up); used for short-press edge detect on OTA button
+_ota_service_hook = None  # set to service_ota_http_and_button so display loops can poll OTA
+_ota_btn_irq_pending = False  # set by GPIO IRQ (press) so short taps aren't missed during long sleeps
+_ota_last_btn_ms = 0  # debounce duplicate IRQ/edges
+
+
+def _ota_btn_irq_handler(_pin):
+    global _ota_btn_irq_pending
+    _ota_btn_irq_pending = True
+
+
+def _maybe_service_ota():
+    """Call OTA HTTP + button handler (use sparingly — e.g. throttled during matrix scroll)."""
+    fn = _ota_service_hook
+    if fn is not None:
+        try:
+            fn()
+        except Exception:
+            pass
+
 
 # ===== MATRIX WIRING PATTERN =====
 # CHANGE THIS TO THE PATTERN THAT WORKED FOR YOU:
@@ -587,6 +609,9 @@ def scroll_single_text_ultra_smooth(text, text_color):
             time.sleep(SCROLL_PAUSE_BEFORE)
         frame_target_ms = int(SCROLL_SPEED * 1000)
         for start_col in range(total_frames):
+            # OTA / :8080 only occasionally — full service every frame made scroll/weather feel very slow
+            if start_col % 72 == 0:
+                _maybe_service_ota()
             frame_start = time.ticks_ms()
             led_matrix.fill((0, 0, 0))
             max_x = min(LED_MATRIX_WIDTH, len(columns) - start_col)
@@ -603,7 +628,7 @@ def scroll_single_text_ultra_smooth(text, text_color):
             if draw_time < frame_target_ms:
                 remaining_ms = frame_target_ms - draw_time
                 if remaining_ms > 0:
-                    time.sleep_ms(remaining_ms)
+                    time.sleep(remaining_ms / 1000.0)
         del columns
         gc.collect()
     except Exception as e:
@@ -1460,6 +1485,10 @@ try:
     if UPDATE_BUTTON_PIN >= 0:
         try:
             update_button = Pin(UPDATE_BUTTON_PIN, Pin.IN, Pin.PULL_UP)
+            try:
+                update_button.irq(trigger=Pin.IRQ_FALLING, handler=_ota_btn_irq_handler)
+            except Exception as irq_e:
+                print("OTA GPIO IRQ (button still polled):", irq_e)
         except Exception:
             update_button = None
 
@@ -1495,24 +1524,37 @@ try:
     _ota_rebind_after = 0.0
 
     def service_ota_http_and_button():
-        global update_socket, _ota_rebind_after
+        global update_socket, _ota_rebind_after, _ota_button_prev, _ota_btn_irq_pending, _ota_last_btn_ms
         """OTA button + port 8080."""
-        if update_button is not None and update_button.value() == 0:
-            if update_button.value() == 0:
-                time.sleep_ms(50)
-                if update_button.value() == 0:
-                    try:
-                        import updater
-                        if update_available and update_info:
-                            updater.install_pending_update(update_info)
+        if update_button is not None:
+            triggered = False
+            if _ota_btn_irq_pending:
+                _ota_btn_irq_pending = False
+                triggered = True
+            else:
+                v = update_button.value()
+                if _ota_button_prev == 1 and v == 0:
+                    triggered = True
+                _ota_button_prev = v
+            if triggered:
+                now = time.ticks_ms()
+                if _ota_last_btn_ms and abs(time.ticks_diff(now, _ota_last_btn_ms)) < 400:
+                    return
+                _ota_last_btn_ms = now
+                time.sleep_ms(40)
+                try:
+                    import updater
+                    print("OTA: GPIO button — checking / installing…")
+                    if update_available and update_info:
+                        updater.install_pending_update(update_info)
+                    else:
+                        has_update, version_info = updater.check_for_new_version(FIRMWARE_VERSION)
+                        if has_update and version_info:
+                            updater.install_pending_update(version_info)
                         else:
-                            has_update, version_info = updater.check_for_new_version(FIRMWARE_VERSION)
-                            if has_update and version_info:
-                                updater.install_pending_update(version_info)
-                            else:
-                                print("OTA button: no update available")
-                    except Exception as e:
-                        print("OTA install error:", e)
+                            print("OTA button: no update available (device already current or version.json unreachable)")
+                except Exception as e:
+                    print("OTA install error:", e)
         if update_socket is None:
             tnow = time.time()
             if tnow >= _ota_rebind_after:
@@ -1572,6 +1614,8 @@ try:
                 pass
             except Exception as e:
                 print("OTA server handle:", e)
+
+    _ota_service_hook = service_ota_http_and_button
 
     def sleep_with_ota_poll(total_seconds):
         remaining = float(total_seconds)
