@@ -1,7 +1,3 @@
-# MetarMap WiFi Manager for Pico W
-# Copy this file to your Pico W. Fix: parse_request_data returns 5 values for JSON
-# so Android app handler "ssid, password, _, _, _ = parse_request_data(request)" works.
-
 import network
 import socket
 import utime as time
