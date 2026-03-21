@@ -54,7 +54,7 @@ CYCLE_DELAY = 10  # Seconds between full airport list cycles; loaded from config
 # ===== FIRMWARE VERSION (for OTA update check) =====
 # Device reports this string; GitHub Pages version.json "version" must be higher to offer OTA.
 # After you flash new code, this should match what you published (or stay lower until user updates).
-FIRMWARE_VERSION = "1.0.1"
+FIRMWARE_VERSION = "1.0.0"
 
 # ===== OTA UPDATE BUTTON (GPIO for "install update"); set -1 to use app/browser only =====
 UPDATE_BUTTON_PIN = -1
@@ -1186,7 +1186,7 @@ def get_weather_conditions_with_retry(raw_text, airport, led, index, min_brightn
                             led.write()
                             time.sleep(.5)
                         if weather_enabled.get("CLR", True) and any(conditions_present[14:15]):
-                            num_steps = 600
+                            num_steps = 1000
                             white_color = (255, 255, 255)
                             green_color = (0, 255, 0)
                             step_size = tuple((b - w) / num_steps for w, b in zip(white_color, green_color))
@@ -1334,7 +1334,7 @@ print("\n=== Testing auto-brightness ===")
 brightness = test_auto_brightness()
 print(f"Initial auto-brightness: {brightness:.3f}")
 
-def process_airports_in_batches(airports, process_function, batch_size=BATCH_SIZE, description="Processing", skip_batch_delay=False):
+def process_airports_in_batches(airports, process_function, batch_size=BATCH_SIZE, description="Processing", skip_batch_delay=False, poll_callback=None):
     gc.collect()
     total_airports = len(airports)
     num_batches = (total_airports + batch_size - 1) // batch_size
@@ -1352,12 +1352,22 @@ def process_airports_in_batches(airports, process_function, batch_size=BATCH_SIZ
                 continue
             print(f"Processing {airport} (LED index {index})...")
             process_function(airport, index)
+            if poll_callback is not None:
+                poll_callback()
             gc.collect()
             time.sleep(0.1)
         print(f"Free memory after batch: {gc.mem_free()} bytes")
         if batch_num < num_batches - 1 and not skip_batch_delay:
             print(f"Waiting {BATCH_DELAY} seconds before next batch...")
-            time.sleep(BATCH_DELAY)
+            if poll_callback is not None:
+                rem = float(BATCH_DELAY)
+                while rem > 0:
+                    poll_callback()
+                    ch = 0.25 if rem >= 0.25 else rem
+                    time.sleep(ch)
+                    rem -= ch
+            else:
+                time.sleep(BATCH_DELAY)
 
 def process_first_pass(airport, index):
     if not airport or airport.strip() == "":
@@ -1441,6 +1451,106 @@ try:
         print("OTA check error:", e)
     gc.collect()
 
+    # OTA HTTP on :8080 — bind NOW so browser/app work during long first/second passes (not only after).
+    update_button = None
+    if UPDATE_BUTTON_PIN >= 0:
+        try:
+            update_button = Pin(UPDATE_BUTTON_PIN, Pin.IN, Pin.PULL_UP)
+        except Exception:
+            update_button = None
+
+    UPDATE_PAGE_HTML = """<!DOCTYPE html><html><head><meta name="viewport" content="width=device-width"><title>MetarMap Update</title></head><body><h1>MetarMap</h1><p>Install latest firmware from GitHub.</p><form method="post" action="/start-update"><button type="submit">Install update</button></form><p><small>Device will reboot and apply after download.</small></p></body></html>"""
+
+    update_socket = None
+    try:
+        update_socket = socket.socket()
+        update_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        update_socket.bind(("0.0.0.0", 8080))
+        update_socket.listen(1)
+        update_socket.settimeout(0.1)
+        print("OTA update server on port 8080 (listening during METAR startup)")
+    except Exception as e:
+        print("OTA server failed:", e)
+        update_socket = None
+
+    try:
+        import network
+        _w = network.WLAN(network.STA_IF)
+        if _w.isconnected():
+            _ip = _w.ifconfig()[0]
+            print("MetarMap LAN IP:", _ip, "— open http://%s:8080 for OTA page" % (_ip,))
+    except Exception:
+        pass
+
+    def service_ota_http_and_button():
+        """OTA button + port 8080."""
+        if update_button is not None and update_button.value() == 0:
+            if update_button.value() == 0:
+                time.sleep_ms(50)
+                if update_button.value() == 0:
+                    try:
+                        import updater
+                        if update_available and update_info:
+                            updater.install_pending_update(update_info)
+                        else:
+                            has_update, version_info = updater.check_for_new_version(FIRMWARE_VERSION)
+                            if has_update and version_info:
+                                updater.install_pending_update(version_info)
+                            else:
+                                print("OTA button: no update available")
+                    except Exception as e:
+                        print("OTA install error:", e)
+        if update_socket is not None:
+            try:
+                conn, _ = update_socket.accept()
+                conn.settimeout(5.0)
+                req = conn.recv(2048).decode("utf-8", "ignore")
+                first = req.split("\n")[0].strip() if req else ""
+                if first.startswith("POST ") and "/start-update" in first:
+                    try:
+                        import updater
+                        if update_available and update_info:
+                            has_update = True
+                            version_info = update_info
+                        else:
+                            has_update, version_info = updater.check_for_new_version(FIRMWARE_VERSION)
+                        if has_update and version_info:
+                            conn.send(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nInstalling...")
+                            try:
+                                conn.flush()
+                            except Exception:
+                                pass
+                            time.sleep_ms(200)
+                            conn.close()
+                            updater.install_pending_update(version_info)
+                        else:
+                            print("OTA POST /start-update: no newer firmware (recheck)")
+                            conn.send(b"HTTP/1.1 409 Conflict\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nNo update available.")
+                            conn.close()
+                    except Exception as e:
+                        print("OTA POST /start-update error:", e)
+                        try:
+                            conn.send(b"HTTP/1.1 500 Internal Server Error\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nUpdate error.")
+                            conn.close()
+                        except Exception:
+                            pass
+                else:
+                    conn.send(b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n")
+                    conn.send(UPDATE_PAGE_HTML.encode("utf-8"))
+                    conn.close()
+            except OSError:
+                pass
+            except Exception as e:
+                print("OTA server handle:", e)
+
+    def sleep_with_ota_poll(total_seconds):
+        remaining = float(total_seconds)
+        while remaining > 0:
+            service_ota_http_and_button()
+            chunk = 0.25 if remaining >= 0.25 else remaining
+            time.sleep(chunk)
+            remaining -= chunk
+
     current_ldr_brightness = map_ldr_to_brightness(read_ldr_value(), MIN_BRIGHTNESS, MAX_BRIGHTNESS)
     last_ldr_refresh_time = time.time()
     bulk_ok = False
@@ -1456,6 +1566,7 @@ try:
                         update_data_success()
                     gc.collect()
                     time.sleep(0.3)
+                service_ota_http_and_button()
             any_set = False
             for index in range(n):
                 fc, _ = bulk_results[index]
@@ -1470,11 +1581,11 @@ try:
                 update_data_success()
                 bulk_ok = True
                 print("All airport LEDs set from bulk fetch (displaying 3s)")
-                time.sleep(3)
+                sleep_with_ota_poll(3)
     if not bulk_ok:
         if not MATRIX_ONLY:
-            process_airports_in_batches(airports, process_first_pass, description="First pass")
-    process_airports_in_batches(airports, process_second_pass, description="Second pass")
+            process_airports_in_batches(airports, process_first_pass, description="First pass", poll_callback=service_ota_http_and_button)
+    process_airports_in_batches(airports, process_second_pass, description="Second pass", poll_callback=service_ota_http_and_button)
 
     # NTP sync once for sleep schedule (time.localtime())
     ntptime_synced = False
@@ -1583,12 +1694,13 @@ try:
                             conn.close()
                             updater.install_pending_update(version_info)
                         else:
-                            conn.send(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nNo update available.")
+                            print("OTA POST /start-update: no newer firmware (recheck)")
+                            conn.send(b"HTTP/1.1 409 Conflict\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nNo update available.")
                             conn.close()
                     except Exception as e:
                         print("OTA POST /start-update error:", e)
                         try:
-                            conn.send(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nUpdate error.")
+                            conn.send(b"HTTP/1.1 500 Internal Server Error\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nUpdate error.")
                             conn.close()
                         except Exception:
                             pass
@@ -1683,5 +1795,6 @@ finally:
             led_matrix.write()
     except:
         pass
+
 
 
