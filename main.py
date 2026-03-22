@@ -1211,7 +1211,7 @@ def get_weather_conditions_with_retry(raw_text, airport, led, index, min_brightn
                             led.write()
                             time.sleep(.5)
                         if weather_enabled.get("CLR", True) and any(conditions_present[14:15]):
-                            num_steps = 400
+                            num_steps = 1000
                             white_color = (255, 255, 255)
                             green_color = (0, 255, 0)
                             step_size = tuple((b - w) / num_steps for w, b in zip(white_color, green_color))
@@ -1515,7 +1515,10 @@ try:
             s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             s.bind(("0.0.0.0", 8080))
             s.listen(1)
-            s.settimeout(0.1)
+            # Non-blocking: accept() returns immediately if no client. A short timeout here
+            # caused a visible matrix scroll hitch every ~72 frames (~5s at default scroll speed)
+            # because scroll_single_text_ultra_smooth calls _maybe_service_ota() that often.
+            s.settimeout(0)
             return s
         except Exception as ex:
             print("OTA bind 8080 failed:", ex)
