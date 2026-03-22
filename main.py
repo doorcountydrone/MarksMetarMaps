@@ -1211,7 +1211,7 @@ def get_weather_conditions_with_retry(raw_text, airport, led, index, min_brightn
                             led.write()
                             time.sleep(.5)
                         if weather_enabled.get("CLR", True) and any(conditions_present[14:15]):
-                            num_steps = 1000
+                            num_steps = 400
                             white_color = (255, 255, 255)
                             green_color = (0, 255, 0)
                             step_size = tuple((b - w) / num_steps for w, b in zip(white_color, green_color))
