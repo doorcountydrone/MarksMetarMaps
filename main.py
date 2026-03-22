@@ -54,7 +54,7 @@ CYCLE_DELAY = 10  # Seconds between full airport list cycles; loaded from config
 # ===== FIRMWARE VERSION (for OTA update check) =====
 # Device reports this string; GitHub Pages version.json "version" must be higher to offer OTA.
 # After you flash new code, this should match what you published (or stay lower until user updates).
-FIRMWARE_VERSION = "1.0.1"
+FIRMWARE_VERSION = "1.0.0"
 
 # ===== OTA UPDATE BUTTON (GPIO for short-press "install update") =====
 # Same pin as force-AP at boot: long hold (3s) during startup = setup AP mode; short press while running = start OTA if available.
@@ -1211,7 +1211,7 @@ def get_weather_conditions_with_retry(raw_text, airport, led, index, min_brightn
                             led.write()
                             time.sleep(.5)
                         if weather_enabled.get("CLR", True) and any(conditions_present[14:15]):
-                            num_steps = 1000
+                            num_steps = 400
                             white_color = (255, 255, 255)
                             green_color = (0, 255, 0)
                             step_size = tuple((b - w) / num_steps for w, b in zip(white_color, green_color))
@@ -1470,9 +1470,24 @@ try:
             update_available = True
             update_info = version_info
             print("OTA: New version available", version_info.get("version"))
+            msg_color = apply_auto_brightness((255, 140, 0))
             if led_matrix is not None and DISPLAY_TYPE == "LED_MATRIX":
-                msg_color = apply_auto_brightness((255, 140, 0))
                 scroll_single_text_ultra_smooth("NEW UPDATE AVAILABLE PRESS BUTTON TO INSTALL", msg_color)
+            elif DISPLAY_TYPE == "NONE":
+                # Strip-only: same amber as matrix scroll — full strip 10s so update is visible
+                try:
+                    for i in range(NUM_LEDS):
+                        logical_colors[i] = (255, 140, 0)
+                        led[i] = msg_color
+                    led.write()
+                    print("OTA: strip-only — update color on all LEDs 10s (install: button or :8080)")
+                    time.sleep(10)
+                    for i in range(NUM_LEDS):
+                        logical_colors[i] = (0, 0, 0)
+                        led[i] = (0, 0, 0)
+                    led.write()
+                except Exception as ex:
+                    print("OTA strip banner error:", ex)
     except SyntaxError as e:
         print("OTA check error: invalid syntax in updater.py — re-copy pico/updater.py to the Pico.")
         print(e)
