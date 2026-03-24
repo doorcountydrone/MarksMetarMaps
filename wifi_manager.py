@@ -1274,3 +1274,4 @@ def start():
     gc.collect()
     set_leds(12, 12, 0, STARTUP_BRIGHTNESS)
     run_server()
+
