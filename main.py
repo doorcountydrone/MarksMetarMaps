@@ -54,7 +54,7 @@ CYCLE_DELAY = 10  # Seconds between full airport list cycles; loaded from config
 # ===== FIRMWARE VERSION (for OTA update check) =====
 # Device reports this string; GitHub Pages version.json "version" must be higher to offer OTA.
 # After you flash new code, this should match what you published (or stay lower until user updates).
-FIRMWARE_VERSION = "1.0.1"
+FIRMWARE_VERSION = "1.0.0"
 
 # ===== OTA UPDATE BUTTON (GPIO for short-press "install update") =====
 # Same pin as force-AP at boot: long hold (3s) during startup = setup AP mode; short press while running = start OTA if available.
@@ -451,11 +451,9 @@ if DISPLAY_TYPE == "OLED":
                 print(f"Error displaying sans18 font in test: {e}")
                 oled.text("OLED Mode", 0, 5, 1)
                 oled.text("Active", 0, 17, 1)
-                oled.text(f"WiFi: {WIFI_SSID[:12]}", 0, 30, 1)
         else:
             oled.text("OLED Mode", 0, 5, 1)
             oled.text("Active", 0, 17, 1)
-            oled.text(f"WiFi: {WIFI_SSID[:12]}", 0, 30, 1)
         oled.show()
         time.sleep(3)
         oled.fill(0)
@@ -722,6 +720,14 @@ def connect_to_wifi(WIFI_SSID, WIFI_PASSWORD):
             print("Connected to WiFi:", wlan.config("essid"))
             print("IP Address:", ip_address)
             conn_green = (0, 255, 0)
+            # current_ldr_brightness defaults to 128 before any LDR read — far too bright for status LEDs.
+            _bw = map_ldr_to_brightness(read_ldr_value(), MIN_BRIGHTNESS, MAX_BRIGHTNESS)
+            if DISPLAY_TYPE == "OLED":
+                # Strip is only a hint in OLED mode; keep it softer than normal strip METAR brightness.
+                _cap = max(MIN_BRIGHTNESS, (MIN_BRIGHTNESS + MAX_BRIGHTNESS) // 2)
+                _bw = min(_bw, _cap)
+            global current_ldr_brightness
+            current_ldr_brightness = _bw
             for i in range(NUM_LEDS):
                 logical_colors[i] = conn_green
                 led[i] = _scale_color(conn_green, current_ldr_brightness)
@@ -735,10 +741,8 @@ def connect_to_wifi(WIFI_SSID, WIFI_PASSWORD):
                     wri_title.printstring("IP Address:")
                     wri_ip.set_textpos(0, 20)
                     wri_ip.printstring(ip_address)
-                    wri_ip.set_textpos(0, 40)
-                    wri_ip.printstring(WIFI_SSID)
                     oled.show()
-                    time.sleep(3)
+                    time.sleep(8)
                     oled.fill(0)
                     oled.show()
                 except Exception as e:
@@ -824,7 +828,7 @@ def ensure_wifi_connected():
         print("WiFi reconnect error:", e)
         return False
 
-MAX_RETRIES = 1
+MAX_RETRIES = 3
 
 # mbedTLS on Pico W often gets this through hotspots with cellular backhaul; treat as transient
 SSL_EOF_MAX_EXTRA_TRIES = 5   # extra connection attempts per "retry" when we see SSL EOF
