@@ -824,7 +824,7 @@ def ensure_wifi_connected():
         print("WiFi reconnect error:", e)
         return False
 
-MAX_RETRIES = 3
+MAX_RETRIES = 1
 
 # mbedTLS on Pico W often gets this through hotspots with cellular backhaul; treat as transient
 SSL_EOF_MAX_EXTRA_TRIES = 5   # extra connection attempts per "retry" when we see SSL EOF
