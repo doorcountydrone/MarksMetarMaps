@@ -54,7 +54,7 @@ CYCLE_DELAY = 10  # Seconds between full airport list cycles; loaded from config
 # ===== FIRMWARE VERSION (for OTA update check) =====
 # Device reports this string; GitHub Pages version.json "version" must be higher to offer OTA.
 # After you flash new code, this should match what you published (or stay lower until user updates).
-FIRMWARE_VERSION = "1.0.1"
+FIRMWARE_VERSION = "1.0.0"
 
 # ===== OTA UPDATE BUTTON (GPIO for short-press "install update") =====
 # Same pin as force-AP at boot: long hold (3s) during startup = setup AP mode; short press while running = start OTA if available.
@@ -161,13 +161,15 @@ def map_ldr_to_brightness(ldr_value, min_brightness, max_brightness):
 
 def get_led_matrix_brightness():
     """Get brightness factor (0.0-1.0) for LED matrix - SAME LOGIC AS MAIN LEDs.
-    Also updates the main strip's floating LDR so strip and matrix stay in sync."""
+    When a GPIO0 strip is used, refresh it from LDR so strip and matrix stay in sync.
+    When MATRIX_ONLY, skip strip refresh (no geographic strip — avoids spurious data on pin 0)."""
     global current_ldr_brightness
     ldr_value = read_ldr_value()
     brightness_value = map_ldr_to_brightness(ldr_value, MIN_BRIGHTNESS, MAX_BRIGHTNESS)
     current_ldr_brightness = brightness_value
     try:
-        refresh_strip_using_ldr()
+        if not MATRIX_ONLY:
+            refresh_strip_using_ldr()
     except Exception:
         pass
     brightness_factor = brightness_value / 255.0
@@ -279,9 +281,12 @@ try:
 except Exception as e:
     print(f"Error initializing pins: {e}")
 
-# WS2811 LED configuration
+# WS2811 LED configuration (initial count; wifi_config may resize after load)
+# NUM_LEDS = pixels clocked on GPIO0 (physical chain length).
+# STRIP_ACTIVE_LEDS = how many positions (0..active-1) may show airport colors; rest forced black.
 LED_PIN = 0
-NUM_LEDS = 200
+NUM_LEDS = 256
+STRIP_ACTIVE_LEDS = 256  # overridden from num_leds in wifi_config.json
 
 try:
     led = neopixel.NeoPixel(machine.Pin(LED_PIN), NUM_LEDS)
@@ -357,10 +362,55 @@ try:
             TIMEZONE_OFFSET_HOURS = max(-12, min(14, int(config.get("timezone_offset_hours", -5))))
         except (TypeError, ValueError):
             TIMEZONE_OFFSET_HOURS = -5
+        # num_leds = airport strip slots (only 0..num_leds-1 may show METAR colors).
+        # physical_led_count = total WS2812 on GPIO0. NeoPixel buffer = max(active, physical).
+        # If physical is OMITTED: default to max(num_leds, 256) so 8×32-style panels still get
+        # every pixel clocked off. (If you only clock 49 into a 256 chain, LEDs 50+ keep latched
+        # data — looks like a duplicate second block.)
+        _DEFAULT_STRIP_PHYS_OMITTED = 256
+        try:
+            _active = int(config.get("num_leds", NUM_LEDS))
+            _active = max(1, min(480, _active))
+        except (TypeError, ValueError):
+            _active = NUM_LEDS
+        _p_raw = config.get("physical_led_count", None)
+        _p_effective = None
+        try:
+            if _p_raw is not None and str(_p_raw).strip() != "":
+                _p_effective = int(_p_raw)
+                # Guardrail: <=1 is almost always accidental and causes stale tail/duplicate block.
+                if _p_effective <= 1:
+                    _p_effective = None
+                else:
+                    _p_effective = max(1, min(480, _p_effective))
+            if _p_effective is not None:
+                _phys = _p_effective
+            else:
+                _phys = max(_active, min(480, _DEFAULT_STRIP_PHYS_OMITTED))
+        except (TypeError, ValueError):
+            _phys = max(_active, min(480, _DEFAULT_STRIP_PHYS_OMITTED))
+        _phys = max(_active, _phys)
+        STRIP_ACTIVE_LEDS = _active
+        NUM_LEDS = _phys
+        led = neopixel.NeoPixel(machine.Pin(LED_PIN), NUM_LEDS)
+        logical_colors = [(0, 0, 0)] * NUM_LEDS
+        for i in range(NUM_LEDS):
+            led[i] = (0, 0, 0)
+        led.write()
+        print(
+            "METAR strip: %d WS2812 clocked (physical); airport LEDs = first %d (num_leds). "
+            "physical_led_count: %s"
+            % (
+                NUM_LEDS,
+                STRIP_ACTIVE_LEDS,
+                _p_effective if _p_effective is not None else "(unset/<=1/invalid → use max(num_leds,256))",
+            )
+        )
         del config
         gc.collect()
 except Exception as e:
     print(f"Error loading configuration: {e}")
+    STRIP_ACTIVE_LEDS = NUM_LEDS
     WEATHER_ENABLED = {code: True for code in WX_TAGS}
     SLEEP_ENABLED = False
     SLEEP_AT_HOUR = 22
@@ -954,7 +1004,8 @@ BULK_CHUNK_SIZE = 20  # airports per request; smaller = more reliable full respo
 def fetch_all_metars_once(airports):
     """Fetch METARs for all airports in chunked requests. Returns list of (flight_category, raw_text) per index, or None on failure.
     Uses order=ids so response order matches our list."""
-    n = min(len(airports), NUM_LEDS)
+    # Fetch METARs for all list entries (matrix scroll may need airports past strip active count).
+    n = min(len(airports), 480)
     if n == 0:
         return []
     results = [(None, None)] * n
@@ -1024,6 +1075,8 @@ def fetch_all_metars_once(airports):
     return results
 
 def get_weather_conditions_with_retry(raw_text, airport, led, index, min_brightness, max_brightness, weather_enabled=None):
+    if index >= STRIP_ACTIVE_LEDS:
+        return False
     if weather_enabled is None:
         weather_enabled = WEATHER_ENABLED
     unwanted_conditions = []
@@ -1287,6 +1340,25 @@ def _scale_color(color, brightness):
         return (0, 0, 0)
     return tuple(min(255, int(c * brightness / 255)) for c in color)
 
+def clear_unused_strip_leds(num_airport_slots):
+    """Black out unused airport slots and everything past STRIP_ACTIVE_LEDS (entire physical tail)."""
+    if MATRIX_ONLY or led is None:
+        return
+    try:
+        n = int(num_airport_slots)
+    except (TypeError, ValueError):
+        n = 0
+    # Within 0..active-1: clear from first unused airport line
+    first_in_active = min(max(0, n), STRIP_ACTIVE_LEDS)
+    for i in range(first_in_active, STRIP_ACTIVE_LEDS):
+        logical_colors[i] = (0, 0, 0)
+        led[i] = (0, 0, 0)
+    # Past active cap through end of physical buffer (always, so tail never shows stale duplicate)
+    for i in range(STRIP_ACTIVE_LEDS, NUM_LEDS):
+        logical_colors[i] = (0, 0, 0)
+        led[i] = (0, 0, 0)
+    led.write()
+
 def refresh_strip_using_ldr():
     """Re-apply current_ldr_brightness to all LEDs from logical_colors."""
     for i in range(NUM_LEDS):
@@ -1296,6 +1368,8 @@ def refresh_strip_using_ldr():
 def check_ldr_and_refresh():
     """Every 2s read LDR, update current_ldr_brightness, refresh whole strip."""
     global current_ldr_brightness, last_ldr_refresh_time
+    if MATRIX_ONLY:
+        return
     if time.time() - last_ldr_refresh_time >= 2.0:
         current_ldr_brightness = map_ldr_to_brightness(read_ldr_value(), MIN_BRIGHTNESS, MAX_BRIGHTNESS)
         refresh_strip_using_ldr()
@@ -1304,6 +1378,8 @@ def check_ldr_and_refresh():
 def set_led_color(led, flight_category, index, min_brightness, max_brightness):
     if index < 0 or index >= NUM_LEDS:
         print("Invalid LED index: {}".format(index))
+        return
+    if index >= STRIP_ACTIVE_LEDS:
         return
     flight_category = flight_category.strip().upper()
     color = (0, 0, 0)
@@ -1373,7 +1449,7 @@ def process_airports_in_batches(airports, process_function, batch_size=BATCH_SIZ
         for i_in_batch, airport in enumerate(batch_airports):
             index = batch_start + i_in_batch
             if index >= NUM_LEDS:
-                print(f"Warning: Airport {airport} at index {index} exceeds LED count ({NUM_LEDS}). Skipping.")
+                print(f"Warning: Airport {airport} at index {index} exceeds physical strip ({NUM_LEDS}). Skipping.")
                 continue
             print(f"Processing {airport} (LED index {index})...")
             process_function(airport, index)
@@ -1397,15 +1473,17 @@ def process_airports_in_batches(airports, process_function, batch_size=BATCH_SIZ
 def process_first_pass(airport, index):
     if not airport or airport.strip() == "":
         print(f"First pass - LED {index}: [skip]")
-        logical_colors[index] = (0, 0, 0)
-        led[index] = (0, 0, 0)
-        led.write()
+        if not MATRIX_ONLY and index < STRIP_ACTIVE_LEDS:
+            logical_colors[index] = (0, 0, 0)
+            led[index] = (0, 0, 0)
+            led.write()
         return
     flight_category, raw_text = get_metar_data_with_retry(airport)
     if flight_category is not None:
         update_data_success()
         print(f"First pass - {airport}: {flight_category}")
-        set_led_color(led, flight_category, index, MIN_BRIGHTNESS, MAX_BRIGHTNESS)
+        if not MATRIX_ONLY:
+            set_led_color(led, flight_category, index, MIN_BRIGHTNESS, MAX_BRIGHTNESS)
     else:
         print(f"First pass - {airport}: No data received")
 
@@ -1423,7 +1501,8 @@ def process_second_pass(airport, index):
         line2 = f" {raw_text}" if raw_text is not None else "Raw Text: N/A"
         print(f"Second pass - {line1}")
         print(line2)
-        set_led_color(led, flight_category, index, MIN_BRIGHTNESS, MAX_BRIGHTNESS)
+        if not MATRIX_ONLY:
+            set_led_color(led, flight_category, index, MIN_BRIGHTNESS, MAX_BRIGHTNESS)
         display_info(line1, line2, flight_category, airport)
         gc.collect()
     else:
@@ -1450,7 +1529,8 @@ def process_main_loop_batch(batch_airports, batch_start_index, poll_callback=Non
             line2 = f" {raw_text}" if raw_text is not None else "Raw Text: N/A"
             print(f"Main loop - {line1}")
             print(line2)
-            set_led_color(led, flight_category, index, MIN_BRIGHTNESS, MAX_BRIGHTNESS)
+            if not MATRIX_ONLY:
+                set_led_color(led, flight_category, index, MIN_BRIGHTNESS, MAX_BRIGHTNESS)
             display_info(line1, line2, flight_category, airport)
             gc.collect()
         else:
@@ -1649,7 +1729,7 @@ try:
     if not MATRIX_ONLY:
         bulk_results = fetch_all_metars_once(airports)
         if bulk_results:
-            n = min(len(airports), len(bulk_results), NUM_LEDS)
+            n = min(len(airports), len(bulk_results), STRIP_ACTIVE_LEDS)
             for index in range(n):
                 if (bulk_results[index][0] is None or bulk_results[index][1] is None) and airports[index] and airports[index].strip():
                     fc, raw = get_metar_data_with_retry(airports[index])
@@ -1674,10 +1754,13 @@ try:
                 bulk_ok = True
                 print("All airport LEDs set from bulk fetch (displaying 3s)")
                 sleep_with_ota_poll(3)
+            # Always clear pixels past airport count (bulk only updates 0..n-1; tail kept startup gray)
+            clear_unused_strip_leds(len(airports))
     if not bulk_ok:
         if not MATRIX_ONLY:
             process_airports_in_batches(airports, process_first_pass, description="First pass", poll_callback=service_ota_http_and_button)
     process_airports_in_batches(airports, process_second_pass, description="Second pass", poll_callback=service_ota_http_and_button)
+    clear_unused_strip_leds(len(airports))
 
     # NTP sync once for sleep schedule (time.localtime())
     ntptime_synced = False
@@ -1770,6 +1853,7 @@ try:
             if batch_num < num_batches - 1:
                 print(f"Waiting {BATCH_DELAY} seconds before next batch...")
                 sleep_with_ota_poll(BATCH_DELAY)
+        clear_unused_strip_leds(len(airports))
         if not any_data_received:
             print("No data received for any airport in this cycle")
             check_data_timeout()
