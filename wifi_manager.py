@@ -36,6 +36,8 @@ DEFAULT_LED_MATRIX_PIN = 1
 DEFAULT_MIN_BRIGHTNESS = 2
 DEFAULT_MAX_BRIGHTNESS = 15
 DEFAULT_BATCH_SIZE = 3
+# Physical WS2812 count on GPIO pin 0 (main MetarMap strip). Not the same as batch_size (METAR fetch chunking).
+DEFAULT_NUM_LEDS_STRIP = 256
 DEFAULT_MATRIX_ONLY = False  # When False: strip shows weather effects; when True: only LED matrix scrolls
 DEFAULT_SCROLL_SPEED = 0.08  # Seconds between scroll steps (lower = faster)
 DEFAULT_MATRIX_WIRING = "SNAKE_COLUMN"  # ROW_MAJOR, COLUMN_MAJOR, SNAKE_ROW, SNAKE_COLUMN
@@ -169,6 +171,32 @@ def urldecode(string):
             i += 1
     return result
 
+def optional_physical_led_count_from_request(request):
+    """Parse optional physical_led_count from JSON or form body (longer chain than num_leds)."""
+    try:
+        if "Content-Type: application/json" in request:
+            i = request.find('\r\n\r\n')
+            if i < 0:
+                return None
+            data = json.loads(request[i + 4:])
+            v = data.get('physical_led_count')
+            if v is None or v == '':
+                return None
+            return max(1, min(480, int(float(v))))
+        if "application/x-www-form-urlencoded" in request:
+            i = request.find('\r\n\r\n')
+            if i < 0:
+                return None
+            for part in request[i + 4:].split('&'):
+                if part.startswith('physical_led_count='):
+                    val = urldecode(part.split('=', 1)[1])
+                    if val is None or str(val).strip() == '':
+                        return None
+                    return max(1, min(480, int(float(val))))
+    except Exception:
+        pass
+    return None
+
 def parse_request_data(request):
     """Parse both form data and JSON requests. Always returns 5 values for unpacking."""
     try:
@@ -234,13 +262,18 @@ def parse_request_data(request):
                         cycle_delay = max(5, min(1800, int(float(config.get('cycle_delay', DEFAULT_CYCLE_DELAY)))))
                     except (TypeError, ValueError):
                         cycle_delay = DEFAULT_CYCLE_DELAY
+                    try:
+                        num_leds = int(config.get('num_leds', DEFAULT_NUM_LEDS_STRIP))
+                        num_leds = max(1, min(480, num_leds))
+                    except (TypeError, ValueError):
+                        num_leds = DEFAULT_NUM_LEDS_STRIP
                     print("Parsed password length:", len(password_val))
                     return (ssid_val, password_val, display_type,
-                            led_matrix_brightness, led_matrix_pin, min_brightness, max_brightness, batch_size, weather_enabled, matrix_only, scroll_speed, matrix_wiring, scroll_pause_before, cycle_delay)
+                            led_matrix_brightness, led_matrix_pin, min_brightness, max_brightness, batch_size, weather_enabled, matrix_only, scroll_speed, matrix_wiring, scroll_pause_before, cycle_delay, num_leds)
             except Exception as e:
                 print("JSON parsing error:", e)
             return (None, None, DEFAULT_DISPLAY_TYPE, DEFAULT_LED_MATRIX_BRIGHTNESS, DEFAULT_LED_MATRIX_PIN,
-                    DEFAULT_MIN_BRIGHTNESS, DEFAULT_MAX_BRIGHTNESS, DEFAULT_BATCH_SIZE, DEFAULT_WEATHER_ENABLED, DEFAULT_MATRIX_ONLY, DEFAULT_SCROLL_SPEED, DEFAULT_MATRIX_WIRING, DEFAULT_SCROLL_PAUSE_BEFORE, DEFAULT_CYCLE_DELAY)
+                    DEFAULT_MIN_BRIGHTNESS, DEFAULT_MAX_BRIGHTNESS, DEFAULT_BATCH_SIZE, DEFAULT_WEATHER_ENABLED, DEFAULT_MATRIX_ONLY, DEFAULT_SCROLL_SPEED, DEFAULT_MATRIX_WIRING, DEFAULT_SCROLL_PAUSE_BEFORE, DEFAULT_CYCLE_DELAY, DEFAULT_NUM_LEDS_STRIP)
 
         # Check if it's form data (from browser)
         if "Content-Type: application/x-www-form-urlencoded" in request:
@@ -291,15 +324,19 @@ def parse_request_data(request):
                 cycle_delay = max(5, min(1800, int(float(params.get('cycle_delay', DEFAULT_CYCLE_DELAY)))))
             except (TypeError, ValueError):
                 cycle_delay = DEFAULT_CYCLE_DELAY
-            return (ssid, password, display_type, led_matrix_brightness, led_matrix_pin, min_brightness, max_brightness, batch_size, DEFAULT_WEATHER_ENABLED, matrix_only, scroll_speed, matrix_wiring, scroll_pause_before, cycle_delay)
+            try:
+                num_leds = max(1, min(480, int(params.get('num_leds', DEFAULT_NUM_LEDS_STRIP))))
+            except (TypeError, ValueError):
+                num_leds = DEFAULT_NUM_LEDS_STRIP
+            return (ssid, password, display_type, led_matrix_brightness, led_matrix_pin, min_brightness, max_brightness, batch_size, DEFAULT_WEATHER_ENABLED, matrix_only, scroll_speed, matrix_wiring, scroll_pause_before, cycle_delay, num_leds)
 
         print("No recognized Content-Type in request")
         return (None, None, DEFAULT_DISPLAY_TYPE, DEFAULT_LED_MATRIX_BRIGHTNESS, DEFAULT_LED_MATRIX_PIN,
-                DEFAULT_MIN_BRIGHTNESS, DEFAULT_MAX_BRIGHTNESS, DEFAULT_BATCH_SIZE, DEFAULT_WEATHER_ENABLED, DEFAULT_MATRIX_ONLY, DEFAULT_SCROLL_SPEED, DEFAULT_MATRIX_WIRING, DEFAULT_SCROLL_PAUSE_BEFORE, DEFAULT_CYCLE_DELAY)
+                DEFAULT_MIN_BRIGHTNESS, DEFAULT_MAX_BRIGHTNESS, DEFAULT_BATCH_SIZE, DEFAULT_WEATHER_ENABLED, DEFAULT_MATRIX_ONLY, DEFAULT_SCROLL_SPEED, DEFAULT_MATRIX_WIRING, DEFAULT_SCROLL_PAUSE_BEFORE, DEFAULT_CYCLE_DELAY, DEFAULT_NUM_LEDS_STRIP)
     except Exception as e:
         print("Error parsing request data:", e)
         return (None, None, DEFAULT_DISPLAY_TYPE, DEFAULT_LED_MATRIX_BRIGHTNESS, DEFAULT_LED_MATRIX_PIN,
-                DEFAULT_MIN_BRIGHTNESS, DEFAULT_MAX_BRIGHTNESS, DEFAULT_BATCH_SIZE, DEFAULT_WEATHER_ENABLED, DEFAULT_MATRIX_ONLY, DEFAULT_SCROLL_SPEED, DEFAULT_MATRIX_WIRING, DEFAULT_SCROLL_PAUSE_BEFORE, DEFAULT_CYCLE_DELAY)
+                DEFAULT_MIN_BRIGHTNESS, DEFAULT_MAX_BRIGHTNESS, DEFAULT_BATCH_SIZE, DEFAULT_WEATHER_ENABLED, DEFAULT_MATRIX_ONLY, DEFAULT_SCROLL_SPEED, DEFAULT_MATRIX_WIRING, DEFAULT_SCROLL_PAUSE_BEFORE, DEFAULT_CYCLE_DELAY, DEFAULT_NUM_LEDS_STRIP)
 
 def save_wifi_config(ssid, password, display_type=DEFAULT_DISPLAY_TYPE,
                      led_matrix_brightness=DEFAULT_LED_MATRIX_BRIGHTNESS,
@@ -312,8 +349,15 @@ def save_wifi_config(ssid, password, display_type=DEFAULT_DISPLAY_TYPE,
                      scroll_speed=DEFAULT_SCROLL_SPEED,
                      matrix_wiring=DEFAULT_MATRIX_WIRING,
                      scroll_pause_before=DEFAULT_SCROLL_PAUSE_BEFORE,
-                     cycle_delay=DEFAULT_CYCLE_DELAY):
+                     cycle_delay=DEFAULT_CYCLE_DELAY,
+                     num_leds=DEFAULT_NUM_LEDS_STRIP,
+                     physical_led_count=None):
     try:
+        try:
+            with open(CONFIG_FILE, 'r') as f:
+                prev_cfg = json.load(f)
+        except Exception:
+            prev_cfg = {}
         if weather_enabled is None:
             weather_enabled = DEFAULT_WEATHER_ENABLED
         if not isinstance(weather_enabled, dict):
@@ -338,8 +382,13 @@ def save_wifi_config(ssid, password, display_type=DEFAULT_DISPLAY_TYPE,
             'scroll_speed': scroll_speed,
             'matrix_wiring': matrix_wiring,
             'scroll_pause_before': scroll_pause_before,
-            'cycle_delay': cycle_delay
+            'cycle_delay': cycle_delay,
+            'num_leds': max(1, min(480, int(num_leds)))
         }
+        if physical_led_count is not None:
+            config['physical_led_count'] = max(1, min(480, int(physical_led_count)))
+        elif 'physical_led_count' in prev_cfg:
+            config['physical_led_count'] = prev_cfg['physical_led_count']
         with open(CONFIG_FILE, 'w') as f:
             json.dump(config, f)
         print("WiFi configuration saved for SSID:", ssid, "password length:", len(password) if password else 0)
@@ -349,7 +398,8 @@ def save_wifi_config(ssid, password, display_type=DEFAULT_DISPLAY_TYPE,
         return False
 
 def update_display_config_only(display_type, led_matrix_brightness, led_matrix_pin, min_brightness, max_brightness,
-                               batch_size, matrix_only, scroll_speed, matrix_wiring, scroll_pause_before, cycle_delay):
+                               batch_size, matrix_only, scroll_speed, matrix_wiring, scroll_pause_before, cycle_delay,
+                               num_leds=DEFAULT_NUM_LEDS_STRIP, physical_led_count=None):
     """Update only display/batch settings; keep existing ssid/password. Used when browser form has no WiFi fields."""
     try:
         config = {}
@@ -369,6 +419,9 @@ def update_display_config_only(display_type, led_matrix_brightness, led_matrix_p
         config['matrix_wiring'] = str(matrix_wiring).upper() if str(matrix_wiring).upper() in VALID_MATRIX_WIRING else DEFAULT_MATRIX_WIRING
         config['scroll_pause_before'] = max(0, min(2, float(scroll_pause_before)))
         config['cycle_delay'] = max(5, min(1800, int(cycle_delay)))
+        config['num_leds'] = max(1, min(480, int(num_leds)))
+        if physical_led_count is not None:
+            config['physical_led_count'] = max(1, min(480, int(physical_led_count)))
         if 'weather_enabled' not in config:
             config['weather_enabled'] = dict(DEFAULT_WEATHER_ENABLED)
         with open(CONFIG_FILE, 'w') as f:
@@ -466,6 +519,8 @@ def get_html_setup_page():
                     if (c.min_brightness != null) document.getElementById('min_brightness').value = c.min_brightness;
                     if (c.max_brightness != null) document.getElementById('max_brightness').value = c.max_brightness;
                     if (c.batch_size != null) document.getElementById('batch_size').value = c.batch_size;
+                    if (c.num_leds != null) document.getElementById('num_leds').value = c.num_leds;
+                    if (c.physical_led_count != null) document.getElementById('physical_led_count').value = c.physical_led_count;
                     if (c.cycle_delay != null) document.getElementById('cycle_delay').value = c.cycle_delay;
                     if (c.scroll_pause_before != null) document.getElementById('scroll_pause_before').value = c.scroll_pause_before;
                     if (c.matrix_only != null) document.getElementById('matrix_only').checked = c.matrix_only;
@@ -540,6 +595,17 @@ def get_html_setup_page():
                 <div class="form-group">
                     <label for="batch_size">Batch size (1-20)</label>
                     <input type="number" id="batch_size" name="batch_size" min="1" max="20" value="3">
+                    <div class="note">How many airports to fetch per API batch — not strip length.</div>
+                </div>
+                <div class="form-group">
+                    <label for="num_leds">Airport LEDs on GPIO0 strip (num_leds, 1–480)</label>
+                    <input type="number" id="num_leds" name="num_leds" min="1" max="480" value="256">
+                    <div class="note">Only the first <strong>num_leds</strong> positions can show METAR colors; the rest of the chain is forced off. Example: <strong>49</strong> airports → use 49 here.</div>
+                </div>
+                <div class="form-group">
+                    <label for="physical_led_count">Physical total on GPIO0 (optional)</label>
+                    <input type="number" id="physical_led_count" name="physical_led_count" min="1" max="480" value="">
+                    <div class="note">If this is blank, firmware uses <strong>max(num_leds, 256)</strong> so an 8×32 chain is fully clocked (no duplicate ghost block). If your chain is longer than 256, enter the real total here.</div>
                 </div>
                 <div class="form-group">
                     <label for="cycle_delay">Seconds between refreshes (5-1800)</label>
@@ -881,6 +947,8 @@ def run_server():
                         'matrix_wiring': config.get('matrix_wiring', DEFAULT_MATRIX_WIRING),
                         'scroll_pause_before': config.get('scroll_pause_before', DEFAULT_SCROLL_PAUSE_BEFORE),
                         'cycle_delay': config.get('cycle_delay', DEFAULT_CYCLE_DELAY),
+                        'num_leds': config.get('num_leds', DEFAULT_NUM_LEDS_STRIP),
+                        'physical_led_count': config.get('physical_led_count'),
                         'weather_enabled': config.get('weather_enabled', DEFAULT_WEATHER_ENABLED),
                         'sleep_enabled': config.get('sleep_enabled', False),
                         'sleep_at_hour': config.get('sleep_at_hour', 22),
@@ -989,6 +1057,20 @@ def run_server():
                         config['led_matrix_pin'] = int(updates['led_matrix_pin'])
                     if 'batch_size' in updates:
                         config['batch_size'] = max(1, min(20, int(float(updates['batch_size']))))
+                    if 'num_leds' in updates:
+                        try:
+                            config['num_leds'] = max(1, min(480, int(float(updates['num_leds']))))
+                        except (TypeError, ValueError):
+                            pass
+                    if 'physical_led_count' in updates:
+                        try:
+                            v = updates['physical_led_count']
+                            if v is None or v == '':
+                                config.pop('physical_led_count', None)
+                            else:
+                                config['physical_led_count'] = max(1, min(480, int(float(v))))
+                        except (TypeError, ValueError):
+                            pass
                     if 'min_brightness' in updates:
                         config['min_brightness'] = max(0, min(255, int(updates['min_brightness'])))
                     if 'max_brightness' in updates:
@@ -1071,10 +1153,11 @@ def run_server():
                 save_success = False
                 test_success = False
                 do_reboot = False
-                ssid, password, display_type, led_matrix_brightness, led_matrix_pin, min_brightness, max_brightness, batch_size, weather_enabled, matrix_only, scroll_speed, matrix_wiring, scroll_pause_before, cycle_delay = parse_request_data(request)
+                ssid, password, display_type, led_matrix_brightness, led_matrix_pin, min_brightness, max_brightness, batch_size, weather_enabled, matrix_only, scroll_speed, matrix_wiring, scroll_pause_before, cycle_delay, num_leds = parse_request_data(request)
+                _plc = optional_physical_led_count_from_request(request)
                 if ssid and password:
-                    print("Received credentials - SSID:", ssid, "Display:", display_type, "Batch size:", batch_size, "Matrix only:", matrix_only, "Scroll speed:", scroll_speed, "Matrix wiring:", matrix_wiring, "Cycle delay:", cycle_delay)
-                    save_success = save_wifi_config(ssid, password, display_type, led_matrix_brightness, led_matrix_pin, min_brightness, max_brightness, batch_size, weather_enabled, matrix_only, scroll_speed, matrix_wiring, scroll_pause_before, cycle_delay)
+                    print("Received credentials - SSID:", ssid, "Display:", display_type, "Batch size:", batch_size, "Strip LEDs:", num_leds, "Physical count:", _plc, "Matrix only:", matrix_only, "Scroll speed:", scroll_speed, "Matrix wiring:", matrix_wiring, "Cycle delay:", cycle_delay)
+                    save_success = save_wifi_config(ssid, password, display_type, led_matrix_brightness, led_matrix_pin, min_brightness, max_brightness, batch_size, weather_enabled, matrix_only, scroll_speed, matrix_wiring, scroll_pause_before, cycle_delay, num_leds=num_leds, physical_led_count=_plc)
                     # Parse reboot flag and optional sleep settings from body
                     try:
                         body_start = request.find('\r\n\r\n') + 4
@@ -1132,9 +1215,10 @@ def run_server():
                     conn.close()
             elif first_line.startswith("POST ") and "/configure" in first_line:
                 print("Handling browser request to /configure")
-                ssid, password, display_type, led_matrix_brightness, led_matrix_pin, min_brightness, max_brightness, batch_size, weather_enabled, matrix_only, scroll_speed, matrix_wiring, scroll_pause_before, cycle_delay = parse_request_data(request)
+                ssid, password, display_type, led_matrix_brightness, led_matrix_pin, min_brightness, max_brightness, batch_size, weather_enabled, matrix_only, scroll_speed, matrix_wiring, scroll_pause_before, cycle_delay, num_leds = parse_request_data(request)
+                _plc2 = optional_physical_led_count_from_request(request)
                 if ssid and password:
-                    save_success = save_wifi_config(ssid, password, display_type, led_matrix_brightness, led_matrix_pin, min_brightness, max_brightness, batch_size, weather_enabled, matrix_only, scroll_speed, matrix_wiring, scroll_pause_before, cycle_delay)
+                    save_success = save_wifi_config(ssid, password, display_type, led_matrix_brightness, led_matrix_pin, min_brightness, max_brightness, batch_size, weather_enabled, matrix_only, scroll_speed, matrix_wiring, scroll_pause_before, cycle_delay, num_leds=num_leds, physical_led_count=_plc2)
                     if save_success:
                         test_success, ip_address = test_wifi_connection(ssid, password)
                     else:
@@ -1150,7 +1234,7 @@ def run_server():
                         machine.reset()
                 else:
                     # Display-only update (no WiFi): save settings, then reboot
-                    ok = update_display_config_only(display_type, led_matrix_brightness, led_matrix_pin, min_brightness, max_brightness, batch_size, matrix_only, scroll_speed, matrix_wiring, scroll_pause_before, cycle_delay)
+                    ok = update_display_config_only(display_type, led_matrix_brightness, led_matrix_pin, min_brightness, max_brightness, batch_size, matrix_only, scroll_speed, matrix_wiring, scroll_pause_before, cycle_delay, num_leds=num_leds, physical_led_count=_plc2)
                     msg = "Settings saved. Rebooting..." if ok else "Failed to save settings."
                     page = get_html_display_saved_page(ok, msg)
                     conn.send('HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: ' + str(len(page)) + '\r\n\r\n')
@@ -1190,4 +1274,3 @@ def start():
     gc.collect()
     set_leds(12, 12, 0, STARTUP_BRIGHTNESS)
     run_server()
-
