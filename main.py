@@ -742,7 +742,7 @@ def connect_to_wifi(WIFI_SSID, WIFI_PASSWORD):
                     wri_ip.set_textpos(0, 20)
                     wri_ip.printstring(ip_address)
                     oled.show()
-                    time.sleep(8)
+                    time.sleep(3)
                     oled.fill(0)
                     oled.show()
                 except Exception as e:
@@ -828,7 +828,7 @@ def ensure_wifi_connected():
         print("WiFi reconnect error:", e)
         return False
 
-MAX_RETRIES = 1
+MAX_RETRIES = 3
 
 # mbedTLS on Pico W often gets this through hotspots with cellular backhaul; treat as transient
 SSL_EOF_MAX_EXTRA_TRIES = 5   # extra connection attempts per "retry" when we see SSL EOF
@@ -1557,6 +1557,27 @@ try:
             msg_color = apply_auto_brightness((255, 140, 0))
             if led_matrix is not None and DISPLAY_TYPE == "LED_MATRIX":
                 scroll_single_text_ultra_smooth("NEW UPDATE AVAILABLE PRESS BUTTON TO INSTALL", msg_color)
+            elif DISPLAY_TYPE == "OLED" and oled is not None:
+                try:
+                    oled.fill(0)
+                    if fonts_available:
+                        wu = writer.Writer(oled, sans18)
+                        wu.set_textpos(0, 0)
+                        wu.printstring("UPDATE")
+                        wu.set_textpos(0, 20)
+                        wu.printstring("AVAILABLE")
+                        wu.set_textpos(0, 40)
+                        wu.printstring("BTN / :8080")
+                    else:
+                        oled.text("UPDATE AVAIL", 0, 0, 1)
+                        oled.text("BTN or :8080", 0, 16, 1)
+                    oled.show()
+                    print("OTA: OLED — update available (6s)")
+                    time.sleep(6)
+                    oled.fill(0)
+                    oled.show()
+                except Exception as ex:
+                    print("OTA OLED banner error:", ex)
             elif DISPLAY_TYPE == "NONE":
                 # Strip-only: same amber as matrix scroll — full strip 10s so update is visible
                 try:
