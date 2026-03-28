@@ -25,7 +25,7 @@ AIRPORT_FILE = 'airports4.txt'
 
 # LED configuration
 LED_PIN = 0
-NUM_LEDS = 49
+NUM_LEDS = 256
 LED_BRIGHTNESS = 0.2
 STARTUP_BRIGHTNESS = 0.2
 
