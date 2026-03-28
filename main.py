@@ -924,8 +924,9 @@ def _parse_flight_category_from_raw(raw_text):
         return "MVFR"
     return "VFR"
 
-def get_metar_data_with_retry(airport):
-    """Returns (flight_category, raw_text) or (None, None). Tries raw format first (smaller response, less memory)."""
+def get_metar_data_with_retry(airport, quick=False):
+    """Returns (flight_category, raw_text) or (None, None). Tries raw format first (smaller response, less memory).
+    If quick=True (first pass or bulk gap fill), skip SSL EOF backoff / outer sleep so slow airports do not block the strip."""
     retries = 0
     while retries < MAX_RETRIES:
         last_error = None
@@ -990,7 +991,12 @@ def get_metar_data_with_retry(airport):
                 last_error = e
                 print(f"Error retrieving data for {airport}: {e}")
             # Both raw and XML failed
-            if last_error and _is_ssl_eof(last_error) and ssl_retries < SSL_EOF_MAX_EXTRA_TRIES:
+            if (
+                not quick
+                and last_error
+                and _is_ssl_eof(last_error)
+                and ssl_retries < SSL_EOF_MAX_EXTRA_TRIES
+            ):
                 ssl_retries += 1
                 print("SSL closed (hotspot/cellular), retry {} in {}s...".format(ssl_retries, SSL_EOF_RETRY_DELAY))
                 time.sleep(SSL_EOF_RETRY_DELAY)
@@ -999,8 +1005,12 @@ def get_metar_data_with_retry(airport):
             break
         retries += 1
         gc.collect()
-        time.sleep(2 * retries)
-    print(f"Unable to retrieve data for {airport} after {MAX_RETRIES} retries")
+        if not quick:
+            time.sleep(2 * retries)
+    if quick:
+        print(f"Quick skip {airport} (no category yet); second pass / main loop will retry")
+    else:
+        print(f"Unable to retrieve data for {airport} after {MAX_RETRIES} retries")
     return None, None
 
 BULK_CHUNK_SIZE = 20  # airports per request; smaller = more reliable full response
@@ -1482,7 +1492,7 @@ def process_first_pass(airport, index):
             led[index] = (0, 0, 0)
             led.write()
         return
-    flight_category, raw_text = get_metar_data_with_retry(airport)
+    flight_category, raw_text = get_metar_data_with_retry(airport, quick=True)
     if flight_category is not None:
         update_data_success()
         print(f"First pass - {airport}: {flight_category}")
@@ -1757,12 +1767,13 @@ try:
             n = min(len(airports), len(bulk_results), STRIP_ACTIVE_LEDS)
             for index in range(n):
                 if (bulk_results[index][0] is None or bulk_results[index][1] is None) and airports[index] and airports[index].strip():
-                    fc, raw = get_metar_data_with_retry(airports[index])
+                    # Same quick path as process_first_pass: no SSL backoff / no extra sleep — bulk already tried these
+                    fc, raw = get_metar_data_with_retry(airports[index], quick=True)
                     if fc is not None:
                         bulk_results[index] = (fc, raw or bulk_results[index][1])
                         update_data_success()
                     gc.collect()
-                    time.sleep(0.3)
+                    time.sleep(0.05)
                 service_ota_http_and_button()
             any_set = False
             for index in range(n):
