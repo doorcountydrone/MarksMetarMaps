@@ -37,7 +37,7 @@ DISPLAY_TYPE = "LED_MATRIX"  # Default value, will be changed
 LED_MATRIX_WIDTH = 32
 LED_MATRIX_HEIGHT = 8
 LED_MATRIX_NUM_LEDS = LED_MATRIX_WIDTH * LED_MATRIX_HEIGHT  # 256 LEDs
-LED_MATRIX_PIN = 1  # Change this to your desired pin for the LED matrix
+LED_MATRIX_PIN = 0  # Change this to your desired pin for the LED matrix
 
 # LED Matrix Brightness (0.0 to 1.0) - This will be overridden by auto-brightness
 LED_MATRIX_BRIGHTNESS = 0.1  # Fallback value if auto-brightness fails
@@ -54,7 +54,7 @@ CYCLE_DELAY = 10  # Seconds between full airport list cycles; loaded from config
 # ===== FIRMWARE VERSION (for OTA update check) =====
 # Device reports this string; GitHub Pages version.json "version" must be higher to offer OTA.
 # After you flash new code, this should match what you published (or stay lower until user updates).
-FIRMWARE_VERSION = "1.0.1"
+FIRMWARE_VERSION = "1.0.0"
 
 # ===== OTA UPDATE BUTTON (GPIO for short-press "install update") =====
 # Same pin as force-AP at boot: long hold (3s) during startup = setup AP mode; short press while running = start OTA if available.
@@ -71,6 +71,8 @@ _ota_button_prev = 1  # 1 = released (pull-up); used for short-press edge detect
 _ota_service_hook = None  # set to service_ota_http_and_button so display loops can poll OTA
 _ota_btn_irq_pending = False  # set by GPIO IRQ (press) so short taps aren't missed during long sleeps
 _ota_last_btn_ms = 0  # debounce duplicate IRQ/edges
+# Set True in main loop when SLEEP_ENABLED and in OFF window and sleep_leds — blocks LDR/OTA from relighting strip from logical_colors
+_strip_dark_for_sleep = False
 
 
 def _ota_btn_irq_handler(_pin):
@@ -251,6 +253,23 @@ def check_wifi_config():
     except:
         return False
 
+
+def _as_bool(value, default=False):
+    """Parse booleans safely from bool/int/string config values."""
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        v = value.strip().lower()
+        if v in ("true", "1", "yes", "on"):
+            return True
+        if v in ("false", "0", "no", "off", ""):
+            return False
+    return bool(value)
+
 # If not configured OR force AP button was pressed, start WiFi manager
 if not check_wifi_config() or force_ap_mode:
     print("Starting setup mode...")
@@ -284,7 +303,7 @@ except Exception as e:
 # WS2811 LED configuration (initial count; wifi_config may resize after load)
 # NUM_LEDS = pixels clocked on GPIO0 (physical chain length).
 # STRIP_ACTIVE_LEDS = how many positions (0..active-1) may show airport colors; rest forced black.
-LED_PIN = 0
+LED_PIN = 1
 NUM_LEDS = 256
 STRIP_ACTIVE_LEDS = 256  # overridden from num_leds in wifi_config.json
 
@@ -350,14 +369,14 @@ try:
         if off_codes:
             print(f"Weather effects OFF for: {off_codes}")
         # Display sleep schedule (turn off matrix/LEDs/OLED at night)
-        SLEEP_ENABLED = bool(config.get("sleep_enabled", False))
+        SLEEP_ENABLED = _as_bool(config.get("sleep_enabled", False), default=False)
         SLEEP_AT_HOUR = max(0, min(23, int(config.get("sleep_at_hour", 22))))
         SLEEP_AT_MIN = max(0, min(59, int(config.get("sleep_at_minute", 0))))
         WAKE_AT_HOUR = max(0, min(23, int(config.get("wake_at_hour", 6))))
         WAKE_AT_MIN = max(0, min(59, int(config.get("wake_at_minute", 0))))
-        SLEEP_MATRIX = bool(config.get("sleep_matrix", True))
-        SLEEP_LEDS = bool(config.get("sleep_leds", True))
-        SLEEP_OLED = bool(config.get("sleep_oled", True))
+        SLEEP_MATRIX = _as_bool(config.get("sleep_matrix", True), default=True)
+        SLEEP_LEDS = _as_bool(config.get("sleep_leds", True), default=True)
+        SLEEP_OLED = _as_bool(config.get("sleep_oled", True), default=True)
         try:
             TIMEZONE_OFFSET_HOURS = max(-12, min(14, int(config.get("timezone_offset_hours", -5))))
         except (TypeError, ValueError):
@@ -804,8 +823,25 @@ def sync_ntp_once():
     return False
 
 def local_time():
-    """Return local time tuple (year, month, day, hour, min, sec, ...) using TIMEZONE_OFFSET_HOURS (UTC + offset)."""
-    return time.localtime(time.time() + TIMEZONE_OFFSET_HOURS * 3600)
+    """Return local civil time tuple (year, month, day, hour, min, sec, ...) using TIMEZONE_OFFSET_HOURS (UTC + offset).
+
+    Use gmtime so behavior does not depend on MicroPython localtime() TZ (Pico is often UTC-only).
+    """
+    return time.gmtime(time.time() + TIMEZONE_OFFSET_HOURS * 3600)
+
+
+def is_in_sleep_window_now():
+    """Return True when current local time is within configured sleep window."""
+    try:
+        t = local_time()
+        now_m = t[3] * 60 + t[4]
+        sleep_m = SLEEP_AT_HOUR * 60 + SLEEP_AT_MIN
+        wake_m = WAKE_AT_HOUR * 60 + WAKE_AT_MIN
+        if sleep_m > wake_m:  # Overnight window, e.g. 22:00-06:00
+            return now_m >= sleep_m or now_m < wake_m
+        return sleep_m <= now_m < wake_m
+    except Exception:
+        return False
 
 def ensure_wifi_connected():
     """If STA is disconnected, try to reconnect. Call periodically from main loop."""
@@ -1375,6 +1411,9 @@ def clear_unused_strip_leds(num_airport_slots):
 
 def refresh_strip_using_ldr():
     """Re-apply current_ldr_brightness to all LEDs from logical_colors."""
+    global _strip_dark_for_sleep
+    if _strip_dark_for_sleep:
+        return
     for i in range(NUM_LEDS):
         led[i] = _scale_color(logical_colors[i], current_ldr_brightness)
     led.write()
@@ -1390,6 +1429,9 @@ def check_ldr_and_refresh():
         last_ldr_refresh_time = time.time()
 
 def set_led_color(led, flight_category, index, min_brightness, max_brightness):
+    global _strip_dark_for_sleep
+    if _strip_dark_for_sleep:
+        return
     if index < 0 or index >= NUM_LEDS:
         print("Invalid LED index: {}".format(index))
         return
@@ -1439,7 +1481,57 @@ if not connect_to_wifi(WIFI_SSID, WIFI_PASSWORD):
     import wifi_manager
     wifi_manager.start()
 
-sync_ntp_once()
+_ntp_startup_ok = sync_ntp_once()
+try:
+    lt = local_time()
+    print(
+        "Startup local time (ntp_ok=%s): %04d-%02d-%02d %02d:%02d:%02d | timezone_offset_hours=%d | unix_utc=%d"
+        % (
+            _ntp_startup_ok,
+            lt[0],
+            lt[1],
+            lt[2],
+            lt[3],
+            lt[4],
+            lt[5],
+            TIMEZONE_OFFSET_HOURS,
+            int(time.time()),
+        )
+    )
+except Exception as e:
+    print("Startup time print error:", e)
+
+try:
+    _lt = local_time()
+    _sleep_m = SLEEP_AT_HOUR * 60 + SLEEP_AT_MIN
+    _wake_m = WAKE_AT_HOUR * 60 + WAKE_AT_MIN
+    _now_m = _lt[3] * 60 + _lt[4]
+    if _sleep_m > _wake_m:
+        _in_window = (_now_m >= _sleep_m or _now_m < _wake_m)
+    else:
+        _in_window = (_sleep_m <= _now_m < _wake_m)
+    print(
+        "Sleep schedule config: enabled=%s sleep_at=%02d:%02d wake_at=%02d:%02d tz=%d sleep_matrix=%s sleep_leds=%s sleep_oled=%s now=%02d:%02d in_window=%s"
+        % (
+            SLEEP_ENABLED,
+            SLEEP_AT_HOUR,
+            SLEEP_AT_MIN,
+            WAKE_AT_HOUR,
+            WAKE_AT_MIN,
+            TIMEZONE_OFFSET_HOURS,
+            SLEEP_MATRIX,
+            SLEEP_LEDS,
+            SLEEP_OLED,
+            _lt[3],
+            _lt[4],
+            _in_window,
+        )
+    )
+    if _sleep_m == _wake_m:
+        print("Sleep schedule warning: sleep_at equals wake_at; sleep window is empty.")
+except Exception as _sleep_cfg_err:
+    print("Sleep schedule print error:", _sleep_cfg_err)
+
 flight_categories = {}
 last_successful_data_time = time.time()
 print(f"Firmware version: {FIRMWARE_VERSION}")
@@ -1455,12 +1547,18 @@ def process_airports_in_batches(airports, process_function, batch_size=BATCH_SIZ
     num_batches = (total_airports + batch_size - 1) // batch_size
     print(f"\n=== {description} airports in {num_batches} batches of {batch_size} ===")
     for batch_num in range(num_batches):
+        if SLEEP_ENABLED and is_in_sleep_window_now():
+            print(f"{description} paused: entered sleep window during batch processing")
+            return True
         batch_start = batch_num * batch_size
         batch_end = min(batch_start + batch_size, total_airports)
         batch_airports = airports[batch_start:batch_end]
         print(f"\n--- Batch {batch_num + 1}/{num_batches} (Airports {batch_start}-{batch_end-1}) ---")
         print(f"Free memory before batch: {gc.mem_free()} bytes")
         for i_in_batch, airport in enumerate(batch_airports):
+            if SLEEP_ENABLED and is_in_sleep_window_now():
+                print(f"{description} paused: entered sleep window mid-batch")
+                return True
             index = batch_start + i_in_batch
             if index >= NUM_LEDS:
                 print(f"Warning: Airport {airport} at index {index} exceeds physical strip ({NUM_LEDS}). Skipping.")
@@ -1477,12 +1575,16 @@ def process_airports_in_batches(airports, process_function, batch_size=BATCH_SIZ
             if poll_callback is not None:
                 rem = float(BATCH_DELAY)
                 while rem > 0:
+                    if SLEEP_ENABLED and is_in_sleep_window_now():
+                        print(f"{description} paused: entered sleep window during batch delay")
+                        return True
                     poll_callback()
                     ch = 0.25 if rem >= 0.25 else rem
                     time.sleep(ch)
                     rem -= ch
             else:
                 time.sleep(BATCH_DELAY)
+    return False
 
 def process_first_pass(airport, index):
     if not airport or airport.strip() == "":
@@ -1525,7 +1627,11 @@ def process_second_pass(airport, index):
 def process_main_loop_batch(batch_airports, batch_start_index, poll_callback=None):
     check_ldr_and_refresh()
     any_data_received = False
+    sleep_hit = False
     for i_in_batch, airport in enumerate(batch_airports):
+        if SLEEP_ENABLED and is_in_sleep_window_now():
+            sleep_hit = True
+            break
         if poll_callback is not None:
             poll_callback()
         index = batch_start_index + i_in_batch
@@ -1551,7 +1657,7 @@ def process_main_loop_batch(batch_airports, batch_start_index, poll_callback=Non
             print(f"No data for {airport}")
         if poll_callback is not None:
             poll_callback()
-    return any_data_received
+    return any_data_received, sleep_hit
 
 try:
     # OTA: check before long METAR batches so serial shows result within seconds of WiFi
@@ -1792,13 +1898,27 @@ try:
                 sleep_with_ota_poll(3)
             # Always clear pixels past airport count (bulk only updates 0..n-1; tail kept startup gray)
             clear_unused_strip_leds(len(airports))
+    startup_sleep_hit = False
     if not bulk_ok:
         if not MATRIX_ONLY:
-            process_airports_in_batches(airports, process_first_pass, description="First pass", poll_callback=service_ota_http_and_button)
-    process_airports_in_batches(airports, process_second_pass, description="Second pass", poll_callback=service_ota_http_and_button)
+            startup_sleep_hit = process_airports_in_batches(
+                airports,
+                process_first_pass,
+                description="First pass",
+                poll_callback=service_ota_http_and_button,
+            )
+    if not startup_sleep_hit:
+        startup_sleep_hit = process_airports_in_batches(
+            airports,
+            process_second_pass,
+            description="Second pass",
+            poll_callback=service_ota_http_and_button,
+        )
+    if startup_sleep_hit:
+        print("Startup METAR passes paused for sleep window; entering scheduler loop")
     clear_unused_strip_leds(len(airports))
 
-    # NTP sync once for sleep schedule (time.localtime())
+    # NTP sync once for sleep schedule (local_time() = gmtime(utc + offset))
     ntptime_synced = False
     def maybe_sync_ntp():
         global ntptime_synced
@@ -1826,7 +1946,9 @@ try:
     def clear_displays_for_sleep():
         try:
             if SLEEP_LEDS and led is not None:
-                for i in range(len(led)):
+                n = min(NUM_LEDS, len(led))
+                for i in range(n):
+                    logical_colors[i] = (0, 0, 0)
                     led[i] = (0, 0, 0)
                 led.write()
             if SLEEP_MATRIX and led_matrix is not None:
@@ -1839,15 +1961,35 @@ try:
             print("Sleep clear err:", e)
 
     displays_sleeping = False
+    _last_sleep_diag_minute = None
 
     while True:
-        service_ota_http_and_button()
-        check_ldr_and_refresh()
         maybe_sync_ntp()
         ensure_wifi_connected()
-        if SLEEP_ENABLED and is_in_sleep_window():
+        t_diag = local_time()
+        in_sleep = SLEEP_ENABLED and is_in_sleep_window()
+        if _last_sleep_diag_minute != t_diag[4]:
+            _last_sleep_diag_minute = t_diag[4]
+            print(
+                "Sleep check: enabled=%s now=%02d:%02d sleep_at=%02d:%02d wake_at=%02d:%02d in_window=%s"
+                % (
+                    SLEEP_ENABLED,
+                    t_diag[3],
+                    t_diag[4],
+                    SLEEP_AT_HOUR,
+                    SLEEP_AT_MIN,
+                    WAKE_AT_HOUR,
+                    WAKE_AT_MIN,
+                    in_sleep,
+                )
+            )
+        _strip_dark_for_sleep = bool(in_sleep and SLEEP_LEDS)
+        service_ota_http_and_button()
+        if not in_sleep:
+            check_ldr_and_refresh()
+        if in_sleep:
+            clear_displays_for_sleep()
             if not displays_sleeping:
-                clear_displays_for_sleep()
                 displays_sleeping = True
                 t = local_time()
                 print("Current time (local): %04d-%02d-%02d %02d:%02d:%02d - Display sleep: off until %02d:%02d" % (t[0], t[1], t[2], t[3], t[4], t[5], WAKE_AT_HOUR, WAKE_AT_MIN))
@@ -1856,9 +1998,32 @@ try:
         just_woke_from_sleep = displays_sleeping
         displays_sleeping = False
         if just_woke_from_sleep:
+            t = local_time()
+            print("Display wake: %02d:%02d - running full refresh from first pass" % (t[3], t[4]))
+            wake_sleep_hit = False
+            if not MATRIX_ONLY:
+                wake_sleep_hit = process_airports_in_batches(
+                    airports,
+                    process_first_pass,
+                    description="Wake first pass",
+                    poll_callback=service_ota_http_and_button,
+                )
+            if not wake_sleep_hit:
+                wake_sleep_hit = process_airports_in_batches(
+                    airports,
+                    process_second_pass,
+                    description="Wake second pass",
+                    poll_callback=service_ota_http_and_button,
+                )
+            if wake_sleep_hit:
+                print("Wake refresh paused: re-entered sleep window")
+                continue
+            clear_unused_strip_leds(len(airports))
             update_data_success()
             t = local_time()
-            print("Display wake: %02d:%02d - resuming METAR fetch" % (t[3], t[4]))
+            print("Wake refresh complete at %02d:%02d - next cycle in %ds" % (t[3], t[4], CYCLE_DELAY))
+            sleep_with_ota_poll(CYCLE_DELAY)
+            continue
         check_data_timeout()
         if no_data_warning_active and DISPLAY_TYPE == "LED_MATRIX":
             print("NO DATA warning active - displaying warning and checking connection...")
@@ -1881,14 +2046,24 @@ try:
             batch_airports = airports[batch_start:batch_end]
             print(f"\n--- Main Loop Batch {batch_num + 1}/{num_batches} (Airports {batch_start}-{batch_end-1}) ---")
             print(f"Free memory before batch: {gc.mem_free()} bytes")
-            batch_data_received = process_main_loop_batch(
+            batch_data_received, batch_sleep_hit = process_main_loop_batch(
                 batch_airports, batch_start, poll_callback=service_ota_http_and_button
             )
             any_data_received = any_data_received or batch_data_received
+            if batch_sleep_hit:
+                print("Main loop batch paused: entered sleep window")
+                break
             print(f"Free memory after batch: {gc.mem_free()} bytes")
             if batch_num < num_batches - 1:
                 print(f"Waiting {BATCH_DELAY} seconds before next batch...")
                 sleep_with_ota_poll(BATCH_DELAY)
+        if SLEEP_ENABLED and is_in_sleep_window_now():
+            clear_displays_for_sleep()
+            displays_sleeping = True
+            t = local_time()
+            print("Current time (local): %04d-%02d-%02d %02d:%02d:%02d - Display sleep: off until %02d:%02d" % (t[0], t[1], t[2], t[3], t[4], t[5], WAKE_AT_HOUR, WAKE_AT_MIN))
+            sleep_with_ota_poll(CYCLE_DELAY)
+            continue
         clear_unused_strip_leds(len(airports))
         if not any_data_received:
             print("No data received for any airport in this cycle")
@@ -1916,4 +2091,7 @@ finally:
             led_matrix.write()
     except:
         pass
+
+
+
 
