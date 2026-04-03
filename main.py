@@ -37,7 +37,7 @@ DISPLAY_TYPE = "LED_MATRIX"  # Default value, will be changed
 LED_MATRIX_WIDTH = 32
 LED_MATRIX_HEIGHT = 8
 LED_MATRIX_NUM_LEDS = LED_MATRIX_WIDTH * LED_MATRIX_HEIGHT  # 256 LEDs
-LED_MATRIX_PIN = 0  # Change this to your desired pin for the LED matrix
+LED_MATRIX_PIN = 1  # Change this to your desired pin for the LED matrix
 
 # LED Matrix Brightness (0.0 to 1.0) - This will be overridden by auto-brightness
 LED_MATRIX_BRIGHTNESS = 0.1  # Fallback value if auto-brightness fails
@@ -303,7 +303,7 @@ except Exception as e:
 # WS2811 LED configuration (initial count; wifi_config may resize after load)
 # NUM_LEDS = pixels clocked on GPIO0 (physical chain length).
 # STRIP_ACTIVE_LEDS = how many positions (0..active-1) may show airport colors; rest forced black.
-LED_PIN = 1
+LED_PIN = 0
 NUM_LEDS = 256
 STRIP_ACTIVE_LEDS = 256  # overridden from num_leds in wifi_config.json
 
