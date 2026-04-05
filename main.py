@@ -54,7 +54,7 @@ CYCLE_DELAY = 10  # Seconds between full airport list cycles; loaded from config
 # ===== FIRMWARE VERSION (for OTA update check) =====
 # Device reports this string; GitHub Pages version.json "version" must be higher to offer OTA.
 # After you flash new code, this should match what you published (or stay lower until user updates).
-FIRMWARE_VERSION = "1.0.1"
+FIRMWARE_VERSION = "1.0.0"
 
 # ===== OTA UPDATE BUTTON (GPIO for short-press "install update") =====
 # Same pin as force-AP at boot: long hold (3s) during startup = setup AP mode; short press while running = start OTA if available.
@@ -163,7 +163,7 @@ def map_ldr_to_brightness(ldr_value, min_brightness, max_brightness):
 
 def get_led_matrix_brightness():
     """Get brightness factor (0.0-1.0) for LED matrix - SAME LOGIC AS MAIN LEDs.
-    When a GPIO0 strip is used, refresh it from LDR so strip and matrix stay in sync.
+    When a main-strip NeoPixel chain is used, refresh it from LDR so strip and matrix stay in sync.
     When MATRIX_ONLY, skip strip refresh (no geographic strip — avoids spurious data on pin 0)."""
     global current_ldr_brightness
     ldr_value = read_ldr_value()
@@ -301,7 +301,7 @@ except Exception as e:
     print(f"Error initializing pins: {e}")
 
 # WS2811 LED configuration (initial count; wifi_config may resize after load)
-# NUM_LEDS = pixels clocked on GPIO0 (physical chain length).
+# NUM_LEDS = pixels clocked on METAR strip GPIO (see wifi_config led_pin; default GPIO 0).
 # STRIP_ACTIVE_LEDS = how many positions (0..active-1) may show airport colors; rest forced black.
 LED_PIN = 0
 NUM_LEDS = 256
@@ -332,7 +332,24 @@ try:
         WIFI_PASSWORD = str(config.get('password', '') or '')
         DISPLAY_TYPE = config.get('display_type', 'LED_MATRIX')
         LED_MATRIX_BRIGHTNESS = config.get('led_matrix_brightness', 0.01)
-        LED_MATRIX_PIN = config.get('led_matrix_pin', 1)
+        try:
+            LED_MATRIX_PIN = max(0, min(28, int(config.get("led_matrix_pin", 1))))
+        except (TypeError, ValueError):
+            LED_MATRIX_PIN = 1
+            print("wifi_config led_matrix_pin invalid, using GPIO 1 for matrix")
+        try:
+            # METAR strip only — must differ from LED_MATRIX_PIN when both are NeoPixel (same pin = strip freezes / shows garbage)
+            LED_PIN = max(0, min(28, int(config.get("led_pin", 0))))
+        except (TypeError, ValueError):
+            LED_PIN = 0
+            print("wifi_config led_pin invalid, using GPIO 0 for METAR strip")
+        if DISPLAY_TYPE == "LED_MATRIX" and LED_PIN == LED_MATRIX_PIN:
+            _alt = 1 if LED_PIN != 1 else 2
+            print(
+                "WARNING: led_pin and led_matrix_pin were both GPIO %d — two NeoPixels on one pin breaks the strip. "
+                "Using GPIO %d for matrix (fix wifi_config.json to match wiring)." % (LED_PIN, _alt)
+            )
+            LED_MATRIX_PIN = _alt
         BATCH_SIZE = max(1, min(20, config.get('batch_size', 3)))
         MIN_BRIGHTNESS = max(0, min(255, config.get('min_brightness', 2)))
         MAX_BRIGHTNESS = max(0, min(255, config.get('max_brightness', 15)))
@@ -382,7 +399,7 @@ try:
         except (TypeError, ValueError):
             TIMEZONE_OFFSET_HOURS = -5
         # num_leds = airport strip slots (only 0..num_leds-1 may show METAR colors).
-        # physical_led_count = total WS2812 on GPIO0. NeoPixel buffer = max(active, physical).
+        # physical_led_count = total WS2812 on led_pin. NeoPixel buffer = max(active, physical).
         # If physical is OMITTED: default to max(num_leds, 256) so 8×32-style panels still get
         # every pixel clocked off. (If you only clock 49 into a 256 chain, LEDs 50+ keep latched
         # data — looks like a duplicate second block.)
@@ -417,14 +434,17 @@ try:
             led[i] = (0, 0, 0)
         led.write()
         print(
-            "METAR strip: %d WS2812 clocked (physical); airport LEDs = first %d (num_leds). "
+            "METAR strip: GPIO %d, %d WS2812 clocked (physical); airport LEDs = first %d (num_leds). "
             "physical_led_count: %s"
             % (
+                LED_PIN,
                 NUM_LEDS,
                 STRIP_ACTIVE_LEDS,
                 _p_effective if _p_effective is not None else "(unset/<=1/invalid → use max(num_leds,256))",
             )
         )
+        if DISPLAY_TYPE == "LED_MATRIX":
+            print("LED matrix: GPIO %d (must differ from METAR strip GPIO %d)" % (LED_MATRIX_PIN, LED_PIN))
         del config
         gc.collect()
 except Exception as e:
@@ -1762,6 +1782,59 @@ try:
 
     _ota_rebind_after = 0.0
 
+    def _http_wifi_config_json_body():
+        """Same JSON shape as wifi_manager GET /config — used on :8080 while main.py runs (no server on port 80)."""
+        try:
+            with open(CONFIG_FILE, "r") as f:
+                cfg = json.load(f)
+        except Exception:
+            cfg = {}
+        we = cfg.get("weather_enabled")
+        if not isinstance(we, dict):
+            we = {str(c): True for c in WX_TAGS}
+        else:
+            we = {str(k): bool(v) for k, v in we.items()}
+            for code in WX_TAGS:
+                if code not in we:
+                    we[code] = True
+        try:
+            _lp = int(cfg.get("led_pin", 0))
+            _lp = max(0, min(28, _lp))
+        except (TypeError, ValueError):
+            _lp = 0
+        try:
+            _lmp = int(cfg.get("led_matrix_pin", 1))
+            _lmp = max(0, min(28, _lmp))
+        except (TypeError, ValueError):
+            _lmp = 1
+        out = {
+            "display_type": cfg.get("display_type", "LED_MATRIX"),
+            "led_matrix_brightness": float(cfg.get("led_matrix_brightness", 0.1)),
+            "led_matrix_pin": _lmp,
+            "led_pin": _lp,
+            "min_brightness": int(cfg.get("min_brightness", 2)),
+            "max_brightness": int(cfg.get("max_brightness", 15)),
+            "batch_size": int(cfg.get("batch_size", 3)),
+            "matrix_only": bool(cfg.get("matrix_only", False)),
+            "scroll_speed": float(cfg.get("scroll_speed", 0.08)),
+            "matrix_wiring": str(cfg.get("matrix_wiring", "SNAKE_COLUMN")),
+            "scroll_pause_before": float(cfg.get("scroll_pause_before", 0.75)),
+            "cycle_delay": int(cfg.get("cycle_delay", 10)),
+            "num_leds": int(cfg.get("num_leds", 256)),
+            "physical_led_count": cfg.get("physical_led_count"),
+            "weather_enabled": we,
+            "sleep_enabled": bool(cfg.get("sleep_enabled", False)),
+            "sleep_at_hour": int(cfg.get("sleep_at_hour", 22)),
+            "sleep_at_minute": int(cfg.get("sleep_at_minute", 0)),
+            "wake_at_hour": int(cfg.get("wake_at_hour", 6)),
+            "wake_at_minute": int(cfg.get("wake_at_minute", 0)),
+            "sleep_matrix": bool(cfg.get("sleep_matrix", True)),
+            "sleep_leds": bool(cfg.get("sleep_leds", True)),
+            "sleep_oled": bool(cfg.get("sleep_oled", True)),
+            "timezone_offset_hours": int(cfg.get("timezone_offset_hours", 0)),
+        }
+        return json.dumps(out)
+
     def service_ota_http_and_button():
         global update_socket, _ota_rebind_after, _ota_button_prev, _ota_btn_irq_pending, _ota_last_btn_ms
         """OTA button + port 8080."""
@@ -1810,6 +1883,26 @@ try:
                     conn.close()
                     return
                 first = req.split("\n")[0].strip() if req else ""
+                if first.startswith("GET ") and "/config" in first:
+                    try:
+                        _cfg_body = _http_wifi_config_json_body()
+                        _cfg_b = _cfg_body.encode("utf-8")
+                        conn.send(
+                            b"HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nConnection: close\r\n"
+                        )
+                        conn.send(("Content-Length: %d\r\n\r\n" % len(_cfg_b)).encode("ascii"))
+                        conn.sendall(_cfg_b)
+                    except Exception as _cfg_ex:
+                        print("OTA GET /config error:", _cfg_ex)
+                        try:
+                            conn.send(b"HTTP/1.1 500\r\nConnection: close\r\n\r\n")
+                        except Exception:
+                            pass
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+                    return
                 if first.startswith("POST ") and "/start-update" in first:
                     try:
                         import updater
@@ -1998,6 +2091,15 @@ try:
         just_woke_from_sleep = displays_sleeping
         displays_sleeping = False
         if just_woke_from_sleep:
+            # After display sleep, ensure strip updates are not blocked and LDR/strip are resynced (long sleep skipped LDR poll).
+            _strip_dark_for_sleep = False
+            if not MATRIX_ONLY:
+                try:
+                    current_ldr_brightness = map_ldr_to_brightness(read_ldr_value(), MIN_BRIGHTNESS, MAX_BRIGHTNESS)
+                    last_ldr_refresh_time = time.time()
+                    refresh_strip_using_ldr()
+                except Exception as _wake_strip_e:
+                    print("Wake strip resync:", _wake_strip_e)
             t = local_time()
             print("Display wake: %02d:%02d - running full refresh from first pass" % (t[3], t[4]))
             wake_sleep_hit = False
@@ -2019,6 +2121,11 @@ try:
                 print("Wake refresh paused: re-entered sleep window")
                 continue
             clear_unused_strip_leds(len(airports))
+            if not MATRIX_ONLY:
+                try:
+                    refresh_strip_using_ldr()
+                except Exception as _wake_strip_e2:
+                    print("Wake strip refresh after batches:", _wake_strip_e2)
             update_data_success()
             t = local_time()
             print("Wake refresh complete at %02d:%02d - next cycle in %ds" % (t[3], t[4], CYCLE_DELAY))
@@ -2091,7 +2198,3 @@ finally:
             led_matrix.write()
     except:
         pass
-
-
-
-
