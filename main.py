@@ -54,7 +54,7 @@ CYCLE_DELAY = 10  # Seconds between full airport list cycles; loaded from config
 # ===== FIRMWARE VERSION (for OTA update check) =====
 # Device reports this string; GitHub Pages version.json "version" must be higher to offer OTA.
 # After you flash new code, this should match what you published (or stay lower until user updates).
-FIRMWARE_VERSION = "1.0.2"
+FIRMWARE_VERSION = "1.0.3"
 
 # ===== OTA UPDATE BUTTON (GPIO for short-press "install update") =====
 # Same pin as force-AP at boot: long hold (3s) during startup = setup AP mode; short press while running = start OTA if available.
