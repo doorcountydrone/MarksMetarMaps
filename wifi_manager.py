@@ -101,7 +101,10 @@ def _parse_sleep_schedule_from_form(params):
             raw = params.get(key)
             if raw is None or raw == '':
                 return default
-            return max(lo, min(hi, int(float(raw))))
+            s = str(raw).strip()
+            if s == '':
+                return default
+            return max(lo, min(hi, int(float(s))))
         except Exception:
             return default
     try:
@@ -242,23 +245,43 @@ def urldecode(string):
             i += 1
     return result
 
+def _http_header_value(request, header_name):
+    """Return first header value (case-insensitive header name), or ''."""
+    try:
+        prefix = (header_name.strip() + ':').lower()
+        for line in request.split('\r\n'):
+            if line and line.lower().startswith(prefix):
+                return line.split(':', 1)[1].strip()
+    except Exception:
+        pass
+    return ''
+
+def _content_length_int(request):
+    """Parse Content-Length header (any case)."""
+    try:
+        v = _http_header_value(request, 'content-length')
+        if v:
+            return int(v.strip())
+    except Exception:
+        pass
+    return None
+
 def optional_physical_led_count_from_request(request):
     """Parse optional physical_led_count from JSON or form body (longer chain than num_leds)."""
     try:
-        if "Content-Type: application/json" in request:
-            i = request.find('\r\n\r\n')
-            if i < 0:
-                return None
-            data = json.loads(request[i + 4:])
+        ct = _http_header_value(request, 'content-type').lower()
+        i = request.find('\r\n\r\n')
+        if i < 0:
+            return None
+        body = request[i + 4:]
+        if 'application/json' in ct:
+            data = json.loads(body)
             v = data.get('physical_led_count')
             if v is None or v == '':
                 return None
             return max(1, min(480, int(float(v))))
-        if "application/x-www-form-urlencoded" in request:
-            i = request.find('\r\n\r\n')
-            if i < 0:
-                return None
-            for part in request[i + 4:].split('&'):
+        if 'application/x-www-form-urlencoded' in ct:
+            for part in body.split('&'):
                 if part.startswith('physical_led_count='):
                     val = urldecode(part.split('=', 1)[1])
                     if val is None or str(val).strip() == '':
@@ -272,8 +295,9 @@ def parse_request_data(request):
     """Parse both form data and JSON requests. Returns (ssid, password, display..., led_pin, sleep_schedule)."""
     try:
         print("Parsing request data...")
+        ct = _http_header_value(request, 'content-type').lower()
         # Check if it's a JSON request (from Android app)
-        if "Content-Type: application/json" in request:
+        if 'application/json' in ct:
             print("Detected JSON request")
             json_start = request.find('\r\n\r\n') + 4
             json_data = request[json_start:]
@@ -352,8 +376,8 @@ def parse_request_data(request):
             return (None, None, DEFAULT_DISPLAY_TYPE, DEFAULT_LED_MATRIX_BRIGHTNESS, DEFAULT_LED_MATRIX_PIN,
                     DEFAULT_MIN_BRIGHTNESS, DEFAULT_MAX_BRIGHTNESS, DEFAULT_BATCH_SIZE, DEFAULT_WEATHER_ENABLED, DEFAULT_MATRIX_ONLY, DEFAULT_SCROLL_SPEED, DEFAULT_MATRIX_WIRING, DEFAULT_SCROLL_PAUSE_BEFORE, DEFAULT_CYCLE_DELAY, DEFAULT_NUM_LEDS_STRIP, DEFAULT_LED_PIN, dict(DEFAULT_SLEEP_SCHEDULE))
 
-        # Check if it's form data (from browser)
-        if "Content-Type: application/x-www-form-urlencoded" in request:
+        # Form POST from browser (charset may follow; Content-Type: is often lowercase)
+        if 'application/x-www-form-urlencoded' in ct:
             print("Detected form data request")
             form_data_start = request.find('\r\n\r\n') + 4
             form_data = request[form_data_start:]
@@ -484,6 +508,10 @@ def save_wifi_config(ssid, password, display_type=DEFAULT_DISPLAY_TYPE,
             for k in DEFAULT_SLEEP_SCHEDULE:
                 if k in prev_cfg:
                     config[k] = prev_cfg[k]
+        # Never shrink file: merge keys missing from this save (truncated POST, etc.)
+        for k, v in prev_cfg.items():
+            if k not in config:
+                config[k] = v
         with open(CONFIG_FILE, 'w') as f:
             json.dump(config, f)
         print("WiFi configuration saved for SSID:", ssid, "password length:", len(password) if password else 0)
@@ -532,6 +560,80 @@ def update_display_config_only(display_type, led_matrix_brightness, led_matrix_p
     except Exception as e:
         print("Error updating display config:", e)
         return False
+
+def _normalize_config_for_json_api(config):
+    """Coerce wifi_config values to int/float/bool so JSON parses as numbers in browsers (not strings)."""
+    def _gi(key, default, lo, hi):
+        v = config.get(key, default)
+        try:
+            n = int(float(v))
+        except (TypeError, ValueError):
+            n = default
+        return max(lo, min(hi, n))
+
+    def _gf(key, default, lo, hi):
+        v = config.get(key, default)
+        try:
+            x = float(v)
+        except (TypeError, ValueError):
+            x = default
+        return max(lo, min(hi, x))
+
+    def _gb(key, default):
+        v = config.get(key, default)
+        if isinstance(v, bool):
+            return v
+        if isinstance(v, (int, float)):
+            return bool(v)
+        s = str(v).lower()
+        if s in ('1', 'true', 'yes', 'on'):
+            return True
+        if s in ('0', 'false', 'no', 'off', ''):
+            return False
+        return default
+
+    we = config.get('weather_enabled', DEFAULT_WEATHER_ENABLED)
+    if not isinstance(we, dict):
+        we = dict(DEFAULT_WEATHER_ENABLED)
+    else:
+        we = {str(k): bool(v) for k, v in we.items()}
+        for code in WX_TAGS:
+            if code not in we:
+                we[code] = True
+    plc = config.get('physical_led_count')
+    if plc is not None and plc != '':
+        try:
+            plc = max(1, min(480, int(float(plc))))
+        except (TypeError, ValueError):
+            plc = None
+    else:
+        plc = None
+    return {
+        'display_type': str(config.get('display_type', DEFAULT_DISPLAY_TYPE)),
+        'led_matrix_brightness': _gf('led_matrix_brightness', DEFAULT_LED_MATRIX_BRIGHTNESS, 0.0, 1.0),
+        'led_matrix_pin': _gi('led_matrix_pin', DEFAULT_LED_MATRIX_PIN, 0, 28),
+        'led_pin': _gi('led_pin', DEFAULT_LED_PIN, 0, 28),
+        'min_brightness': _gi('min_brightness', DEFAULT_MIN_BRIGHTNESS, 0, 255),
+        'max_brightness': _gi('max_brightness', DEFAULT_MAX_BRIGHTNESS, 0, 255),
+        'batch_size': _gi('batch_size', DEFAULT_BATCH_SIZE, 1, 20),
+        'matrix_only': _gb('matrix_only', DEFAULT_MATRIX_ONLY),
+        'scroll_speed': _gf('scroll_speed', DEFAULT_SCROLL_SPEED, 0.03, 0.2),
+        'matrix_wiring': str(config.get('matrix_wiring', DEFAULT_MATRIX_WIRING)).upper() if str(config.get('matrix_wiring', DEFAULT_MATRIX_WIRING)).upper() in VALID_MATRIX_WIRING else DEFAULT_MATRIX_WIRING,
+        'scroll_pause_before': _gf('scroll_pause_before', DEFAULT_SCROLL_PAUSE_BEFORE, 0.0, 2.0),
+        'cycle_delay': _gi('cycle_delay', DEFAULT_CYCLE_DELAY, 5, 1800),
+        'num_leds': _gi('num_leds', DEFAULT_NUM_LEDS_STRIP, 1, 480),
+        'physical_led_count': plc,
+        'weather_enabled': we,
+        'sleep_enabled': _gb('sleep_enabled', False),
+        'sleep_at_hour': _gi('sleep_at_hour', 22, 0, 23),
+        'sleep_at_minute': _gi('sleep_at_minute', 0, 0, 59),
+        'wake_at_hour': _gi('wake_at_hour', 6, 0, 23),
+        'wake_at_minute': _gi('wake_at_minute', 0, 0, 59),
+        'sleep_matrix': _gb('sleep_matrix', True),
+        'sleep_leds': _gb('sleep_leds', True),
+        'sleep_oled': _gb('sleep_oled', True),
+        'timezone_offset_hours': _gi('timezone_offset_hours', 0, -12, 14),
+    }
 
 def send_json_response(conn, success, message=None, ip=None):
     response = {
@@ -618,41 +720,76 @@ def get_html_setup_page():
                 document.getElementById('scroll_speed_val').innerText = v + ' (1=slow, 10=fast)';
                 document.getElementById('scroll_speed').value = scrollSpeedToDelay(v);
             }
-            window.onload = function() {
-                toggleMatrix();
-                updateScrollLabel();
-                fetch('/config').then(function(r) { return r.json(); }).then(function(c) {
-                    if (c.display_type) document.getElementById('display_type').value = c.display_type;
-                    if (typeof c.led_matrix_pin === 'number') document.getElementById('led_matrix_pin').value = c.led_matrix_pin;
-                    if (typeof c.led_pin === 'number') document.getElementById('led_pin').value = c.led_pin;
-                    if (c.min_brightness != null) document.getElementById('min_brightness').value = c.min_brightness;
-                    if (c.max_brightness != null) document.getElementById('max_brightness').value = c.max_brightness;
-                    if (c.batch_size != null) document.getElementById('batch_size').value = c.batch_size;
-                    if (c.num_leds != null) document.getElementById('num_leds').value = c.num_leds;
-                    if (c.physical_led_count != null) document.getElementById('physical_led_count').value = c.physical_led_count;
-                    if (c.cycle_delay != null) document.getElementById('cycle_delay').value = c.cycle_delay;
-                    if (c.scroll_pause_before != null) document.getElementById('scroll_pause_before').value = c.scroll_pause_before;
-                    if (c.matrix_only != null) document.getElementById('matrix_only').checked = c.matrix_only;
-                    if (c.matrix_wiring) document.getElementById('matrix_wiring').value = c.matrix_wiring;
-                    if (c.scroll_speed != null) {
-                        var delay = c.scroll_speed;
+            function numFrom(v) {
+                if (v === null || v === undefined) return NaN;
+                if (typeof v === 'number' && !isNaN(v)) return v;
+                var x = parseFloat(String(v).replace(',', '.'));
+                return isNaN(x) ? NaN : x;
+            }
+            function setInputNum(id, v, asInt) {
+                var n = numFrom(v);
+                if (isNaN(n)) return;
+                var el = document.getElementById(id);
+                if (!el) return;
+                el.value = asInt ? String(Math.round(n)) : String(n);
+            }
+            function setCheckbox(id, v) {
+                var el = document.getElementById(id);
+                if (!el) return;
+                if (typeof v === 'boolean') { el.checked = v; return; }
+                if (v === 1 || v === '1' || v === 'true' || v === 'True') { el.checked = true; return; }
+                if (v === 0 || v === '0' || v === 'false' || v === 'False') { el.checked = false; return; }
+                el.checked = !!v;
+            }
+            function applyConfig(c) {
+                if (!c) return;
+                if (c.display_type) document.getElementById('display_type').value = c.display_type;
+                setInputNum('led_matrix_pin', c.led_matrix_pin, true);
+                setInputNum('led_pin', c.led_pin, true);
+                setInputNum('min_brightness', c.min_brightness, true);
+                setInputNum('max_brightness', c.max_brightness, true);
+                setInputNum('batch_size', c.batch_size, true);
+                setInputNum('num_leds', c.num_leds, true);
+                if (c.physical_led_count !== undefined && c.physical_led_count !== null && c.physical_led_count !== '')
+                    setInputNum('physical_led_count', c.physical_led_count, true);
+                setInputNum('cycle_delay', c.cycle_delay, true);
+                setInputNum('scroll_pause_before', c.scroll_pause_before, false);
+                setCheckbox('matrix_only', c.matrix_only);
+                if (c.matrix_wiring) document.getElementById('matrix_wiring').value = c.matrix_wiring;
+                if (c.scroll_speed != null) {
+                    var delay = numFrom(c.scroll_speed);
+                    if (!isNaN(delay)) {
                         var slider = Math.round(1 + (0.2 - delay) * 9 / 0.17);
                         slider = Math.max(1, Math.min(10, slider));
                         document.getElementById('scroll_speed_slider').value = slider;
                         document.getElementById('scroll_speed').value = scrollSpeedToDelay(slider);
                         updateScrollLabel();
                     }
-                    if (typeof c.timezone_offset_hours === 'number') document.getElementById('timezone_offset_hours').value = c.timezone_offset_hours;
-                    if (typeof c.sleep_enabled === 'boolean') document.getElementById('sleep_enabled').checked = c.sleep_enabled;
-                    if (typeof c.sleep_at_hour === 'number') document.getElementById('sleep_at_hour').value = c.sleep_at_hour;
-                    if (typeof c.sleep_at_minute === 'number') document.getElementById('sleep_at_minute').value = c.sleep_at_minute;
-                    if (typeof c.wake_at_hour === 'number') document.getElementById('wake_at_hour').value = c.wake_at_hour;
-                    if (typeof c.wake_at_minute === 'number') document.getElementById('wake_at_minute').value = c.wake_at_minute;
-                    if (typeof c.sleep_matrix === 'boolean') document.getElementById('sleep_matrix').checked = c.sleep_matrix;
-                    if (typeof c.sleep_leds === 'boolean') document.getElementById('sleep_leds').checked = c.sleep_leds;
-                    if (typeof c.sleep_oled === 'boolean') document.getElementById('sleep_oled').checked = c.sleep_oled;
-                    toggleMatrix();
-                }).catch(function() {});
+                }
+                setInputNum('timezone_offset_hours', c.timezone_offset_hours, true);
+                setCheckbox('sleep_enabled', c.sleep_enabled);
+                setInputNum('sleep_at_hour', c.sleep_at_hour, true);
+                setInputNum('sleep_at_minute', c.sleep_at_minute, true);
+                setInputNum('wake_at_hour', c.wake_at_hour, true);
+                setInputNum('wake_at_minute', c.wake_at_minute, true);
+                setCheckbox('sleep_matrix', c.sleep_matrix);
+                setCheckbox('sleep_leds', c.sleep_leds);
+                setCheckbox('sleep_oled', c.sleep_oled);
+                toggleMatrix();
+            }
+            window.onload = function() {
+                toggleMatrix();
+                updateScrollLabel();
+                var msg = document.getElementById('config_load_msg');
+                fetch('/config').then(function(r) {
+                    if (!r.ok) throw new Error('bad status');
+                    return r.json();
+                }).then(function(c) {
+                    applyConfig(c);
+                    if (msg) msg.textContent = '';
+                }).catch(function() {
+                    if (msg) msg.textContent = 'Could not load saved settings from MetarMap. You can still edit and save.';
+                });
             };
         </script>
     </head>
@@ -662,8 +799,9 @@ def get_html_setup_page():
             <p><strong>MetarMap setup Wi-Fi (connect your phone here):</strong> SSID <strong>""" + AP_SSID + """</strong> &mdash; password <strong>""" + AP_PASSWORD + """</strong> (defaults in this firmware; edit <code>wifi_manager.py</code> if you changed them).</p>
             <p><strong>Same settings as the app.</strong> The fields below are your <em>home router</em> Wi-Fi for the Pico to join, not the AP password above. Leave WiFi blank to update display/brightness (device reboots to apply). Fill WiFi + tap Save &amp; Restart to set network and reboot.</p>
             <p><strong>IP:</strong> 192.168.4.1 &nbsp;|&nbsp; <a href="/">Setup</a> &nbsp; <a href="/page/airports">Airports</a> &nbsp; <a href="/page/weather">Weather</a> &nbsp; <a href="/page/help">Help</a> &nbsp; <a href="/page/update">Update</a></p>
+        <p id="config_load_msg" class="note" style="color:#a00;margin-top:8px"></p>
         </div>
-        <form action="/configure" method="post">
+        <form action="/configure" method="post" novalidate>
             <div class="config-section">
                 <div class="section-title">Home Wi-Fi (optional)</div>
                 <div class="form-group">
@@ -751,8 +889,8 @@ def get_html_setup_page():
                 <div class="section-title">Display sleep schedule</div>
                 <div class="form-group">
                     <label for="timezone_offset_hours">Timezone offset from UTC (hours, -12 to 14)</label>
-                    <input type="number" id="timezone_offset_hours" name="timezone_offset_hours" min="-12" max="14" value="0">
-                    <div class="note">Used for local sleep/wake times (same as Android app).</div>
+                    <input type="text" id="timezone_offset_hours" name="timezone_offset_hours" value="0" maxlength="4" inputmode="text" autocorrect="off" autocomplete="off" spellcheck="false" placeholder="-6">
+                    <div class="note">Use a minus for west of UTC (e.g. -6). Text field avoids phone keypads that hide the minus key.</div>
                 </div>
                 <input type="hidden" name="sleep_enabled" value="0">
                 <div class="form-group">
@@ -1063,24 +1201,21 @@ def run_server():
             set_leds(0, 0, 15)
             conn.settimeout(30)
             request = conn.recv(4096).decode('utf-8')
-            # For POST, read full body (may be split across packets) so password is never truncated
-            if "POST " in request and "Content-Length:" in request:
+            # For POST, read full body (may be split across packets). Headers are often lowercase on phones.
+            content_len = _content_length_int(request)
+            if content_len is not None and request.lstrip().upper().startswith('POST'):
                 try:
-                    cl_start = request.find("Content-Length:")
-                    cl_end = request.find("\r\n", cl_start)
-                    if cl_end > cl_start:
-                        content_len = int(request[cl_start + 14:cl_end].strip())
-                        body_start = request.find("\r\n\r\n") + 4
-                        if body_start >= 4:
-                            body_so_far = request[body_start:] if body_start <= len(request) else ''
-                            while len(body_so_far) < content_len:
-                                to_read = min(1024, content_len - len(body_so_far))
-                                chunk = conn.recv(to_read).decode('utf-8')
-                                if not chunk:
-                                    break
-                                body_so_far += chunk
-                            body_so_far = body_so_far[:content_len]
-                            request = request[:body_start] + body_so_far
+                    body_start = request.find('\r\n\r\n') + 4
+                    if body_start >= 4:
+                        body_so_far = request[body_start:] if body_start <= len(request) else ''
+                        while len(body_so_far) < content_len:
+                            to_read = min(1024, content_len - len(body_so_far))
+                            chunk = conn.recv(to_read).decode('utf-8')
+                            if not chunk:
+                                break
+                            body_so_far += chunk
+                        body_so_far = body_so_far[:content_len]
+                        request = request[:body_start] + body_so_far
                 except (ValueError, IndexError):
                     pass
             # Match GET /config (Android app or any client); first line is request line e.g. "GET /config HTTP/1.1"
@@ -1094,33 +1229,7 @@ def run_server():
                             config = json.load(f)
                     except:
                         pass
-                    # Return config with defaults for missing keys
-                    response_config = {
-                        'display_type': config.get('display_type', DEFAULT_DISPLAY_TYPE),
-                        'led_matrix_brightness': config.get('led_matrix_brightness', DEFAULT_LED_MATRIX_BRIGHTNESS),
-                        'led_matrix_pin': config.get('led_matrix_pin', DEFAULT_LED_MATRIX_PIN),
-                        'led_pin': config.get('led_pin', DEFAULT_LED_PIN),
-                        'min_brightness': config.get('min_brightness', DEFAULT_MIN_BRIGHTNESS),
-                        'max_brightness': config.get('max_brightness', DEFAULT_MAX_BRIGHTNESS),
-                        'batch_size': config.get('batch_size', DEFAULT_BATCH_SIZE),
-                        'matrix_only': config.get('matrix_only', DEFAULT_MATRIX_ONLY),
-                        'scroll_speed': config.get('scroll_speed', DEFAULT_SCROLL_SPEED),
-                        'matrix_wiring': config.get('matrix_wiring', DEFAULT_MATRIX_WIRING),
-                        'scroll_pause_before': config.get('scroll_pause_before', DEFAULT_SCROLL_PAUSE_BEFORE),
-                        'cycle_delay': config.get('cycle_delay', DEFAULT_CYCLE_DELAY),
-                        'num_leds': config.get('num_leds', DEFAULT_NUM_LEDS_STRIP),
-                        'physical_led_count': config.get('physical_led_count'),
-                        'weather_enabled': config.get('weather_enabled', DEFAULT_WEATHER_ENABLED),
-                        'sleep_enabled': config.get('sleep_enabled', False),
-                        'sleep_at_hour': config.get('sleep_at_hour', 22),
-                        'sleep_at_minute': config.get('sleep_at_minute', 0),
-                        'wake_at_hour': config.get('wake_at_hour', 6),
-                        'wake_at_minute': config.get('wake_at_minute', 0),
-                        'sleep_matrix': config.get('sleep_matrix', True),
-                        'sleep_leds': config.get('sleep_leds', True),
-                        'sleep_oled': config.get('sleep_oled', True),
-                        'timezone_offset_hours': config.get('timezone_offset_hours', 0)
-                    }
+                    response_config = _normalize_config_for_json_api(config)
                     response_body = json.dumps(response_config)
                     rb = response_body.encode('utf-8')
                     conn.send('HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: %d\r\n\r\n' % len(rb))
@@ -1410,4 +1519,5 @@ def start():
     gc.collect()
     set_leds(12, 12, 0, STARTUP_BRIGHTNESS)
     run_server()
+
 
