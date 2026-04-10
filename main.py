@@ -9,7 +9,7 @@ import neopixel
 from machine import ADC, Pin, I2C
 import ssd1306
 import framebuf
-import os  # Added missing import
+import os
 
 machine.freq(230_000_000)
 
