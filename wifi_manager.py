@@ -33,7 +33,7 @@ STARTUP_BRIGHTNESS = 0.2
 DEFAULT_DISPLAY_TYPE = "OLED"
 DEFAULT_LED_MATRIX_BRIGHTNESS = 0.1
 DEFAULT_LED_MATRIX_PIN = 1
-# METAR airport strip (WS2812) data pin — same as main.py LED_PIN / wifi_config "led_pin"
+# METAR airport strip (WS2812) data pin - same as main.py LED_PIN / wifi_config "led_pin"
 DEFAULT_LED_PIN = 0
 DEFAULT_MIN_BRIGHTNESS = 2
 DEFAULT_MAX_BRIGHTNESS = 15
@@ -49,6 +49,75 @@ VALID_MATRIX_WIRING = ("ROW_MAJOR", "COLUMN_MAJOR", "SNAKE_ROW", "SNAKE_COLUMN")
 # All 24 wx codes from main.py - all enabled by default
 WX_TAGS = ["BR", "-RA", "RA", "+RA", "-SN", "SN", "+SN", "SHSN", "LTG", "DSNT", "WND", "FG", "FZFG", "FZFD", "CLR", "CC", "CA", "CG", "VCTS", "TS", "$", "FC", "+FC", "TORNADO"]
 DEFAULT_WEATHER_ENABLED = {code: True for code in WX_TAGS}
+
+# Sleep schedule (same keys as main.py / wifi_config.json); matches Android app
+DEFAULT_SLEEP_SCHEDULE = {
+    'sleep_enabled': False,
+    'sleep_at_hour': 22,
+    'sleep_at_minute': 0,
+    'wake_at_hour': 6,
+    'wake_at_minute': 0,
+    'sleep_matrix': True,
+    'sleep_leds': True,
+    'sleep_oled': True,
+    'timezone_offset_hours': 0,
+}
+
+def _parse_sleep_schedule_from_json(config):
+    out = {}
+    for k in DEFAULT_SLEEP_SCHEDULE:
+        out[k] = DEFAULT_SLEEP_SCHEDULE[k]
+    if not isinstance(config, dict):
+        return out
+    try:
+        if 'sleep_enabled' in config:
+            out['sleep_enabled'] = bool(config['sleep_enabled'])
+        if 'sleep_at_hour' in config:
+            out['sleep_at_hour'] = max(0, min(23, int(config['sleep_at_hour'])))
+        if 'sleep_at_minute' in config:
+            out['sleep_at_minute'] = max(0, min(59, int(config['sleep_at_minute'])))
+        if 'wake_at_hour' in config:
+            out['wake_at_hour'] = max(0, min(23, int(config['wake_at_hour'])))
+        if 'wake_at_minute' in config:
+            out['wake_at_minute'] = max(0, min(59, int(config['wake_at_minute'])))
+        if 'sleep_matrix' in config:
+            out['sleep_matrix'] = bool(config['sleep_matrix'])
+        if 'sleep_leds' in config:
+            out['sleep_leds'] = bool(config['sleep_leds'])
+        if 'sleep_oled' in config:
+            out['sleep_oled'] = bool(config['sleep_oled'])
+        if 'timezone_offset_hours' in config:
+            out['timezone_offset_hours'] = max(-12, min(14, int(config['timezone_offset_hours'])))
+    except Exception:
+        pass
+    return out
+
+def _parse_sleep_schedule_from_form(params):
+    out = {}
+    for k in DEFAULT_SLEEP_SCHEDULE:
+        out[k] = DEFAULT_SLEEP_SCHEDULE[k]
+    def _ti(key, default, lo, hi):
+        try:
+            raw = params.get(key)
+            if raw is None or raw == '':
+                return default
+            return max(lo, min(hi, int(float(raw))))
+        except Exception:
+            return default
+    try:
+        sv = str(params.get('sleep_enabled', '') or '').lower()
+        out['sleep_enabled'] = sv in ('1', 'on', 'true', 'yes')
+        out['sleep_at_hour'] = _ti('sleep_at_hour', 22, 0, 23)
+        out['sleep_at_minute'] = _ti('sleep_at_minute', 0, 0, 59)
+        out['wake_at_hour'] = _ti('wake_at_hour', 6, 0, 23)
+        out['wake_at_minute'] = _ti('wake_at_minute', 0, 0, 59)
+        for key in ('sleep_matrix', 'sleep_leds', 'sleep_oled'):
+            sv = str(params.get(key, '1') or '1').lower()
+            out[key] = sv in ('1', 'on', 'true', 'yes')
+        out['timezone_offset_hours'] = _ti('timezone_offset_hours', 0, -12, 14)
+    except Exception:
+        pass
+    return out
 
 # Initialize NeoPixels with error handling
 try:
@@ -200,7 +269,7 @@ def optional_physical_led_count_from_request(request):
     return None
 
 def parse_request_data(request):
-    """Parse both form data and JSON requests. Always returns 5 values for unpacking."""
+    """Parse both form data and JSON requests. Returns (ssid, password, display..., led_pin, sleep_schedule)."""
     try:
         print("Parsing request data...")
         # Check if it's a JSON request (from Android app)
@@ -275,12 +344,13 @@ def parse_request_data(request):
                     except (TypeError, ValueError):
                         led_pin = DEFAULT_LED_PIN
                     print("Parsed password length:", len(password_val))
+                    sleep_sched = _parse_sleep_schedule_from_json(config)
                     return (ssid_val, password_val, display_type,
-                            led_matrix_brightness, led_matrix_pin, min_brightness, max_brightness, batch_size, weather_enabled, matrix_only, scroll_speed, matrix_wiring, scroll_pause_before, cycle_delay, num_leds, led_pin)
+                            led_matrix_brightness, led_matrix_pin, min_brightness, max_brightness, batch_size, weather_enabled, matrix_only, scroll_speed, matrix_wiring, scroll_pause_before, cycle_delay, num_leds, led_pin, sleep_sched)
             except Exception as e:
                 print("JSON parsing error:", e)
             return (None, None, DEFAULT_DISPLAY_TYPE, DEFAULT_LED_MATRIX_BRIGHTNESS, DEFAULT_LED_MATRIX_PIN,
-                    DEFAULT_MIN_BRIGHTNESS, DEFAULT_MAX_BRIGHTNESS, DEFAULT_BATCH_SIZE, DEFAULT_WEATHER_ENABLED, DEFAULT_MATRIX_ONLY, DEFAULT_SCROLL_SPEED, DEFAULT_MATRIX_WIRING, DEFAULT_SCROLL_PAUSE_BEFORE, DEFAULT_CYCLE_DELAY, DEFAULT_NUM_LEDS_STRIP, DEFAULT_LED_PIN)
+                    DEFAULT_MIN_BRIGHTNESS, DEFAULT_MAX_BRIGHTNESS, DEFAULT_BATCH_SIZE, DEFAULT_WEATHER_ENABLED, DEFAULT_MATRIX_ONLY, DEFAULT_SCROLL_SPEED, DEFAULT_MATRIX_WIRING, DEFAULT_SCROLL_PAUSE_BEFORE, DEFAULT_CYCLE_DELAY, DEFAULT_NUM_LEDS_STRIP, DEFAULT_LED_PIN, dict(DEFAULT_SLEEP_SCHEDULE))
 
         # Check if it's form data (from browser)
         if "Content-Type: application/x-www-form-urlencoded" in request:
@@ -340,15 +410,16 @@ def parse_request_data(request):
                 led_pin = max(0, min(28, led_pin))
             except (TypeError, ValueError):
                 led_pin = DEFAULT_LED_PIN
-            return (ssid, password, display_type, led_matrix_brightness, led_matrix_pin, min_brightness, max_brightness, batch_size, DEFAULT_WEATHER_ENABLED, matrix_only, scroll_speed, matrix_wiring, scroll_pause_before, cycle_delay, num_leds, led_pin)
+            sleep_sched = _parse_sleep_schedule_from_form(params)
+            return (ssid, password, display_type, led_matrix_brightness, led_matrix_pin, min_brightness, max_brightness, batch_size, DEFAULT_WEATHER_ENABLED, matrix_only, scroll_speed, matrix_wiring, scroll_pause_before, cycle_delay, num_leds, led_pin, sleep_sched)
 
         print("No recognized Content-Type in request")
         return (None, None, DEFAULT_DISPLAY_TYPE, DEFAULT_LED_MATRIX_BRIGHTNESS, DEFAULT_LED_MATRIX_PIN,
-                DEFAULT_MIN_BRIGHTNESS, DEFAULT_MAX_BRIGHTNESS, DEFAULT_BATCH_SIZE, DEFAULT_WEATHER_ENABLED, DEFAULT_MATRIX_ONLY, DEFAULT_SCROLL_SPEED, DEFAULT_MATRIX_WIRING, DEFAULT_SCROLL_PAUSE_BEFORE, DEFAULT_CYCLE_DELAY, DEFAULT_NUM_LEDS_STRIP, DEFAULT_LED_PIN)
+                DEFAULT_MIN_BRIGHTNESS, DEFAULT_MAX_BRIGHTNESS, DEFAULT_BATCH_SIZE, DEFAULT_WEATHER_ENABLED, DEFAULT_MATRIX_ONLY, DEFAULT_SCROLL_SPEED, DEFAULT_MATRIX_WIRING, DEFAULT_SCROLL_PAUSE_BEFORE, DEFAULT_CYCLE_DELAY, DEFAULT_NUM_LEDS_STRIP, DEFAULT_LED_PIN, dict(DEFAULT_SLEEP_SCHEDULE))
     except Exception as e:
         print("Error parsing request data:", e)
         return (None, None, DEFAULT_DISPLAY_TYPE, DEFAULT_LED_MATRIX_BRIGHTNESS, DEFAULT_LED_MATRIX_PIN,
-                DEFAULT_MIN_BRIGHTNESS, DEFAULT_MAX_BRIGHTNESS, DEFAULT_BATCH_SIZE, DEFAULT_WEATHER_ENABLED, DEFAULT_MATRIX_ONLY, DEFAULT_SCROLL_SPEED, DEFAULT_MATRIX_WIRING, DEFAULT_SCROLL_PAUSE_BEFORE, DEFAULT_CYCLE_DELAY, DEFAULT_NUM_LEDS_STRIP, DEFAULT_LED_PIN)
+                DEFAULT_MIN_BRIGHTNESS, DEFAULT_MAX_BRIGHTNESS, DEFAULT_BATCH_SIZE, DEFAULT_WEATHER_ENABLED, DEFAULT_MATRIX_ONLY, DEFAULT_SCROLL_SPEED, DEFAULT_MATRIX_WIRING, DEFAULT_SCROLL_PAUSE_BEFORE, DEFAULT_CYCLE_DELAY, DEFAULT_NUM_LEDS_STRIP, DEFAULT_LED_PIN, dict(DEFAULT_SLEEP_SCHEDULE))
 
 def save_wifi_config(ssid, password, display_type=DEFAULT_DISPLAY_TYPE,
                      led_matrix_brightness=DEFAULT_LED_MATRIX_BRIGHTNESS,
@@ -364,7 +435,8 @@ def save_wifi_config(ssid, password, display_type=DEFAULT_DISPLAY_TYPE,
                      cycle_delay=DEFAULT_CYCLE_DELAY,
                      num_leds=DEFAULT_NUM_LEDS_STRIP,
                      led_pin=DEFAULT_LED_PIN,
-                     physical_led_count=None):
+                     physical_led_count=None,
+                     sleep_schedule=None):
     try:
         try:
             with open(CONFIG_FILE, 'r') as f:
@@ -404,6 +476,14 @@ def save_wifi_config(ssid, password, display_type=DEFAULT_DISPLAY_TYPE,
             config['physical_led_count'] = max(1, min(480, int(physical_led_count)))
         elif 'physical_led_count' in prev_cfg:
             config['physical_led_count'] = prev_cfg['physical_led_count']
+        if sleep_schedule is not None:
+            for k in DEFAULT_SLEEP_SCHEDULE:
+                if k in sleep_schedule:
+                    config[k] = sleep_schedule[k]
+        else:
+            for k in DEFAULT_SLEEP_SCHEDULE:
+                if k in prev_cfg:
+                    config[k] = prev_cfg[k]
         with open(CONFIG_FILE, 'w') as f:
             json.dump(config, f)
         print("WiFi configuration saved for SSID:", ssid, "password length:", len(password) if password else 0)
@@ -414,7 +494,8 @@ def save_wifi_config(ssid, password, display_type=DEFAULT_DISPLAY_TYPE,
 
 def update_display_config_only(display_type, led_matrix_brightness, led_matrix_pin, min_brightness, max_brightness,
                                batch_size, matrix_only, scroll_speed, matrix_wiring, scroll_pause_before, cycle_delay,
-                               num_leds=DEFAULT_NUM_LEDS_STRIP, led_pin=DEFAULT_LED_PIN, physical_led_count=None):
+                               num_leds=DEFAULT_NUM_LEDS_STRIP, led_pin=DEFAULT_LED_PIN, physical_led_count=None,
+                               sleep_schedule=None):
     """Update only display/batch settings; keep existing ssid/password. Used when browser form has no WiFi fields."""
     try:
         config = {}
@@ -440,6 +521,10 @@ def update_display_config_only(display_type, led_matrix_brightness, led_matrix_p
             config['physical_led_count'] = max(1, min(480, int(physical_led_count)))
         if 'weather_enabled' not in config:
             config['weather_enabled'] = dict(DEFAULT_WEATHER_ENABLED)
+        if sleep_schedule is not None:
+            for k in DEFAULT_SLEEP_SCHEDULE:
+                if k in sleep_schedule:
+                    config[k] = sleep_schedule[k]
         with open(CONFIG_FILE, 'w') as f:
             json.dump(config, f)
         print("Display/config updated (no WiFi change)")
@@ -455,10 +540,16 @@ def send_json_response(conn, success, message=None, ip=None):
     }
     if ip:
         response['ip'] = ip
-    body = json.dumps(response)
+    body = json.dumps(response).encode('utf-8')
     conn.send('HTTP/1.1 200 OK\r\n')
     conn.send('Content-Type: application/json; charset=utf-8\r\n')
     conn.send('Content-Length: %d\r\n\r\n' % len(body))
+    conn.sendall(body)
+
+def send_html_page(conn, page_str):
+    """Send HTML with UTF-8 and correct Content-Length in bytes."""
+    body = page_str.encode('utf-8')
+    conn.send('HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: %d\r\n\r\n' % len(body))
     conn.sendall(body)
 
 def test_wifi_connection(ssid, password):
@@ -494,6 +585,7 @@ def get_html_setup_page():
     html = """<!DOCTYPE html>
     <html>
     <head>
+        <meta charset="utf-8">
         <title>MetarMap Setup</title>
         <meta name="viewport" content="width=device-width, initial-scale=1">
         <style>
@@ -550,6 +642,15 @@ def get_html_setup_page():
                         document.getElementById('scroll_speed').value = scrollSpeedToDelay(slider);
                         updateScrollLabel();
                     }
+                    if (typeof c.timezone_offset_hours === 'number') document.getElementById('timezone_offset_hours').value = c.timezone_offset_hours;
+                    if (typeof c.sleep_enabled === 'boolean') document.getElementById('sleep_enabled').checked = c.sleep_enabled;
+                    if (typeof c.sleep_at_hour === 'number') document.getElementById('sleep_at_hour').value = c.sleep_at_hour;
+                    if (typeof c.sleep_at_minute === 'number') document.getElementById('sleep_at_minute').value = c.sleep_at_minute;
+                    if (typeof c.wake_at_hour === 'number') document.getElementById('wake_at_hour').value = c.wake_at_hour;
+                    if (typeof c.wake_at_minute === 'number') document.getElementById('wake_at_minute').value = c.wake_at_minute;
+                    if (typeof c.sleep_matrix === 'boolean') document.getElementById('sleep_matrix').checked = c.sleep_matrix;
+                    if (typeof c.sleep_leds === 'boolean') document.getElementById('sleep_leds').checked = c.sleep_leds;
+                    if (typeof c.sleep_oled === 'boolean') document.getElementById('sleep_oled').checked = c.sleep_oled;
                     toggleMatrix();
                 }).catch(function() {});
             };
@@ -558,21 +659,21 @@ def get_html_setup_page():
     <body>
         <h1>MetarMap Setup</h1>
         <div class="info-box">
-            <p><strong>MetarMap setup Wi‑Fi (connect your phone here):</strong> SSID <strong>""" + AP_SSID + """</strong> &mdash; password <strong>""" + AP_PASSWORD + """</strong> (defaults in this firmware; edit <code>wifi_manager.py</code> if you changed them).</p>
-            <p><strong>Same settings as the app.</strong> The fields below are your <em>home router</em> Wi‑Fi for the Pico to join, not the AP password above. Leave WiFi blank to update display/brightness (device reboots to apply). Fill WiFi + tap Save &amp; Restart to set network and reboot.</p>
+            <p><strong>MetarMap setup Wi-Fi (connect your phone here):</strong> SSID <strong>""" + AP_SSID + """</strong> &mdash; password <strong>""" + AP_PASSWORD + """</strong> (defaults in this firmware; edit <code>wifi_manager.py</code> if you changed them).</p>
+            <p><strong>Same settings as the app.</strong> The fields below are your <em>home router</em> Wi-Fi for the Pico to join, not the AP password above. Leave WiFi blank to update display/brightness (device reboots to apply). Fill WiFi + tap Save &amp; Restart to set network and reboot.</p>
             <p><strong>IP:</strong> 192.168.4.1 &nbsp;|&nbsp; <a href="/">Setup</a> &nbsp; <a href="/page/airports">Airports</a> &nbsp; <a href="/page/weather">Weather</a> &nbsp; <a href="/page/help">Help</a> &nbsp; <a href="/page/update">Update</a></p>
         </div>
         <form action="/configure" method="post">
             <div class="config-section">
-                <div class="section-title">Home Wi‑Fi (optional)</div>
+                <div class="section-title">Home Wi-Fi (optional)</div>
                 <div class="form-group">
                     <label for="ssid">Router network name (SSID)</label>
-                    <input type="text" id="ssid" name="ssid" placeholder="Your home/office router—not """ + AP_SSID + """">
-                    <div class="note">The network MetarMap should join after setup—not the MetarMap AP password.</div>
+                    <input type="text" id="ssid" name="ssid" placeholder="Your home/office router (not """ + AP_SSID + """)">
+                    <div class="note">The network MetarMap should join after setup, not the MetarMap AP password.</div>
                 </div>
                 <div class="form-group">
-                    <label for="password">Router Wi‑Fi password</label>
-                    <input type="password" id="password" name="password" placeholder="Router password—not """ + AP_PASSWORD + """ unless that is your router password">
+                    <label for="password">Router Wi-Fi password</label>
+                    <input type="password" id="password" name="password" placeholder="Router password (not """ + AP_PASSWORD + """ unless that is your router password)">
                     <div class="note">Password for your router above, not the setup AP password (unless they match by coincidence).</div>
                 </div>
             </div>
@@ -587,7 +688,7 @@ def get_html_setup_page():
                     </select>
                 </div>
                 <div class="form-group">
-                    <label for="led_pin">Main METAR strip data pin (0–28)</label>
+                    <label for="led_pin">Main METAR strip data pin (0-28)</label>
                     <input type="number" id="led_pin" name="led_pin" min="0" max="28" value="0">
                     <div class="note">GPIO for the WS2812 airport strip (default 0). Separate from the matrix data pin below.</div>
                 </div>
@@ -617,17 +718,17 @@ def get_html_setup_page():
                 <div class="form-group">
                     <label for="batch_size">Batch size (1-20)</label>
                     <input type="number" id="batch_size" name="batch_size" min="1" max="20" value="3">
-                    <div class="note">How many airports to fetch per API batch — not strip length.</div>
+                    <div class="note">How many airports to fetch per API batch - not strip length.</div>
                 </div>
                 <div class="form-group">
-                    <label for="num_leds">Airport LEDs on main strip (num_leds, 1–480)</label>
+                    <label for="num_leds">Airport LEDs on main strip (num_leds, 1-480)</label>
                     <input type="number" id="num_leds" name="num_leds" min="1" max="480" value="256">
-                    <div class="note">Only the first <strong>num_leds</strong> positions can show METAR colors; the rest of the chain is forced off. Example: <strong>49</strong> airports → use 49 here.</div>
+                    <div class="note">Only the first <strong>num_leds</strong> positions can show METAR colors; the rest of the chain is forced off. Example: <strong>49</strong> airports -> use 49 here.</div>
                 </div>
                 <div class="form-group">
                     <label for="physical_led_count">Physical total on main strip (optional)</label>
                     <input type="number" id="physical_led_count" name="physical_led_count" min="1" max="480" value="">
-                    <div class="note">If this is blank, firmware uses <strong>max(num_leds, 256)</strong> so an 8×32 chain is fully clocked (no duplicate ghost block). If your chain is longer than 256, enter the real total here.</div>
+                    <div class="note">If this is blank, firmware uses <strong>max(num_leds, 256)</strong> so an 8x32 chain is fully clocked (no duplicate ghost block). If your chain is longer than 256, enter the real total here.</div>
                 </div>
                 <div class="form-group">
                     <label for="cycle_delay">Seconds between refreshes (5-1800)</label>
@@ -644,6 +745,41 @@ def get_html_setup_page():
                 </div>
                 <div class="form-group">
                     <label><input type="checkbox" id="matrix_only" name="matrix_only" value="on"> Strip: flight colors only (no rain/snow effects)</label>
+                </div>
+            </div>
+            <div class="config-section">
+                <div class="section-title">Display sleep schedule</div>
+                <div class="form-group">
+                    <label for="timezone_offset_hours">Timezone offset from UTC (hours, -12 to 14)</label>
+                    <input type="number" id="timezone_offset_hours" name="timezone_offset_hours" min="-12" max="14" value="0">
+                    <div class="note">Used for local sleep/wake times (same as Android app).</div>
+                </div>
+                <input type="hidden" name="sleep_enabled" value="0">
+                <div class="form-group">
+                    <label><input type="checkbox" name="sleep_enabled" value="1" id="sleep_enabled"> Enable sleep schedule (off/dim during night hours)</label>
+                </div>
+                <div class="form-group">
+                    <label>Sleep time (local)</label>
+                    <div style="display:flex;flex-wrap:wrap;gap:10px;align-items:center">
+                        <span>H <input type="number" id="sleep_at_hour" name="sleep_at_hour" min="0" max="23" value="22" style="width:64px"></span>
+                        <span>M <input type="number" id="sleep_at_minute" name="sleep_at_minute" min="0" max="59" value="0" style="width:64px"></span>
+                    </div>
+                </div>
+                <div class="form-group">
+                    <label>Wake time (local)</label>
+                    <div style="display:flex;flex-wrap:wrap;gap:10px;align-items:center">
+                        <span>H <input type="number" id="wake_at_hour" name="wake_at_hour" min="0" max="23" value="6" style="width:64px"></span>
+                        <span>M <input type="number" id="wake_at_minute" name="wake_at_minute" min="0" max="59" value="0" style="width:64px"></span>
+                    </div>
+                </div>
+                <div class="form-group">
+                    <div class="note" style="margin-bottom:8px">During sleep, include (checked = turn off or dim that display):</div>
+                    <input type="hidden" name="sleep_matrix" value="0">
+                    <label><input type="checkbox" name="sleep_matrix" value="1" id="sleep_matrix"> LED matrix</label><br>
+                    <input type="hidden" name="sleep_leds" value="0">
+                    <label><input type="checkbox" name="sleep_leds" value="1" id="sleep_leds"> METAR strip LEDs</label><br>
+                    <input type="hidden" name="sleep_oled" value="0">
+                    <label><input type="checkbox" name="sleep_oled" value="1" id="sleep_oled"> OLED</label>
                 </div>
             </div>
             <button type="submit" class="btn">Save &amp; Restart</button>
@@ -683,6 +819,7 @@ def get_html_success_page(ssid, display_type, led_matrix_brightness, led_matrix_
     html = """<!DOCTYPE html>
     <html>
     <head>
+        <meta charset="utf-8">
         <title>MetarMap Setup Complete</title>
         <meta name="viewport" content="width=device-width, initial-scale=1">
         <style>
@@ -729,7 +866,7 @@ def get_html_success_page(ssid, display_type, led_matrix_brightness, led_matrix_
 # Page shown after display-only save (optionally rebooting)
 def get_html_display_saved_page(success, message):
     color = "green" if success else "#dc3545"
-    html = """<!DOCTYPE html><html><head><meta name="viewport" content="width=device-width, initial-scale=1"><title>MetarMap</title></head><body style="font-family:Arial;text-align:center;padding:20px;">
+    html = """<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>MetarMap</title></head><body style="font-family:Arial;text-align:center;padding:20px;">
     <h2 style="color:""" + color + """">""" + ("Settings saved" if success else "Error") + """</h2>
     <p>""" + message + """</p>
     <p><a href="/" style="color:#0066cc">Back to setup</a></p>
@@ -738,7 +875,7 @@ def get_html_display_saved_page(success, message):
 
 # Airports page: list + fetch/save (same as app Airports tab)
 def get_html_airports_page():
-    html = """<!DOCTYPE html><html><head><meta name="viewport" content="width=device-width, initial-scale=1"><title>MetarMap Airports</title>
+    html = """<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>MetarMap Airports</title>
     <style>body{font-family:Arial;margin:0;padding:20px;max-width:500px;margin:0 auto;} h1{color:#0066cc;}
     .nav{margin-bottom:20px;} .nav a{margin-right:15px;color:#0066cc;}
     label{display:block;margin-bottom:5px;font-weight:bold;} textarea{width:100%;height:200px;padding:10px;box-sizing:border-box;}
@@ -778,7 +915,7 @@ def get_html_airports_page():
 # Weather page: toggles per code (same as app Weather tab)
 def get_html_weather_page():
     codes_js = json.dumps(WX_TAGS)
-    html = """<!DOCTYPE html><html><head><meta name="viewport" content="width=device-width, initial-scale=1"><title>MetarMap Weather</title>
+    html = """<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>MetarMap Weather</title>
     <style>body{font-family:Arial;margin:0;padding:20px;max-width:500px;margin:0 auto;} h1{color:#0066cc;}
     .nav{margin-bottom:20px;} .nav a{margin-right:15px;color:#0066cc;}
     .row{display:flex;justify-content:space-between;align-items:center;padding:8px 0;border-bottom:1px solid #eee;}
@@ -819,7 +956,7 @@ def get_html_weather_page():
 
 # Help page: same content as app Help tab
 def get_html_help_page():
-    html = """<!DOCTYPE html><html><head><meta name="viewport" content="width=device-width, initial-scale=1"><title>MetarMap Help</title>
+    html = """<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>MetarMap Help</title>
     <style>body{font-family:Arial;margin:0;padding:20px;max-width:600px;margin:0 auto;line-height:1.5;}
     h1{color:#000;} h2{color:#0066cc;font-size:1.1em;margin-top:20px;} .nav{margin-bottom:20px;} .nav a{margin-right:15px;color:#0066cc;}
     .card{background:#f5f5f5;padding:15px;margin:12px 0;border-radius:8px;} .card h3{color:#0066cc;margin-top:0;}
@@ -828,16 +965,16 @@ def get_html_help_page():
     <h1>Help &amp; Instructions</h1>
     <div class="nav"><a href="/">Setup</a> <a href="/page/airports">Airports</a> <a href="/page/weather">Weather</a> <a href="/page/help">Help</a> <a href="/page/update">Update</a></div>
     <div class="card"><h3>Quick start</h3>
-    <p>1. Join MetarMap setup Wi‑Fi: SSID <strong>""" + AP_SSID + """</strong>, password <strong>""" + AP_PASSWORD + """</strong> (unless you changed AP in firmware).<br>2. Setup: enter your <em>home router</em> name and password—not the AP password—then Save &amp; Restart (or leave blank to only change display).<br>3. Airports: add codes (e.g. KORD, LAX), Save to MetarMap.<br>Done.</p></div>
+    <p>1. Join MetarMap setup Wi-Fi: SSID <strong>""" + AP_SSID + """</strong>, password <strong>""" + AP_PASSWORD + """</strong> (unless you changed AP in firmware).<br>2. Setup: enter your <em>home router</em> name and password (not the AP password), then Save &amp; Restart (or leave blank to only change display).<br>3. Airports: add codes (e.g. KORD, LAX), Save to MetarMap.<br>Done.</p></div>
     <div class="card"><h3>What is a MetarMap?</h3>
     <p>MetarMap is a hardware project with a Raspberry Pi Pico W. It fetches real-time aviation weather (METAR), shows flight categories (VFR/MVFR/IFR/LIFR) and weather on an LED strip and optional matrix/OLED. On startup it shows all airports' flight categories at once for a few seconds, then cycles with weather effects.</p></div>
     <div class="card"><h3>Setup (WiFi / display)</h3>
-    <p><strong>Router vs AP:</strong> The WiFi fields on Setup are your <em>router</em> credentials so the Pico can reach the internet—not the password for joining <strong>""" + AP_SSID + """</strong> on your phone (default AP password: <strong>""" + AP_PASSWORD + """</strong>).</p>
+    <p><strong>Router vs AP:</strong> The WiFi fields on Setup are your <em>router</em> credentials so the Pico can reach the internet, not the password for joining <strong>""" + AP_SSID + """</strong> on your phone (default AP password: <strong>""" + AP_PASSWORD + """</strong>).</p>
     <p>Leave WiFi blank to update display/brightness (device reboots to apply). Fill WiFi to set network and restart. Display type, matrix layout, min/max brightness (use same for no LDR), batch size, cycle delay, scroll speed, &quot;Strip: flight colors only&quot; = matrix only.</p></div>
     <div class="card"><h3>Firmware updates (manual)</h3>
     <p>After boot, MetarMap <em>checks</em> online whether a newer firmware exists; it does <strong>not</strong> install by itself. Use <strong>Update</strong> &rarr; Install, open <code>http://&lt;pico-ip&gt;:8080</code> on your home network, or the Android app&apos;s install button when you want to upgrade.</p></div>
     <div class="card"><h3>Airports</h3>
-    <p>One code per line. Order = LED order. Fetch from MetarMap loads current list; Save to MetarMap writes your list. Use empty line or SKIP for blank slot. 3&ndash;4 letters or digits (e.g. KORD, 0A0).</p></div>
+    <p>One code per line. Order = LED order. Fetch from MetarMap loads current list; Save to MetarMap writes your list. Use empty line or SKIP for blank slot. 3-4 letters or digits (e.g. KORD, 0A0).</p></div>
     <div class="card"><h3>Weather</h3>
     <p>Each code toggles whether that condition lights the LEDs. ON = effect enabled, OFF = disabled. Save sends to device and reboots to apply.</p></div>
     <div class="card"><h3>Weather codes &amp; LED effects</h3>
@@ -853,7 +990,7 @@ def get_html_help_page():
 
 def get_html_update_page():
     html = """<!DOCTYPE html>
-    <html><head><meta name="viewport" content="width=device-width"><title>MetarMap Update</title>
+    <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>MetarMap Update</title>
     <style>body{font-family:Arial;margin:12px;} .nav{margin-bottom:12px;} a{margin-right:8px;}
     .card{background:#f5f5f5;padding:12px;margin:8px 0;border-radius:6px;}
     button{background:#0d6efd;color:#fff;border:none;padding:10px 16px;border-radius:6px;font-size:16px;}
@@ -874,6 +1011,7 @@ def get_html_error_page(message):
     html = """<!DOCTYPE html>
     <html>
     <head>
+        <meta charset="utf-8">
         <title>MetarMap Setup Error</title>
         <meta name="viewport" content="width=device-width, initial-scale=1">
         <style>
@@ -984,9 +1122,9 @@ def run_server():
                         'timezone_offset_hours': config.get('timezone_offset_hours', 0)
                     }
                     response_body = json.dumps(response_config)
-                    conn.send('HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n')
-                    conn.send('Content-Length: ' + str(len(response_body)) + '\r\n\r\n')
-                    conn.sendall(response_body)
+                    rb = response_body.encode('utf-8')
+                    conn.send('HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: %d\r\n\r\n' % len(rb))
+                    conn.sendall(rb)
                     we = response_config.get('weather_enabled', {})
                     on_count = sum(1 for v in we.values() if v)
                     print("Sent config (weather_enabled: %d on, %d off)" % (on_count, len(we) - on_count))
@@ -995,24 +1133,16 @@ def run_server():
                     send_json_response(conn, False, str(e))
                 conn.close()
             elif first_line.startswith("GET ") and "/page/airports" in first_line:
-                page = get_html_airports_page()
-                conn.send('HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: ' + str(len(page)) + '\r\n\r\n')
-                conn.sendall(page)
+                send_html_page(conn, get_html_airports_page())
                 conn.close()
             elif first_line.startswith("GET ") and "/page/weather" in first_line:
-                page = get_html_weather_page()
-                conn.send('HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: ' + str(len(page)) + '\r\n\r\n')
-                conn.sendall(page)
+                send_html_page(conn, get_html_weather_page())
                 conn.close()
             elif first_line.startswith("GET ") and "/page/help" in first_line:
-                page = get_html_help_page()
-                conn.send('HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: ' + str(len(page)) + '\r\n\r\n')
-                conn.sendall(page)
+                send_html_page(conn, get_html_help_page())
                 conn.close()
             elif first_line.startswith("GET ") and "/page/update" in first_line:
-                page = get_html_update_page()
-                conn.send('HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: ' + str(len(page)) + '\r\n\r\n')
-                conn.sendall(page)
+                send_html_page(conn, get_html_update_page())
                 conn.close()
             elif first_line.startswith("POST ") and "/start-update" in first_line:
                 print("Handling POST /start-update - OTA install from browser/app")
@@ -1181,34 +1311,15 @@ def run_server():
                 save_success = False
                 test_success = False
                 do_reboot = False
-                ssid, password, display_type, led_matrix_brightness, led_matrix_pin, min_brightness, max_brightness, batch_size, weather_enabled, matrix_only, scroll_speed, matrix_wiring, scroll_pause_before, cycle_delay, num_leds, led_pin = parse_request_data(request)
+                ssid, password, display_type, led_matrix_brightness, led_matrix_pin, min_brightness, max_brightness, batch_size, weather_enabled, matrix_only, scroll_speed, matrix_wiring, scroll_pause_before, cycle_delay, num_leds, led_pin, sleep_schedule = parse_request_data(request)
                 _plc = optional_physical_led_count_from_request(request)
                 if ssid and password:
                     print("Received credentials - SSID:", ssid, "Display:", display_type, "Batch size:", batch_size, "Strip GPIO:", led_pin, "Strip LEDs:", num_leds, "Physical count:", _plc, "Matrix only:", matrix_only, "Scroll speed:", scroll_speed, "Matrix wiring:", matrix_wiring, "Cycle delay:", cycle_delay)
-                    save_success = save_wifi_config(ssid, password, display_type, led_matrix_brightness, led_matrix_pin, min_brightness, max_brightness, batch_size, weather_enabled, matrix_only, scroll_speed, matrix_wiring, scroll_pause_before, cycle_delay, num_leds=num_leds, led_pin=led_pin, physical_led_count=_plc)
-                    # Parse reboot flag and optional sleep settings from body
+                    save_success = save_wifi_config(ssid, password, display_type, led_matrix_brightness, led_matrix_pin, min_brightness, max_brightness, batch_size, weather_enabled, matrix_only, scroll_speed, matrix_wiring, scroll_pause_before, cycle_delay, num_leds=num_leds, led_pin=led_pin, physical_led_count=_plc, sleep_schedule=sleep_schedule)
                     try:
                         body_start = request.find('\r\n\r\n') + 4
                         body = request[body_start:].strip() if body_start >= 4 else '{}'
                         body_json = json.loads(body) if body else {}
-                        if save_success and any(k in body_json for k in ('sleep_enabled', 'sleep_at_hour', 'wake_at_hour', 'sleep_matrix', 'sleep_leds', 'sleep_oled', 'timezone_offset_hours')):
-                            with open(CONFIG_FILE, 'r') as f:
-                                config = json.load(f)
-                            if 'sleep_enabled' in body_json: config['sleep_enabled'] = bool(body_json['sleep_enabled'])
-                            if 'sleep_at_hour' in body_json: config['sleep_at_hour'] = max(0, min(23, int(body_json['sleep_at_hour'])))
-                            if 'sleep_at_minute' in body_json: config['sleep_at_minute'] = max(0, min(59, int(body_json['sleep_at_minute'])))
-                            if 'wake_at_hour' in body_json: config['wake_at_hour'] = max(0, min(23, int(body_json['wake_at_hour'])))
-                            if 'wake_at_minute' in body_json: config['wake_at_minute'] = max(0, min(59, int(body_json['wake_at_minute'])))
-                            if 'sleep_matrix' in body_json: config['sleep_matrix'] = bool(body_json['sleep_matrix'])
-                            if 'sleep_leds' in body_json: config['sleep_leds'] = bool(body_json['sleep_leds'])
-                            if 'sleep_oled' in body_json: config['sleep_oled'] = bool(body_json['sleep_oled'])
-                            if 'timezone_offset_hours' in body_json:
-                                try:
-                                    config['timezone_offset_hours'] = max(-12, min(14, int(body_json['timezone_offset_hours'])))
-                                except (TypeError, ValueError):
-                                    pass
-                            with open(CONFIG_FILE, 'w') as f:
-                                json.dump(config, f)
                         do_reboot = body_json.get('reboot', True)
                         if isinstance(do_reboot, str):
                             do_reboot = do_reboot.lower() in ('true', '1', 'yes')
@@ -1217,7 +1328,7 @@ def run_server():
                     # Reply to app immediately so it doesn't time out (app has ~10s read timeout; connection test can take 20s)
                     if do_reboot:
                         send_json_response(conn, success=save_success,
-                            message='Config saved. Testing connection and rebooting…',
+                            message='Config saved. Testing connection and rebooting...',
                             ip=None)
                     else:
                         send_json_response(conn, success=save_success,
@@ -1230,7 +1341,7 @@ def run_server():
                         if test_success:
                             print("Connection test OK, IP:", ip_address)
                         else:
-                            print("Connection test failed – device will try again on reboot.")
+                            print("Connection test failed - device will try again on reboot.")
                     if save_success and do_reboot:
                         set_leds(10, 0, 10)
                         print("Configuration complete. Restarting device...")
@@ -1243,17 +1354,16 @@ def run_server():
                     conn.close()
             elif first_line.startswith("POST ") and "/configure" in first_line:
                 print("Handling browser request to /configure")
-                ssid, password, display_type, led_matrix_brightness, led_matrix_pin, min_brightness, max_brightness, batch_size, weather_enabled, matrix_only, scroll_speed, matrix_wiring, scroll_pause_before, cycle_delay, num_leds, led_pin = parse_request_data(request)
+                ssid, password, display_type, led_matrix_brightness, led_matrix_pin, min_brightness, max_brightness, batch_size, weather_enabled, matrix_only, scroll_speed, matrix_wiring, scroll_pause_before, cycle_delay, num_leds, led_pin, sleep_schedule = parse_request_data(request)
                 _plc2 = optional_physical_led_count_from_request(request)
                 if ssid and password:
-                    save_success = save_wifi_config(ssid, password, display_type, led_matrix_brightness, led_matrix_pin, min_brightness, max_brightness, batch_size, weather_enabled, matrix_only, scroll_speed, matrix_wiring, scroll_pause_before, cycle_delay, num_leds=num_leds, led_pin=led_pin, physical_led_count=_plc2)
+                    save_success = save_wifi_config(ssid, password, display_type, led_matrix_brightness, led_matrix_pin, min_brightness, max_brightness, batch_size, weather_enabled, matrix_only, scroll_speed, matrix_wiring, scroll_pause_before, cycle_delay, num_leds=num_leds, led_pin=led_pin, physical_led_count=_plc2, sleep_schedule=sleep_schedule)
                     if save_success:
                         test_success, ip_address = test_wifi_connection(ssid, password)
                     else:
                         test_success, ip_address = False, None
                     success_page = get_html_success_page(ssid, display_type, led_matrix_brightness, led_matrix_pin, test_success, ip_address)
-                    conn.send('HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: ' + str(len(success_page)) + '\r\n\r\n')
-                    conn.sendall(success_page)
+                    send_html_page(conn, success_page)
                     conn.close()
                     if save_success and test_success:
                         set_leds(10, 0, 10)
@@ -1262,11 +1372,10 @@ def run_server():
                         machine.reset()
                 else:
                     # Display-only update (no WiFi): save settings, then reboot
-                    ok = update_display_config_only(display_type, led_matrix_brightness, led_matrix_pin, min_brightness, max_brightness, batch_size, matrix_only, scroll_speed, matrix_wiring, scroll_pause_before, cycle_delay, num_leds=num_leds, led_pin=led_pin, physical_led_count=_plc2)
+                    ok = update_display_config_only(display_type, led_matrix_brightness, led_matrix_pin, min_brightness, max_brightness, batch_size, matrix_only, scroll_speed, matrix_wiring, scroll_pause_before, cycle_delay, num_leds=num_leds, led_pin=led_pin, physical_led_count=_plc2, sleep_schedule=sleep_schedule)
                     msg = "Settings saved. Rebooting..." if ok else "Failed to save settings."
                     page = get_html_display_saved_page(ok, msg)
-                    conn.send('HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: ' + str(len(page)) + '\r\n\r\n')
-                    conn.sendall(page)
+                    send_html_page(conn, page)
                     conn.close()
                     if ok:
                         set_leds(10, 0, 10)
@@ -1285,8 +1394,7 @@ def run_server():
                 clear_leds()
                 machine.reset()
             else:
-                conn.send('HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n')
-                conn.sendall(get_html_setup_page())
+                send_html_page(conn, get_html_setup_page())
                 conn.close()
         except Exception as e:
             print("Error handling request:", e)
@@ -1302,5 +1410,4 @@ def start():
     gc.collect()
     set_leds(12, 12, 0, STARTUP_BRIGHTNESS)
     run_server()
-
 
