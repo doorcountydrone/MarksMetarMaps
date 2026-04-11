@@ -11,7 +11,7 @@ import ssd1306
 import framebuf
 import os
 
-machine.freq(230_000_000)
+machine.freq(240_000_000)
 
 # Import brightness settings from wifi_manager
 try:
