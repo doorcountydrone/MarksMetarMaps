@@ -9,9 +9,9 @@ import neopixel
 from machine import ADC, Pin, I2C
 import ssd1306
 import framebuf
-import os
+import os  # Added missing import
 
-machine.freq(240_000_000)
+machine.freq(230_000_000)
 
 # Import brightness settings from wifi_manager
 try:
@@ -45,6 +45,8 @@ LED_MATRIX_BRIGHTNESS = 0.1  # Fallback value if auto-brightness fails
 # LED Matrix Display Settings (SCROLL_SPEED overridden from config)
 SCROLL_SPEED = 0.08  # Seconds between scroll steps; loaded from wifi_config.json if present
 SCROLL_PAUSE_BEFORE = .75  # Seconds to pause before starting scroll
+# When True: scroll ICAO=CATEGORY text before METAR; when False: scroll METAR only (colors still show category)
+SCROLL_MATRIX_CATEGORY = True
 
 # ===== BATCH PROCESSING SETTINGS =====
 BATCH_SIZE = 5  # Reduced from 5 for better memory management
@@ -54,7 +56,7 @@ CYCLE_DELAY = 10  # Seconds between full airport list cycles; loaded from config
 # ===== FIRMWARE VERSION (for OTA update check) =====
 # Device reports this string; GitHub Pages version.json "version" must be higher to offer OTA.
 # After you flash new code, this should match what you published (or stay lower until user updates).
-FIRMWARE_VERSION = "1.0.5"
+FIRMWARE_VERSION = "1.0.1"
 
 # ===== OTA UPDATE BUTTON (GPIO for short-press "install update") =====
 # Same pin as force-AP at boot: long hold (3s) during startup = setup AP mode; short press while running = start OTA if available.
@@ -355,6 +357,7 @@ try:
         MAX_BRIGHTNESS = max(0, min(255, config.get('max_brightness', 15)))
         _mo = config.get('matrix_only', False)
         MATRIX_ONLY = _mo.lower() in ('true', '1', 'yes') if isinstance(_mo, str) else bool(_mo)
+        SCROLL_MATRIX_CATEGORY = _as_bool(config.get("matrix_scroll_category", True), default=True)
         try:
             SCROLL_SPEED = max(0.03, min(0.2, float(config.get('scroll_speed', 0.08))))
         except (TypeError, ValueError):
@@ -382,6 +385,7 @@ try:
         print(f"Display Type: {DISPLAY_TYPE}")
         print(f"LED Matrix Brightness: {LED_MATRIX_BRIGHTNESS}")
         print(f"Matrix only (no strip weather): {MATRIX_ONLY}")
+        print(f"Matrix scroll category line: {SCROLL_MATRIX_CATEGORY}")
         off_codes = [c for c, v in WEATHER_ENABLED.items() if not v]
         if off_codes:
             print(f"Weather effects OFF for: {off_codes}")
@@ -643,8 +647,9 @@ def scroll_header_with_metar(header, flight_category, metar_text):
     try:
         base_text_color = FLIGHT_COLOR_MAP.get(flight_category, (255, 255, 255))
         text_color = apply_auto_brightness(base_text_color)
-        scroll_single_text_ultra_smooth(header, text_color)
-        time.sleep(1)
+        if SCROLL_MATRIX_CATEGORY:
+            scroll_single_text_ultra_smooth(header, text_color)
+            time.sleep(1)
         if metar_text and len(metar_text.strip()) > 0:
             scroll_single_text_ultra_smooth(metar_text.strip(), text_color)
         else:
@@ -1334,7 +1339,7 @@ def get_weather_conditions_with_retry(raw_text, airport, led, index, min_brightn
                             led.write()
                             time.sleep(.5)
                         if weather_enabled.get("CLR", True) and any(conditions_present[14:15]):
-                            num_steps = 100
+                            num_steps = 200
                             white_color = (255, 255, 255)
                             green_color = (0, 255, 0)
                             step_size = tuple((b - w) / num_steps for w, b in zip(white_color, green_color))
@@ -1816,6 +1821,7 @@ try:
             "max_brightness": int(cfg.get("max_brightness", 15)),
             "batch_size": int(cfg.get("batch_size", 3)),
             "matrix_only": bool(cfg.get("matrix_only", False)),
+            "matrix_scroll_category": _as_bool(cfg.get("matrix_scroll_category", True), default=True),
             "scroll_speed": float(cfg.get("scroll_speed", 0.08)),
             "matrix_wiring": str(cfg.get("matrix_wiring", "SNAKE_COLUMN")),
             "scroll_pause_before": float(cfg.get("scroll_pause_before", 0.75)),
@@ -2198,4 +2204,5 @@ finally:
             led_matrix.write()
     except:
         pass
+
 
