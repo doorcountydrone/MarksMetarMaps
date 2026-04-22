@@ -11,7 +11,7 @@ import ssd1306
 import framebuf
 import os  # Added missing import
 
-machine.freq(230_000_000)
+machine.freq(250_000_000)
 
 # Import brightness settings from wifi_manager
 try:
@@ -56,7 +56,7 @@ CYCLE_DELAY = 10  # Seconds between full airport list cycles; loaded from config
 # ===== FIRMWARE VERSION (for OTA update check) =====
 # Device reports this string; GitHub Pages version.json "version" must be higher to offer OTA.
 # After you flash new code, this should match what you published (or stay lower until user updates).
-FIRMWARE_VERSION = "1.0.1"
+FIRMWARE_VERSION = "1.0.5"
 
 # ===== OTA UPDATE BUTTON (GPIO for short-press "install update") =====
 # Same pin as force-AP at boot: long hold (3s) during startup = setup AP mode; short press while running = start OTA if available.
@@ -1339,7 +1339,7 @@ def get_weather_conditions_with_retry(raw_text, airport, led, index, min_brightn
                             led.write()
                             time.sleep(.5)
                         if weather_enabled.get("CLR", True) and any(conditions_present[14:15]):
-                            num_steps = 200
+                            num_steps = 100
                             white_color = (255, 255, 255)
                             green_color = (0, 255, 0)
                             step_size = tuple((b - w) / num_steps for w, b in zip(white_color, green_color))
