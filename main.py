@@ -11,7 +11,7 @@ import ssd1306
 import framebuf
 import os  # Added missing import
 
-machine.freq(250_000_000)
+machine.freq(230_000_000)
 
 # Import brightness settings from wifi_manager
 try:
@@ -56,7 +56,7 @@ CYCLE_DELAY = 10  # Seconds between full airport list cycles; loaded from config
 # ===== FIRMWARE VERSION (for OTA update check) =====
 # Device reports this string; GitHub Pages version.json "version" must be higher to offer OTA.
 # After you flash new code, this should match what you published (or stay lower until user updates).
-FIRMWARE_VERSION = "1.0.5"
+FIRMWARE_VERSION = "1.0.1"
 
 # ===== OTA UPDATE BUTTON (GPIO for short-press "install update") =====
 # Same pin as force-AP at boot: long hold (3s) during startup = setup AP mode; short press while running = start OTA if available.
@@ -75,6 +75,11 @@ _ota_btn_irq_pending = False  # set by GPIO IRQ (press) so short taps aren't mis
 _ota_last_btn_ms = 0  # debounce duplicate IRQ/edges
 # Set True in main loop when SLEEP_ENABLED and in OFF window and sleep_leds — blocks LDR/OTA from relighting strip from logical_colors
 _strip_dark_for_sleep = False
+# If boot happens inside the sleep window, keep displays awake until the next daily sleep_at; then normal schedule resumes.
+_sleep_boot_override_active = False
+_sleep_boot_override_clear_after = None  # (y, mo, d, h, mi) local civil — clear override when now >= this tuple
+# Do not dim for sleep until NTP has set the RTC at least once (avoids false sleep / flash on bad default time).
+_sleep_clock_trusted = False
 
 
 def _ota_btn_irq_handler(_pin):
@@ -829,22 +834,27 @@ NTP_SERVERS = ("time.google.com", "pool.ntp.org", "time.nist.gov")
 
 def _try_ntp_sync():
     """Try to set RTC from NTP using NTP_SERVERS. Returns True if any server succeeds."""
+    global _sleep_clock_trusted
     import ntptime
     for host in NTP_SERVERS:
         try:
             ntptime.host = host
             ntptime.settime()
             print("NTP time synced from", host)
+            _sleep_clock_trusted = True
             return True
         except Exception as e:
             print("NTP failed", host, ":", e)
     return False
 
 def sync_ntp_once():
-    """Sync RTC from NTP once so time.time() is correct before any timestamps (avoids false 180s timeout)."""
-    if _try_ntp_sync():
-        return True
-    print("NTP sync at startup failed (all servers)")
+    """Sync RTC from NTP so time is correct before METAR/sleep (retries while WiFi stabilizes)."""
+    for attempt in range(3):
+        if _try_ntp_sync():
+            return True
+        if attempt < 2:
+            time.sleep(1)
+    print("NTP sync at startup failed (all servers, 3 rounds)")
     return False
 
 def local_time():
@@ -867,6 +877,110 @@ def is_in_sleep_window_now():
         return sleep_m <= now_m < wake_m
     except Exception:
         return False
+
+
+_DIMS = (31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31)
+
+
+def _is_leap_year(y):
+    return (y % 4 == 0) and (y % 100 != 0 or y % 400 == 0)
+
+
+def _ymd_add_one_day(y, mo, d):
+    dim = _DIMS[mo - 1]
+    if mo == 2 and _is_leap_year(y):
+        dim = 29
+    if d < dim:
+        return (y, mo, d + 1)
+    if mo < 12:
+        return (y, mo + 1, 1)
+    return (y + 1, 1, 1)
+
+
+def _next_local_sleep_at_tuple_strictly_after_now():
+    """Next local civil (y,mo,d,h,mi) at SLEEP_AT_HOUR:MINUTE strictly after current local minute."""
+    t = local_time()
+    y, mo, d, h, mi = t[0], t[1], t[2], t[3], t[4]
+    now_tuple = (y, mo, d, h, mi)
+    cy, cmo, cd = y, mo, d
+    for _ in range(370):
+        cand = (cy, cmo, cd, SLEEP_AT_HOUR, SLEEP_AT_MIN)
+        if cand > now_tuple:
+            return cand
+        cy, cmo, cd = _ymd_add_one_day(cy, cmo, cd)
+    return (y + 1, mo, d, SLEEP_AT_HOUR, SLEEP_AT_MIN)
+
+
+def _refresh_sleep_boot_override():
+    """End boot-time 'stay awake' override at stored clear time (wake_at for same-day, next sleep_at overnight)."""
+    global _sleep_boot_override_active, _sleep_boot_override_clear_after
+    if not _sleep_boot_override_active or _sleep_boot_override_clear_after is None:
+        return
+    try:
+        lt = local_time()
+        now5 = (lt[0], lt[1], lt[2], lt[3], lt[4])
+        if now5 >= _sleep_boot_override_clear_after:
+            _sleep_boot_override_active = False
+            _sleep_boot_override_clear_after = None
+            print(
+                "Sleep: boot override ended — normal schedule (at %04d-%02d-%02d %02d:%02d)"
+                % (now5[0], now5[1], now5[2], now5[3], now5[4])
+            )
+    except Exception as _e:
+        print("Sleep boot override refresh err:", _e)
+
+
+def _try_arm_sleep_boot_override():
+    """If we boot inside the sleep window, keep displays on until a clear boundary (not stuck dark).
+
+    Overnight (sleep_at > wake on clock): stay on until next daily sleep_at (evening).
+    Same-day window (e.g. 18:50-18:55): stay on until wake_at today — avoids \"next sleep_at tomorrow\"
+    blocking dim for the whole day.
+    """
+    global _sleep_boot_override_active, _sleep_boot_override_clear_after
+    if _sleep_boot_override_active or not SLEEP_ENABLED:
+        return
+    if not _sleep_clock_trusted:
+        return
+    if not is_in_sleep_window_now():
+        return
+    _sm = SLEEP_AT_HOUR * 60 + SLEEP_AT_MIN
+    _wm = WAKE_AT_HOUR * 60 + WAKE_AT_MIN
+    lt = local_time()
+    y, mo, d = lt[0], lt[1], lt[2]
+    if _sm > _wm:
+        nxt = _next_local_sleep_at_tuple_strictly_after_now()
+        _sleep_boot_override_clear_after = nxt
+        _sleep_boot_override_active = True
+        print(
+            "Sleep: boot inside overnight window — displays stay on until next sleep_at %04d-%02d-%02d %02d:%02d"
+            % (nxt[0], nxt[1], nxt[2], nxt[3], nxt[4])
+        )
+    else:
+        # Same-day: only arm after the sleep-start *minute* (reboot at 19:05:xx with sleep 19:05 keeps normal dim).
+        now_m = lt[3] * 60 + lt[4]
+        if now_m <= _sm:
+            return
+        nxt = (y, mo, d, WAKE_AT_HOUR, WAKE_AT_MIN)
+        _sleep_boot_override_clear_after = nxt
+        _sleep_boot_override_active = True
+        print(
+            "Sleep: boot inside same-day sleep window — displays stay on until wake_at %04d-%02d-%02d %02d:%02d"
+            % (nxt[0], nxt[1], nxt[2], nxt[3], nxt[4])
+        )
+
+
+def sleep_applies_to_displays_now():
+    """True when sleep schedule should dim/blank displays (honors boot override inside sleep window)."""
+    _refresh_sleep_boot_override()
+    if not SLEEP_ENABLED:
+        return False
+    if not _sleep_clock_trusted:
+        return False
+    if _sleep_boot_override_active:
+        return False
+    return is_in_sleep_window_now()
+
 
 def ensure_wifi_connected():
     """If STA is disconnected, try to reconnect. Call periodically from main loop."""
@@ -1339,7 +1453,7 @@ def get_weather_conditions_with_retry(raw_text, airport, led, index, min_brightn
                             led.write()
                             time.sleep(.5)
                         if weather_enabled.get("CLR", True) and any(conditions_present[14:15]):
-                            num_steps = 100
+                            num_steps = 200
                             white_color = (255, 255, 255)
                             green_color = (0, 255, 0)
                             step_size = tuple((b - w) / num_steps for w, b in zip(white_color, green_color))
@@ -1557,6 +1671,9 @@ try:
 except Exception as _sleep_cfg_err:
     print("Sleep schedule print error:", _sleep_cfg_err)
 
+if _ntp_startup_ok:
+    _try_arm_sleep_boot_override()
+
 flight_categories = {}
 last_successful_data_time = time.time()
 print(f"Firmware version: {FIRMWARE_VERSION}")
@@ -1572,7 +1689,7 @@ def process_airports_in_batches(airports, process_function, batch_size=BATCH_SIZ
     num_batches = (total_airports + batch_size - 1) // batch_size
     print(f"\n=== {description} airports in {num_batches} batches of {batch_size} ===")
     for batch_num in range(num_batches):
-        if SLEEP_ENABLED and is_in_sleep_window_now():
+        if sleep_applies_to_displays_now():
             print(f"{description} paused: entered sleep window during batch processing")
             return True
         batch_start = batch_num * batch_size
@@ -1581,7 +1698,7 @@ def process_airports_in_batches(airports, process_function, batch_size=BATCH_SIZ
         print(f"\n--- Batch {batch_num + 1}/{num_batches} (Airports {batch_start}-{batch_end-1}) ---")
         print(f"Free memory before batch: {gc.mem_free()} bytes")
         for i_in_batch, airport in enumerate(batch_airports):
-            if SLEEP_ENABLED and is_in_sleep_window_now():
+            if sleep_applies_to_displays_now():
                 print(f"{description} paused: entered sleep window mid-batch")
                 return True
             index = batch_start + i_in_batch
@@ -1600,7 +1717,7 @@ def process_airports_in_batches(airports, process_function, batch_size=BATCH_SIZ
             if poll_callback is not None:
                 rem = float(BATCH_DELAY)
                 while rem > 0:
-                    if SLEEP_ENABLED and is_in_sleep_window_now():
+                    if sleep_applies_to_displays_now():
                         print(f"{description} paused: entered sleep window during batch delay")
                         return True
                     poll_callback()
@@ -1654,7 +1771,7 @@ def process_main_loop_batch(batch_airports, batch_start_index, poll_callback=Non
     any_data_received = False
     sleep_hit = False
     for i_in_batch, airport in enumerate(batch_airports):
-        if SLEEP_ENABLED and is_in_sleep_window_now():
+        if sleep_applies_to_displays_now():
             sleep_hit = True
             break
         if poll_callback is not None:
@@ -2028,19 +2145,7 @@ try:
             t = local_time()
             print("NTP time synced for sleep schedule")
             print("Current time (local): %04d-%02d-%02d %02d:%02d:%02d" % (t[0], t[1], t[2], t[3], t[4], t[5]))
-
-    def is_in_sleep_window():
-        try:
-            t = local_time()
-            h, mi = t[3], t[4]
-            now_m = h * 60 + mi
-            sleep_m = SLEEP_AT_HOUR * 60 + SLEEP_AT_MIN
-            wake_m = WAKE_AT_HOUR * 60 + WAKE_AT_MIN
-            if sleep_m > wake_m:  # e.g. 22:00 to 06:00
-                return now_m >= sleep_m or now_m < wake_m
-            return sleep_m <= now_m < wake_m
-        except Exception:
-            return False
+            _try_arm_sleep_boot_override()
 
     def clear_displays_for_sleep():
         try:
@@ -2066,13 +2171,14 @@ try:
         maybe_sync_ntp()
         ensure_wifi_connected()
         t_diag = local_time()
-        in_sleep = SLEEP_ENABLED and is_in_sleep_window()
+        in_sleep = sleep_applies_to_displays_now()
         if _last_sleep_diag_minute != t_diag[4]:
             _last_sleep_diag_minute = t_diag[4]
             print(
-                "Sleep check: enabled=%s now=%02d:%02d sleep_at=%02d:%02d wake_at=%02d:%02d in_window=%s"
+                "Sleep check: enabled=%s ntp_trusted=%s now=%02d:%02d sleep_at=%02d:%02d wake_at=%02d:%02d effective_sleep=%s boot_override=%s"
                 % (
                     SLEEP_ENABLED,
+                    _sleep_clock_trusted,
                     t_diag[3],
                     t_diag[4],
                     SLEEP_AT_HOUR,
@@ -2080,6 +2186,7 @@ try:
                     WAKE_AT_HOUR,
                     WAKE_AT_MIN,
                     in_sleep,
+                    _sleep_boot_override_active,
                 )
             )
         _strip_dark_for_sleep = bool(in_sleep and SLEEP_LEDS)
@@ -2170,7 +2277,7 @@ try:
             if batch_num < num_batches - 1:
                 print(f"Waiting {BATCH_DELAY} seconds before next batch...")
                 sleep_with_ota_poll(BATCH_DELAY)
-        if SLEEP_ENABLED and is_in_sleep_window_now():
+        if sleep_applies_to_displays_now():
             clear_displays_for_sleep()
             displays_sleeping = True
             t = local_time()
