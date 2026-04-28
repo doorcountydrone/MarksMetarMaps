@@ -56,7 +56,7 @@ CYCLE_DELAY = 10  # Seconds between full airport list cycles; loaded from config
 # ===== FIRMWARE VERSION (for OTA update check) =====
 # Device reports this string; GitHub Pages version.json "version" must be higher to offer OTA.
 # After you flash new code, this should match what you published (or stay lower until user updates).
-FIRMWARE_VERSION = "1.0.5"
+FIRMWARE_VERSION = "1.0.4"
 
 # ===== OTA UPDATE BUTTON (GPIO for short-press "install update") =====
 # Same pin as force-AP at boot: long hold (3s) during startup = setup AP mode; short press while running = start OTA if available.
@@ -911,8 +911,22 @@ def _next_local_sleep_at_tuple_strictly_after_now():
     return (y + 1, mo, d, SLEEP_AT_HOUR, SLEEP_AT_MIN)
 
 
+def _next_local_wake_at_tuple_strictly_after_now():
+    """Next local civil (y,mo,d,h,mi) at WAKE_AT_HOUR:MINUTE strictly after current local minute."""
+    t = local_time()
+    y, mo, d, h, mi = t[0], t[1], t[2], t[3], t[4]
+    now_tuple = (y, mo, d, h, mi)
+    cy, cmo, cd = y, mo, d
+    for _ in range(370):
+        cand = (cy, cmo, cd, WAKE_AT_HOUR, WAKE_AT_MIN)
+        if cand > now_tuple:
+            return cand
+        cy, cmo, cd = _ymd_add_one_day(cy, cmo, cd)
+    return (y + 1, mo, d, WAKE_AT_HOUR, WAKE_AT_MIN)
+
+
 def _refresh_sleep_boot_override():
-    """End boot-time 'stay awake' override at stored clear time (wake_at for same-day, next sleep_at overnight)."""
+    """End boot-time 'stay awake' override at stored clear time."""
     global _sleep_boot_override_active, _sleep_boot_override_clear_after
     if not _sleep_boot_override_active or _sleep_boot_override_clear_after is None:
         return
@@ -933,7 +947,7 @@ def _refresh_sleep_boot_override():
 def _try_arm_sleep_boot_override():
     """If we boot inside the sleep window, keep displays on until a clear boundary (not stuck dark).
 
-    Overnight (sleep_at > wake on clock): stay on until next daily sleep_at (evening).
+    Overnight (sleep_at > wake on clock): stay on until next wake_at.
     Same-day window (e.g. 18:50-18:55): stay on until wake_at today — avoids \"next sleep_at tomorrow\"
     blocking dim for the whole day.
     """
@@ -949,11 +963,15 @@ def _try_arm_sleep_boot_override():
     lt = local_time()
     y, mo, d = lt[0], lt[1], lt[2]
     if _sm > _wm:
-        nxt = _next_local_sleep_at_tuple_strictly_after_now()
+        # Overnight: if reboot occurs in the exact sleep-start minute, honor scheduled sleep.
+        now_m = lt[3] * 60 + lt[4]
+        if now_m == _sm:
+            return
+        nxt = _next_local_wake_at_tuple_strictly_after_now()
         _sleep_boot_override_clear_after = nxt
         _sleep_boot_override_active = True
         print(
-            "Sleep: boot inside overnight window — displays stay on until next sleep_at %04d-%02d-%02d %02d:%02d"
+            "Sleep: boot inside overnight window — displays stay on until wake_at %04d-%02d-%02d %02d:%02d"
             % (nxt[0], nxt[1], nxt[2], nxt[3], nxt[4])
         )
     else:
