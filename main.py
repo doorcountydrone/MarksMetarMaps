@@ -1916,7 +1916,12 @@ try:
         _w = network.WLAN(network.STA_IF)
         if _w.isconnected():
             _ip = _w.ifconfig()[0]
-            print("MetarMap LAN IP:", _ip, "— open http://%s:8080 for OTA page" % (_ip,))
+            print(
+                "MetarMap LAN IP:",
+                _ip,
+                "— http://%s:8080 OTA; GET/POST /config and POST /update-config (same as app Save when URL has no port)"
+                % (_ip,),
+            )
     except Exception:
         pass
 
@@ -1975,6 +1980,117 @@ try:
             "timezone_offset_hours": int(cfg.get("timezone_offset_hours", 0)),
         }
         return json.dumps(out)
+
+    _LAN_VALID_MATRIX_WIRING = frozenset(
+        ("ROW_MAJOR", "COLUMN_MAJOR", "SNAKE_ROW", "SNAKE_COLUMN")
+    )
+
+    def _http_apply_post_update_config(updates):
+        """Merge JSON updates into wifi_config.json (same rules as wifi_manager POST /update-config)."""
+        cfg = {}
+        try:
+            with open(CONFIG_FILE, "r") as f:
+                cfg = json.load(f)
+        except Exception:
+            pass
+        if "display_type" in updates:
+            cfg["display_type"] = str(updates["display_type"])
+        if "led_matrix_brightness" in updates:
+            cfg["led_matrix_brightness"] = float(updates["led_matrix_brightness"])
+        if "led_matrix_pin" in updates:
+            cfg["led_matrix_pin"] = int(updates["led_matrix_pin"])
+        if "led_pin" in updates:
+            try:
+                cfg["led_pin"] = max(0, min(28, int(updates["led_pin"])))
+            except (TypeError, ValueError):
+                pass
+        if "batch_size" in updates:
+            cfg["batch_size"] = max(1, min(20, int(float(updates["batch_size"]))))
+        if "num_leds" in updates:
+            try:
+                cfg["num_leds"] = max(1, min(480, int(float(updates["num_leds"]))))
+            except (TypeError, ValueError):
+                pass
+        if "physical_led_count" in updates:
+            try:
+                v = updates["physical_led_count"]
+                if v is None or v == "":
+                    cfg.pop("physical_led_count", None)
+                else:
+                    cfg["physical_led_count"] = max(1, min(480, int(float(v))))
+            except (TypeError, ValueError):
+                pass
+        if "min_brightness" in updates:
+            cfg["min_brightness"] = max(0, min(255, int(updates["min_brightness"])))
+        if "max_brightness" in updates:
+            cfg["max_brightness"] = max(0, min(255, int(updates["max_brightness"])))
+        if "matrix_only" in updates:
+            mo = updates["matrix_only"]
+            cfg["matrix_only"] = mo.lower() in ("true", "1", "yes") if isinstance(mo, str) else bool(mo)
+        if "matrix_scroll_category" in updates:
+            msc = updates["matrix_scroll_category"]
+            cfg["matrix_scroll_category"] = (
+                msc.lower() in ("true", "1", "yes", "on") if isinstance(msc, str) else bool(msc)
+            )
+        if "scroll_speed" in updates:
+            try:
+                cfg["scroll_speed"] = max(0.03, min(0.2, float(updates["scroll_speed"])))
+            except (TypeError, ValueError):
+                pass
+        if "matrix_wiring" in updates:
+            mw = str(updates["matrix_wiring"]).upper()
+            if mw in _LAN_VALID_MATRIX_WIRING:
+                cfg["matrix_wiring"] = mw
+        if "scroll_pause_before" in updates:
+            try:
+                cfg["scroll_pause_before"] = max(0, min(2, float(updates["scroll_pause_before"])))
+            except (TypeError, ValueError):
+                pass
+        if "cycle_delay" in updates:
+            try:
+                cfg["cycle_delay"] = max(5, min(1800, int(float(updates["cycle_delay"]))))
+            except (TypeError, ValueError):
+                pass
+        if "sleep_enabled" in updates:
+            cfg["sleep_enabled"] = bool(updates["sleep_enabled"])
+        if "sleep_at_hour" in updates:
+            cfg["sleep_at_hour"] = max(0, min(23, int(updates["sleep_at_hour"])))
+        if "sleep_at_minute" in updates:
+            cfg["sleep_at_minute"] = max(0, min(59, int(updates["sleep_at_minute"])))
+        if "wake_at_hour" in updates:
+            cfg["wake_at_hour"] = max(0, min(23, int(updates["wake_at_hour"])))
+        if "wake_at_minute" in updates:
+            cfg["wake_at_minute"] = max(0, min(59, int(updates["wake_at_minute"])))
+        if "sleep_matrix" in updates:
+            cfg["sleep_matrix"] = bool(updates["sleep_matrix"])
+        if "sleep_leds" in updates:
+            cfg["sleep_leds"] = bool(updates["sleep_leds"])
+        if "sleep_oled" in updates:
+            cfg["sleep_oled"] = bool(updates["sleep_oled"])
+        if "timezone_offset_hours" in updates:
+            try:
+                cfg["timezone_offset_hours"] = max(-12, min(14, int(updates["timezone_offset_hours"])))
+            except (TypeError, ValueError):
+                pass
+        if "weather_enabled" in updates:
+            we = updates["weather_enabled"]
+            if isinstance(we, dict):
+                cfg["weather_enabled"] = {str(k): bool(v) for k, v in we.items()}
+                for code in WX_TAGS:
+                    if code not in cfg["weather_enabled"]:
+                        cfg["weather_enabled"][code] = True
+        with open(CONFIG_FILE, "w") as f:
+            json.dump(cfg, f)
+        print("LAN :8080 POST /update-config saved to", CONFIG_FILE)
+
+    def _http_send_json_response(conn, success, message):
+        body = json.dumps({"success": success, "message": message})
+        b = body.encode("utf-8")
+        conn.send(
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nConnection: close\r\n"
+        )
+        conn.send(("Content-Length: %d\r\n\r\n" % len(b)).encode("ascii"))
+        conn.sendall(b)
 
     def service_ota_http_and_button():
         global update_socket, _ota_rebind_after, _ota_button_prev, _ota_btn_irq_pending, _ota_last_btn_ms
@@ -2043,6 +2159,43 @@ try:
                         conn.close()
                     except Exception:
                         pass
+                    return
+                if first.startswith("POST ") and "/update-config" in first:
+                    try:
+                        bs = req.find("\r\n\r\n") + 4
+                        body_raw = req[bs:].strip() if bs >= 4 else "{}"
+                        updates = json.loads(body_raw) if body_raw else {}
+                        _http_apply_post_update_config(updates)
+                        do_rb = updates.get("reboot", True)
+                        if isinstance(do_rb, str):
+                            do_rb = do_rb.lower() in ("true", "1", "yes")
+                        if do_rb:
+                            _http_send_json_response(conn, True, "Settings updated, rebooting")
+                            try:
+                                conn.close()
+                            except Exception:
+                                pass
+                            time.sleep(2)
+                            machine.reset()
+                        else:
+                            _http_send_json_response(conn, True, "Settings saved (no reboot)")
+                            try:
+                                conn.close()
+                            except Exception:
+                                pass
+                    except Exception as _uc_ex:
+                        print("LAN POST /update-config error:", _uc_ex)
+                        try:
+                            _http_send_json_response(conn, False, str(_uc_ex))
+                        except Exception:
+                            try:
+                                conn.send(b"HTTP/1.1 500\r\nConnection: close\r\n\r\n")
+                            except Exception:
+                                pass
+                        try:
+                            conn.close()
+                        except Exception:
+                            pass
                     return
                 if first.startswith("POST ") and "/start-update" in first:
                     try:
