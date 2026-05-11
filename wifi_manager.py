@@ -63,6 +63,13 @@ DEFAULT_SLEEP_SCHEDULE = {
     'sleep_leds': True,
     'sleep_oled': True,
     'timezone_offset_hours': 0,
+    'weekend_mode_enabled': False,
+    'weekend_off_weekday': 4,
+    'weekend_off_hour': 18,
+    'weekend_off_minute': 0,
+    'weekend_on_weekday': 0,
+    'weekend_on_hour': 6,
+    'weekend_on_minute': 0,
 }
 
 def _parse_sleep_schedule_from_json(config):
@@ -90,6 +97,20 @@ def _parse_sleep_schedule_from_json(config):
             out['sleep_oled'] = bool(config['sleep_oled'])
         if 'timezone_offset_hours' in config:
             out['timezone_offset_hours'] = max(-12, min(14, int(config['timezone_offset_hours'])))
+        if 'weekend_mode_enabled' in config:
+            out['weekend_mode_enabled'] = bool(config['weekend_mode_enabled'])
+        if 'weekend_off_weekday' in config:
+            out['weekend_off_weekday'] = max(0, min(6, int(config['weekend_off_weekday'])))
+        if 'weekend_off_hour' in config:
+            out['weekend_off_hour'] = max(0, min(23, int(config['weekend_off_hour'])))
+        if 'weekend_off_minute' in config:
+            out['weekend_off_minute'] = max(0, min(59, int(config['weekend_off_minute'])))
+        if 'weekend_on_weekday' in config:
+            out['weekend_on_weekday'] = max(0, min(6, int(config['weekend_on_weekday'])))
+        if 'weekend_on_hour' in config:
+            out['weekend_on_hour'] = max(0, min(23, int(config['weekend_on_hour'])))
+        if 'weekend_on_minute' in config:
+            out['weekend_on_minute'] = max(0, min(59, int(config['weekend_on_minute'])))
     except Exception:
         pass
     return out
@@ -120,6 +141,14 @@ def _parse_sleep_schedule_from_form(params):
             sv = str(params.get(key, '1') or '1').lower()
             out[key] = sv in ('1', 'on', 'true', 'yes')
         out['timezone_offset_hours'] = _ti('timezone_offset_hours', 0, -12, 14)
+        wmv = str(params.get('weekend_mode_enabled', '') or '').lower()
+        out['weekend_mode_enabled'] = wmv in ('1', 'on', 'true', 'yes')
+        out['weekend_off_weekday'] = _ti('weekend_off_weekday', 4, 0, 6)
+        out['weekend_off_hour'] = _ti('weekend_off_hour', 18, 0, 23)
+        out['weekend_off_minute'] = _ti('weekend_off_minute', 0, 0, 59)
+        out['weekend_on_weekday'] = _ti('weekend_on_weekday', 0, 0, 6)
+        out['weekend_on_hour'] = _ti('weekend_on_hour', 6, 0, 23)
+        out['weekend_on_minute'] = _ti('weekend_on_minute', 0, 0, 59)
     except Exception:
         pass
     return out
@@ -644,6 +673,13 @@ def _normalize_config_for_json_api(config):
         'sleep_leds': _gb('sleep_leds', True),
         'sleep_oled': _gb('sleep_oled', True),
         'timezone_offset_hours': _gi('timezone_offset_hours', 0, -12, 14),
+        'weekend_mode_enabled': _gb('weekend_mode_enabled', False),
+        'weekend_off_weekday': _gi('weekend_off_weekday', 4, 0, 6),
+        'weekend_off_hour': _gi('weekend_off_hour', 18, 0, 23),
+        'weekend_off_minute': _gi('weekend_off_minute', 0, 0, 59),
+        'weekend_on_weekday': _gi('weekend_on_weekday', 0, 0, 6),
+        'weekend_on_hour': _gi('weekend_on_hour', 6, 0, 23),
+        'weekend_on_minute': _gi('weekend_on_minute', 0, 0, 59),
     }
 
 def send_json_response(conn, success, message=None, ip=None):
@@ -787,6 +823,17 @@ def get_html_setup_page():
                 setCheckbox('sleep_matrix', c.sleep_matrix);
                 setCheckbox('sleep_leds', c.sleep_leds);
                 setCheckbox('sleep_oled', c.sleep_oled);
+                setCheckbox('weekend_mode_enabled', c.weekend_mode_enabled);
+                function setWd(id, v) {
+                    var el = document.getElementById(id);
+                    if (el) el.value = String(Math.max(0, Math.min(6, parseInt(v, 10) || 0)));
+                }
+                setWd('weekend_off_weekday', c.weekend_off_weekday);
+                setInputNum('weekend_off_hour', c.weekend_off_hour, true);
+                setInputNum('weekend_off_minute', c.weekend_off_minute, true);
+                setWd('weekend_on_weekday', c.weekend_on_weekday);
+                setInputNum('weekend_on_hour', c.weekend_on_hour, true);
+                setInputNum('weekend_on_minute', c.weekend_on_minute, true);
                 toggleMatrix();
             }
             window.onload = function() {
@@ -934,6 +981,43 @@ def get_html_setup_page():
                     <label><input type="checkbox" name="sleep_leds" value="1" id="sleep_leds"> METAR strip LEDs</label><br>
                     <input type="hidden" name="sleep_oled" value="0">
                     <label><input type="checkbox" name="sleep_oled" value="1" id="sleep_oled"> OLED</label>
+                </div>
+                <div class="form-group">
+                    <input type="hidden" name="weekend_mode_enabled" value="0">
+                    <label><input type="checkbox" name="weekend_mode_enabled" value="1" id="weekend_mode_enabled"> Weekend / long off block (adds to daily sleep above)</label>
+                    <div class="note">Uses the same timezone offset. Weekday: 0=Monday … 6=Sunday. The block may wrap across the week (example: off Friday 18:00, on Monday 06:00).</div>
+                </div>
+                <div class="form-group">
+                    <label>Long off — start (weekday + local time)</label>
+                    <div style="display:flex;flex-wrap:wrap;gap:10px;align-items:center">
+                        <select id="weekend_off_weekday" name="weekend_off_weekday" style="width:auto;min-width:120px">
+                            <option value="0">Monday</option>
+                            <option value="1">Tuesday</option>
+                            <option value="2">Wednesday</option>
+                            <option value="3">Thursday</option>
+                            <option value="4" selected>Friday</option>
+                            <option value="5">Saturday</option>
+                            <option value="6">Sunday</option>
+                        </select>
+                        <span>H <input type="number" id="weekend_off_hour" name="weekend_off_hour" min="0" max="23" value="18" style="width:64px"></span>
+                        <span>M <input type="number" id="weekend_off_minute" name="weekend_off_minute" min="0" max="59" value="0" style="width:64px"></span>
+                    </div>
+                </div>
+                <div class="form-group">
+                    <label>Long off — end (weekday + local time)</label>
+                    <div style="display:flex;flex-wrap:wrap;gap:10px;align-items:center">
+                        <select id="weekend_on_weekday" name="weekend_on_weekday" style="width:auto;min-width:120px">
+                            <option value="0" selected>Monday</option>
+                            <option value="1">Tuesday</option>
+                            <option value="2">Wednesday</option>
+                            <option value="3">Thursday</option>
+                            <option value="4">Friday</option>
+                            <option value="5">Saturday</option>
+                            <option value="6">Sunday</option>
+                        </select>
+                        <span>H <input type="number" id="weekend_on_hour" name="weekend_on_hour" min="0" max="23" value="6" style="width:64px"></span>
+                        <span>M <input type="number" id="weekend_on_minute" name="weekend_on_minute" min="0" max="59" value="0" style="width:64px"></span>
+                    </div>
                 </div>
             </div>
             <button type="submit" class="btn">Save &amp; Restart</button>
@@ -1402,6 +1486,38 @@ def run_server():
                     if 'timezone_offset_hours' in updates:
                         try:
                             config['timezone_offset_hours'] = max(-12, min(14, int(updates['timezone_offset_hours'])))
+                        except (TypeError, ValueError):
+                            pass
+                    if 'weekend_mode_enabled' in updates:
+                        config['weekend_mode_enabled'] = bool(updates['weekend_mode_enabled'])
+                    if 'weekend_off_weekday' in updates:
+                        try:
+                            config['weekend_off_weekday'] = max(0, min(6, int(updates['weekend_off_weekday'])))
+                        except (TypeError, ValueError):
+                            pass
+                    if 'weekend_off_hour' in updates:
+                        try:
+                            config['weekend_off_hour'] = max(0, min(23, int(updates['weekend_off_hour'])))
+                        except (TypeError, ValueError):
+                            pass
+                    if 'weekend_off_minute' in updates:
+                        try:
+                            config['weekend_off_minute'] = max(0, min(59, int(updates['weekend_off_minute'])))
+                        except (TypeError, ValueError):
+                            pass
+                    if 'weekend_on_weekday' in updates:
+                        try:
+                            config['weekend_on_weekday'] = max(0, min(6, int(updates['weekend_on_weekday'])))
+                        except (TypeError, ValueError):
+                            pass
+                    if 'weekend_on_hour' in updates:
+                        try:
+                            config['weekend_on_hour'] = max(0, min(23, int(updates['weekend_on_hour'])))
+                        except (TypeError, ValueError):
+                            pass
+                    if 'weekend_on_minute' in updates:
+                        try:
+                            config['weekend_on_minute'] = max(0, min(59, int(updates['weekend_on_minute'])))
                         except (TypeError, ValueError):
                             pass
                     if 'weather_enabled' in updates:
