@@ -56,7 +56,7 @@ CYCLE_DELAY = 10  # Seconds between full airport list cycles; loaded from config
 # ===== FIRMWARE VERSION (for OTA update check) =====
 # Device reports this string; GitHub Pages version.json "version" must be higher to offer OTA.
 # After you flash new code, this should match what you published (or stay lower until user updates).
-FIRMWARE_VERSION = "1.0.5"
+FIRMWARE_VERSION = "1.0.6"
 
 # ===== OTA UPDATE BUTTON (GPIO for short-press "install update") =====
 # Same pin as force-AP at boot: long hold (3s) during startup = setup AP mode; short press while running = start OTA if available.
@@ -277,6 +277,25 @@ def _as_bool(value, default=False):
             return False
     return bool(value)
 
+
+def _parse_weekday_config(value, default):
+    """Weekday for schedules: 0=Monday … 6=Sunday (same as time.gmtime weekday). Accept int/float or mon/tue/…"""
+    d = int(default)
+    d = max(0, min(6, d))
+    if value is None:
+        return d
+    if isinstance(value, (int, float)):
+        return max(0, min(6, int(value)))
+    s = str(value).strip().lower()
+    names = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
+    if len(s) >= 3 and s[:3] in names:
+        return names.index(s[:3])
+    try:
+        return max(0, min(6, int(float(s))))
+    except (TypeError, ValueError):
+        return d
+
+
 # If not configured OR force AP button was pressed, start WiFi manager
 if not check_wifi_config() or force_ap_mode:
     print("Starting setup mode...")
@@ -403,6 +422,26 @@ try:
         SLEEP_MATRIX = _as_bool(config.get("sleep_matrix", True), default=True)
         SLEEP_LEDS = _as_bool(config.get("sleep_leds", True), default=True)
         SLEEP_OLED = _as_bool(config.get("sleep_oled", True), default=True)
+        # Long "weekend" (or any weekly block): off from weekend_off_weekday/time until weekend_on_weekday/time (local).
+        WEEKEND_MODE_ENABLED = _as_bool(config.get("weekend_mode_enabled", False), default=False)
+        WEEKEND_OFF_WEEKDAY = _parse_weekday_config(config.get("weekend_off_weekday", 4), 4)
+        try:
+            WEEKEND_OFF_HOUR = max(0, min(23, int(config.get("weekend_off_hour", 18))))
+        except (TypeError, ValueError):
+            WEEKEND_OFF_HOUR = 18
+        try:
+            WEEKEND_OFF_MINUTE = max(0, min(59, int(config.get("weekend_off_minute", 0))))
+        except (TypeError, ValueError):
+            WEEKEND_OFF_MINUTE = 0
+        WEEKEND_ON_WEEKDAY = _parse_weekday_config(config.get("weekend_on_weekday", 0), 0)
+        try:
+            WEEKEND_ON_HOUR = max(0, min(23, int(config.get("weekend_on_hour", 6))))
+        except (TypeError, ValueError):
+            WEEKEND_ON_HOUR = 6
+        try:
+            WEEKEND_ON_MINUTE = max(0, min(59, int(config.get("weekend_on_minute", 0))))
+        except (TypeError, ValueError):
+            WEEKEND_ON_MINUTE = 0
         try:
             TIMEZONE_OFFSET_HOURS = max(-12, min(14, int(config.get("timezone_offset_hours", -5))))
         except (TypeError, ValueError):
@@ -467,6 +506,13 @@ except Exception as e:
     WAKE_AT_MIN = 0
     SLEEP_MATRIX = SLEEP_LEDS = SLEEP_OLED = True
     TIMEZONE_OFFSET_HOURS = -5
+    WEEKEND_MODE_ENABLED = False
+    WEEKEND_OFF_WEEKDAY = 4
+    WEEKEND_OFF_HOUR = 18
+    WEEKEND_OFF_MINUTE = 0
+    WEEKEND_ON_WEEKDAY = 0
+    WEEKEND_ON_HOUR = 6
+    WEEKEND_ON_MINUTE = 0
     r_scaled = int(20 * STARTUP_BRIGHTNESS)
     for i in range(NUM_LEDS):
         led[i] = (r_scaled, 0, 0)
@@ -865,16 +911,77 @@ def local_time():
     return time.gmtime(time.time() + TIMEZONE_OFFSET_HOURS * 3600)
 
 
+def _in_daily_sleep_clock(hour, minute):
+    """Daily night window using clock only (no weekday). hour, minute = local civil."""
+    now_m = hour * 60 + minute
+    sleep_m = SLEEP_AT_HOUR * 60 + SLEEP_AT_MIN
+    wake_m = WAKE_AT_HOUR * 60 + WAKE_AT_MIN
+    if sleep_m > wake_m:
+        return now_m >= sleep_m or now_m < wake_m
+    return sleep_m <= now_m < wake_m
+
+
 def is_in_sleep_window_now():
-    """Return True when current local time is within configured sleep window."""
+    """Return True when current local time is within configured daily sleep window."""
     try:
         t = local_time()
-        now_m = t[3] * 60 + t[4]
-        sleep_m = SLEEP_AT_HOUR * 60 + SLEEP_AT_MIN
-        wake_m = WAKE_AT_HOUR * 60 + WAKE_AT_MIN
-        if sleep_m > wake_m:  # Overnight window, e.g. 22:00-06:00
-            return now_m >= sleep_m or now_m < wake_m
-        return sleep_m <= now_m < wake_m
+        return _in_daily_sleep_clock(t[3], t[4])
+    except Exception:
+        return False
+
+
+def _week_minutes(wd, hour, minute):
+    """Minutes from start of ISO week (Mon 00:00) to this weekday + time (wd 0=Mon … 6=Sun)."""
+    return wd * 1440 + hour * 60 + minute
+
+
+def is_in_weekend_off_period_at(weekday, hour, minute):
+    """True if (weekday, time) lies in the configured weekend block (may wrap past Sunday)."""
+    if not WEEKEND_MODE_ENABLED:
+        return False
+    try:
+        cur = _week_minutes(weekday, hour, minute)
+        S = _week_minutes(WEEKEND_OFF_WEEKDAY, WEEKEND_OFF_HOUR, WEEKEND_OFF_MINUTE)
+        E = _week_minutes(WEEKEND_ON_WEEKDAY, WEEKEND_ON_HOUR, WEEKEND_ON_MINUTE)
+        if S < E:
+            return S <= cur < E
+        if S > E:
+            return cur >= S or cur < E
+        if WEEKEND_OFF_WEEKDAY != WEEKEND_ON_WEEKDAY:
+            return False
+        om = hour * 60 + minute
+        o0 = WEEKEND_OFF_HOUR * 60 + WEEKEND_OFF_MINUTE
+        o1 = WEEKEND_ON_HOUR * 60 + WEEKEND_ON_MINUTE
+        if o0 < o1:
+            return o0 <= om < o1
+        if o0 > o1:
+            return om >= o0 or om < o1
+        return False
+    except Exception:
+        return False
+
+
+def is_in_weekend_off_period_now():
+    """True when local time is inside the weekend / long off block."""
+    try:
+        t = local_time()
+        return is_in_weekend_off_period_at(t[6], t[3], t[4])
+    except Exception:
+        return False
+
+
+def is_combined_scheduled_display_sleep_at(weekday, hour, minute):
+    """Daily sleep and/or weekend block (used by boot wake scanner)."""
+    daily = SLEEP_ENABLED and _in_daily_sleep_clock(hour, minute)
+    block = WEEKEND_MODE_ENABLED and is_in_weekend_off_period_at(weekday, hour, minute)
+    return daily or block
+
+
+def is_combined_scheduled_display_sleep_now():
+    """Whether any enabled schedule wants displays off (ignores boot override and clock trust)."""
+    try:
+        t = local_time()
+        return is_combined_scheduled_display_sleep_at(t[6], t[3], t[4])
     except Exception:
         return False
 
@@ -895,6 +1002,36 @@ def _ymd_add_one_day(y, mo, d):
     if mo < 12:
         return (y, mo + 1, 1)
     return (y + 1, 1, 1)
+
+
+def _tick_local_minute(y, mo, d, h, mi, wd):
+    """Advance local civil time by one minute; wd is ISO weekday 0..6."""
+    mi += 1
+    if mi < 60:
+        return (y, mo, d, h, mi, wd)
+    mi = 0
+    h += 1
+    if h < 24:
+        return (y, mo, d, h, mi, wd)
+    h = 0
+    y, mo, d = _ymd_add_one_day(y, mo, d)
+    wd = (wd + 1) % 7
+    return (y, mo, d, h, mi, wd)
+
+
+def _next_local_tuple_combined_sleep_false_strictly_after_now():
+    """First local minute strictly after now when no schedule requests display sleep (or None)."""
+    try:
+        t = local_time()
+        y, mo, d, h, mi = t[0], t[1], t[2], t[3], t[4]
+        wd = t[6]
+        for _ in range(10080):
+            y, mo, d, h, mi, wd = _tick_local_minute(y, mo, d, h, mi, wd)
+            if not is_combined_scheduled_display_sleep_at(wd, h, mi):
+                return (y, mo, d, h, mi)
+    except Exception as _e:
+        print("next combined wake err:", _e)
+    return None
 
 
 def _next_local_sleep_at_tuple_strictly_after_now():
@@ -945,59 +1082,49 @@ def _refresh_sleep_boot_override():
 
 
 def _try_arm_sleep_boot_override():
-    """If we boot inside the sleep window, keep displays on until a clear boundary (not stuck dark).
-
-    Overnight (sleep_at > wake on clock): stay on until next wake_at.
-    Same-day window (e.g. 18:50-18:55): stay on until wake_at today — avoids \"next sleep_at tomorrow\"
-    blocking dim for the whole day.
-    """
+    """If we boot inside a scheduled-off window, keep displays on until the next time all schedules are awake."""
     global _sleep_boot_override_active, _sleep_boot_override_clear_after
-    if _sleep_boot_override_active or not SLEEP_ENABLED:
+    if _sleep_boot_override_active:
+        return
+    if not (SLEEP_ENABLED or WEEKEND_MODE_ENABLED):
         return
     if not _sleep_clock_trusted:
         return
-    if not is_in_sleep_window_now():
+    if not is_combined_scheduled_display_sleep_now():
         return
+    lt = local_time()
+    now_m = lt[3] * 60 + lt[4]
     _sm = SLEEP_AT_HOUR * 60 + SLEEP_AT_MIN
     _wm = WAKE_AT_HOUR * 60 + WAKE_AT_MIN
-    lt = local_time()
-    y, mo, d = lt[0], lt[1], lt[2]
-    if _sm > _wm:
-        # Overnight: if reboot occurs in the exact sleep-start minute, honor scheduled sleep.
-        now_m = lt[3] * 60 + lt[4]
-        if now_m == _sm:
+    if SLEEP_ENABLED:
+        if _sm > _wm and now_m == _sm:
             return
-        nxt = _next_local_wake_at_tuple_strictly_after_now()
-        _sleep_boot_override_clear_after = nxt
-        _sleep_boot_override_active = True
-        print(
-            "Sleep: boot inside overnight window — displays stay on until wake_at %04d-%02d-%02d %02d:%02d"
-            % (nxt[0], nxt[1], nxt[2], nxt[3], nxt[4])
-        )
-    else:
-        # Same-day: only arm after the sleep-start *minute* (reboot at 19:05:xx with sleep 19:05 keeps normal dim).
-        now_m = lt[3] * 60 + lt[4]
-        if now_m <= _sm:
+        if _sm <= _wm and now_m <= _sm:
             return
-        nxt = (y, mo, d, WAKE_AT_HOUR, WAKE_AT_MIN)
-        _sleep_boot_override_clear_after = nxt
-        _sleep_boot_override_active = True
-        print(
-            "Sleep: boot inside same-day sleep window — displays stay on until wake_at %04d-%02d-%02d %02d:%02d"
-            % (nxt[0], nxt[1], nxt[2], nxt[3], nxt[4])
-        )
+    if WEEKEND_MODE_ENABLED:
+        if lt[6] == WEEKEND_OFF_WEEKDAY and now_m == (WEEKEND_OFF_HOUR * 60 + WEEKEND_OFF_MINUTE):
+            return
+    nxt = _next_local_tuple_combined_sleep_false_strictly_after_now()
+    if nxt is None:
+        return
+    _sleep_boot_override_clear_after = nxt
+    _sleep_boot_override_active = True
+    print(
+        "Sleep: boot inside scheduled-off window — displays stay on until %04d-%02d-%02d %02d:%02d"
+        % (nxt[0], nxt[1], nxt[2], nxt[3], nxt[4])
+    )
 
 
 def sleep_applies_to_displays_now():
     """True when sleep schedule should dim/blank displays (honors boot override inside sleep window)."""
     _refresh_sleep_boot_override()
-    if not SLEEP_ENABLED:
+    if not (SLEEP_ENABLED or WEEKEND_MODE_ENABLED):
         return False
     if not _sleep_clock_trusted:
         return False
     if _sleep_boot_override_active:
         return False
-    return is_in_sleep_window_now()
+    return is_combined_scheduled_display_sleep_now()
 
 
 def ensure_wifi_connected():
@@ -1667,14 +1794,23 @@ try:
         _in_window = (_now_m >= _sleep_m or _now_m < _wake_m)
     else:
         _in_window = (_sleep_m <= _now_m < _wake_m)
+    _in_weekend = is_in_weekend_off_period_now()
+    _in_combined = is_combined_scheduled_display_sleep_now()
     print(
-        "Sleep schedule config: enabled=%s sleep_at=%02d:%02d wake_at=%02d:%02d tz=%d sleep_matrix=%s sleep_leds=%s sleep_oled=%s now=%02d:%02d in_window=%s"
+        "Sleep schedule config: daily_enabled=%s sleep_at=%02d:%02d wake_at=%02d:%02d | weekend_mode=%s off=wd%d %02d:%02d on=wd%d %02d:%02d | tz=%d | matrix=%s strip=%s oled=%s | now=%02d:%02d daily_win=%s weekend_blk=%s combined=%s"
         % (
             SLEEP_ENABLED,
             SLEEP_AT_HOUR,
             SLEEP_AT_MIN,
             WAKE_AT_HOUR,
             WAKE_AT_MIN,
+            WEEKEND_MODE_ENABLED,
+            WEEKEND_OFF_WEEKDAY,
+            WEEKEND_OFF_HOUR,
+            WEEKEND_OFF_MINUTE,
+            WEEKEND_ON_WEEKDAY,
+            WEEKEND_ON_HOUR,
+            WEEKEND_ON_MINUTE,
             TIMEZONE_OFFSET_HOURS,
             SLEEP_MATRIX,
             SLEEP_LEDS,
@@ -1682,6 +1818,8 @@ try:
             _lt[3],
             _lt[4],
             _in_window,
+            _in_weekend,
+            _in_combined,
         )
     )
     if _sleep_m == _wake_m:
@@ -1978,6 +2116,13 @@ try:
             "sleep_leds": bool(cfg.get("sleep_leds", True)),
             "sleep_oled": bool(cfg.get("sleep_oled", True)),
             "timezone_offset_hours": int(cfg.get("timezone_offset_hours", 0)),
+            "weekend_mode_enabled": bool(cfg.get("weekend_mode_enabled", False)),
+            "weekend_off_weekday": int(cfg.get("weekend_off_weekday", 4)),
+            "weekend_off_hour": int(cfg.get("weekend_off_hour", 18)),
+            "weekend_off_minute": int(cfg.get("weekend_off_minute", 0)),
+            "weekend_on_weekday": int(cfg.get("weekend_on_weekday", 0)),
+            "weekend_on_hour": int(cfg.get("weekend_on_hour", 6)),
+            "weekend_on_minute": int(cfg.get("weekend_on_minute", 0)),
         }
         return json.dumps(out)
 
@@ -2070,6 +2215,38 @@ try:
         if "timezone_offset_hours" in updates:
             try:
                 cfg["timezone_offset_hours"] = max(-12, min(14, int(updates["timezone_offset_hours"])))
+            except (TypeError, ValueError):
+                pass
+        if "weekend_mode_enabled" in updates:
+            cfg["weekend_mode_enabled"] = bool(updates["weekend_mode_enabled"])
+        if "weekend_off_weekday" in updates:
+            try:
+                cfg["weekend_off_weekday"] = max(0, min(6, int(updates["weekend_off_weekday"])))
+            except (TypeError, ValueError):
+                pass
+        if "weekend_off_hour" in updates:
+            try:
+                cfg["weekend_off_hour"] = max(0, min(23, int(updates["weekend_off_hour"])))
+            except (TypeError, ValueError):
+                pass
+        if "weekend_off_minute" in updates:
+            try:
+                cfg["weekend_off_minute"] = max(0, min(59, int(updates["weekend_off_minute"])))
+            except (TypeError, ValueError):
+                pass
+        if "weekend_on_weekday" in updates:
+            try:
+                cfg["weekend_on_weekday"] = max(0, min(6, int(updates["weekend_on_weekday"])))
+            except (TypeError, ValueError):
+                pass
+        if "weekend_on_hour" in updates:
+            try:
+                cfg["weekend_on_hour"] = max(0, min(23, int(updates["weekend_on_hour"])))
+            except (TypeError, ValueError):
+                pass
+        if "weekend_on_minute" in updates:
+            try:
+                cfg["weekend_on_minute"] = max(0, min(59, int(updates["weekend_on_minute"])))
             except (TypeError, ValueError):
                 pass
         if "weather_enabled" in updates:
@@ -2309,7 +2486,7 @@ try:
     ntptime_synced = False
     def maybe_sync_ntp():
         global ntptime_synced
-        if ntptime_synced or not SLEEP_ENABLED:
+        if ntptime_synced or not (SLEEP_ENABLED or WEEKEND_MODE_ENABLED):
             return
         if _try_ntp_sync():
             ntptime_synced = True
@@ -2346,9 +2523,10 @@ try:
         if _last_sleep_diag_minute != t_diag[4]:
             _last_sleep_diag_minute = t_diag[4]
             print(
-                "Sleep check: enabled=%s ntp_trusted=%s now=%02d:%02d sleep_at=%02d:%02d wake_at=%02d:%02d effective_sleep=%s boot_override=%s"
+                "Sleep check: daily=%s weekend_mode=%s ntp_trusted=%s now=%02d:%02d sleep_at=%02d:%02d wake_at=%02d:%02d blk_off=wd%d@%02d:%02d blk_on=wd%d@%02d:%02d sched_off=%s effective_sleep=%s boot_ovr=%s"
                 % (
                     SLEEP_ENABLED,
+                    WEEKEND_MODE_ENABLED,
                     _sleep_clock_trusted,
                     t_diag[3],
                     t_diag[4],
@@ -2356,6 +2534,13 @@ try:
                     SLEEP_AT_MIN,
                     WAKE_AT_HOUR,
                     WAKE_AT_MIN,
+                    WEEKEND_OFF_WEEKDAY,
+                    WEEKEND_OFF_HOUR,
+                    WEEKEND_OFF_MINUTE,
+                    WEEKEND_ON_WEEKDAY,
+                    WEEKEND_ON_HOUR,
+                    WEEKEND_ON_MINUTE,
+                    is_combined_scheduled_display_sleep_now(),
                     in_sleep,
                     _sleep_boot_override_active,
                 )
@@ -2369,7 +2554,17 @@ try:
             if not displays_sleeping:
                 displays_sleeping = True
                 t = local_time()
-                print("Current time (local): %04d-%02d-%02d %02d:%02d:%02d - Display sleep: off until %02d:%02d" % (t[0], t[1], t[2], t[3], t[4], t[5], WAKE_AT_HOUR, WAKE_AT_MIN))
+                _u = _next_local_tuple_combined_sleep_false_strictly_after_now()
+                if _u is not None:
+                    print(
+                        "Current time (local): %04d-%02d-%02d %02d:%02d:%02d - Display sleep: next wake %04d-%02d-%02d %02d:%02d"
+                        % (t[0], t[1], t[2], t[3], t[4], t[5], _u[0], _u[1], _u[2], _u[3], _u[4])
+                    )
+                else:
+                    print(
+                        "Current time (local): %04d-%02d-%02d %02d:%02d:%02d - Display sleep: on (no next wake computed)"
+                        % (t[0], t[1], t[2], t[3], t[4], t[5])
+                    )
             sleep_with_ota_poll(CYCLE_DELAY)
             continue
         just_woke_from_sleep = displays_sleeping
@@ -2452,7 +2647,17 @@ try:
             clear_displays_for_sleep()
             displays_sleeping = True
             t = local_time()
-            print("Current time (local): %04d-%02d-%02d %02d:%02d:%02d - Display sleep: off until %02d:%02d" % (t[0], t[1], t[2], t[3], t[4], t[5], WAKE_AT_HOUR, WAKE_AT_MIN))
+            _u2 = _next_local_tuple_combined_sleep_false_strictly_after_now()
+            if _u2 is not None:
+                print(
+                    "Current time (local): %04d-%02d-%02d %02d:%02d:%02d - Display sleep: next wake %04d-%02d-%02d %02d:%02d"
+                    % (t[0], t[1], t[2], t[3], t[4], t[5], _u2[0], _u2[1], _u2[2], _u2[3], _u2[4])
+                )
+            else:
+                print(
+                    "Current time (local): %04d-%02d-%02d %02d:%02d:%02d - Display sleep: on (no next wake computed)"
+                    % (t[0], t[1], t[2], t[3], t[4], t[5])
+                )
             sleep_with_ota_poll(CYCLE_DELAY)
             continue
         clear_unused_strip_leds(len(airports))
@@ -2482,5 +2687,6 @@ finally:
             led_matrix.write()
     except:
         pass
+
 
 
