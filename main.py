@@ -11,7 +11,7 @@ import ssd1306
 import framebuf
 import os  # Added missing import
 
-machine.freq(250_000_000)
+machine.freq(230_000_000)
 
 # Import brightness settings from wifi_manager
 try:
@@ -56,7 +56,7 @@ CYCLE_DELAY = 10  # Seconds between full airport list cycles; loaded from config
 # ===== FIRMWARE VERSION (for OTA update check) =====
 # Device reports this string; GitHub Pages version.json "version" must be higher to offer OTA.
 # After you flash new code, this should match what you published (or stay lower until user updates).
-FIRMWARE_VERSION = "1.0.7"
+FIRMWARE_VERSION = "1.0.1"
 
 # ===== OTA UPDATE BUTTON (GPIO for short-press "install update") =====
 # Same pin as force-AP at boot: long hold (3s) during startup = setup AP mode; short press while running = start OTA if available.
@@ -1116,12 +1116,18 @@ def _try_arm_sleep_boot_override():
 
 
 def sleep_applies_to_displays_now():
-    """True when sleep schedule should dim/blank displays (honors boot override inside sleep window)."""
+    """True when sleep schedule should dim/blank displays.
+
+    Boot override keeps displays on after a cold boot inside the *daily* night window so the
+    device does not look dead; weekend / long-off blackout must still turn LEDs off on schedule.
+    """
     _refresh_sleep_boot_override()
     if not (SLEEP_ENABLED or WEEKEND_MODE_ENABLED):
         return False
     if not _sleep_clock_trusted:
         return False
+    if WEEKEND_MODE_ENABLED and is_in_weekend_off_period_now():
+        return True
     if _sleep_boot_override_active:
         return False
     return is_combined_scheduled_display_sleep_now()
@@ -2687,5 +2693,4 @@ finally:
             led_matrix.write()
     except:
         pass
-
 
