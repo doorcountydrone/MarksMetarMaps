@@ -24,8 +24,7 @@ CONFIG_FILE = 'wifi_config.json'
 AIRPORT_FILE = 'airports4.txt'
 
 # LED configuration
-LED_PIN = 0
-NUM_LEDS = 256
+NUM_LEDS = 256  # updated by init_strip_leds_from_wifi_config() from wifi_config num_leds
 LED_BRIGHTNESS = 0.2
 STARTUP_BRIGHTNESS = 0.2
 
@@ -153,17 +152,36 @@ def _parse_sleep_schedule_from_form(params):
         pass
     return out
 
-# Initialize NeoPixels with error handling
-try:
-    led = neopixel.NeoPixel(machine.Pin(LED_PIN), NUM_LEDS)
-    leds_initialized = True
-    print("LEDs initialized for WiFi manager")
-except Exception as e:
-    leds_initialized = False
-    print("Error initializing LEDs:", e)
+led = None
+leds_initialized = False
+
+
+def init_strip_leds_from_wifi_config():
+    """(Re)create METAR strip NeoPixel from wifi_config.json led_pin / num_leds for AP/status LEDs."""
+    global led, leds_initialized, NUM_LEDS
+    pin = DEFAULT_LED_PIN
+    n = DEFAULT_NUM_LEDS_STRIP
+    try:
+        with open(CONFIG_FILE, "r") as f:
+            cfg = json.load(f)
+        pin = max(0, min(28, int(cfg.get("led_pin", DEFAULT_LED_PIN))))
+        n = max(1, min(480, int(cfg.get("num_leds", DEFAULT_NUM_LEDS_STRIP))))
+    except Exception:
+        pass
+    try:
+        led = neopixel.NeoPixel(machine.Pin(pin), n)
+        NUM_LEDS = n
+        leds_initialized = True
+        print("WiFi manager strip: GPIO", pin, "x", n, "LEDs")
+    except Exception as e:
+        leds_initialized = False
+        print("Error initializing strip LEDs:", e)
+
+
+init_strip_leds_from_wifi_config()
 
 def set_leds(r, g, b, brightness_override=None):
-    if not leds_initialized:
+    if not leds_initialized or led is None:
         return
     brightness_factor = brightness_override if brightness_override is not None else LED_BRIGHTNESS
     r_scaled = max(0, min(255, int(r * brightness_factor)))
@@ -174,7 +192,7 @@ def set_leds(r, g, b, brightness_override=None):
     led.write()
 
 def clear_leds():
-    if leds_initialized:
+    if leds_initialized and led is not None:
         for i in range(NUM_LEDS):
             led[i] = (0, 0, 0)
         led.write()
@@ -228,6 +246,7 @@ def set_matrix_corners_blue():
 
 def create_ap():
     print("Setting up access point...")
+    init_strip_leds_from_wifi_config()
     set_leds(10, 10, 0, STARTUP_BRIGHTNESS)
     sta_if = network.WLAN(network.STA_IF)
     if sta_if.active():
@@ -703,6 +722,7 @@ def send_html_page(conn, page_str):
 
 def test_wifi_connection(ssid, password):
     print("Testing connection to:", ssid)
+    init_strip_leds_from_wifi_config()
     set_leds(15, 15, 0, STARTUP_BRIGHTNESS)
     sta_if = network.WLAN(network.STA_IF)
     sta_if.active(False)
@@ -1652,6 +1672,7 @@ def run_server():
 def start():
     print("===== Starting WiFi Manager =====")
     gc.collect()
+    init_strip_leds_from_wifi_config()
     set_leds(12, 12, 0, STARTUP_BRIGHTNESS)
     run_server()
 
