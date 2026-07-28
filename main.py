@@ -56,7 +56,7 @@ CYCLE_DELAY = 10  # Seconds between full airport list cycles; loaded from config
 # ===== FIRMWARE VERSION (for OTA update check) =====
 # Device reports this string; GitHub Pages version.json "version" must be higher to offer OTA.
 # After you flash new code, this should match what you published (or stay lower until user updates).
-FIRMWARE_VERSION = "1.1.1"
+FIRMWARE_VERSION = "1.1.2"
 
 # ===== OTA UPDATE BUTTON (GPIO for short-press "install update") =====
 # Same pin as force-AP at boot: long hold (3s) during startup = setup AP mode; short press while running = start OTA if available.
@@ -2506,6 +2506,25 @@ hr{border:none;border-top:1px solid #ddd;margin:24px 0}
                 if not req:
                     conn.close()
                     return
+                # Finish reading POST body (update-config JSON often exceeds first 2048-byte chunk)
+                try:
+                    _cl = None
+                    for _hline in req.split("\r\n"):
+                        if _hline.lower().startswith("content-length:"):
+                            _cl = int(_hline.split(":", 1)[1].strip())
+                            break
+                    if _cl is not None and req.lstrip().upper().startswith("POST"):
+                        _bs = req.find("\r\n\r\n") + 4
+                        if _bs >= 4:
+                            _body = req[_bs:]
+                            while len(_body) < _cl:
+                                _chunk = conn.recv(min(1024, _cl - len(_body)))
+                                if not _chunk:
+                                    break
+                                _body += _chunk.decode("utf-8", "ignore")
+                            req = req[:_bs] + _body[:_cl]
+                except Exception as _recv_ex:
+                    print("OTA HTTP body read:", _recv_ex)
                 first = req.split("\n")[0].strip() if req else ""
                 if first.startswith("GET ") and "/config" in first:
                     try:
