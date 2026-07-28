@@ -56,7 +56,7 @@ CYCLE_DELAY = 10  # Seconds between full airport list cycles; loaded from config
 # ===== FIRMWARE VERSION (for OTA update check) =====
 # Device reports this string; GitHub Pages version.json "version" must be higher to offer OTA.
 # After you flash new code, this should match what you published (or stay lower until user updates).
-FIRMWARE_VERSION = "1.1.0"
+FIRMWARE_VERSION = "1.1.1"
 
 # ===== OTA UPDATE BUTTON (GPIO for short-press "install update") =====
 # Same pin as force-AP at boot: long hold (3s) during startup = setup AP mode; short press while running = start OTA if available.
@@ -2114,7 +2114,30 @@ try:
             print("History trigger GPIO init failed:", _ht_e)
             history_trigger = None
 
-    UPDATE_PAGE_HTML = """<!DOCTYPE html><html><head><meta name="viewport" content="width=device-width"><title>MetarMap Update</title></head><body><h1>MetarMap</h1><p>Firmware is <strong>not</strong> installed automatically; the device only checks at boot. Use this page when you want to download and install.</p><p>Install latest firmware from GitHub.</p><form method="post" action="/start-update"><button type="submit">Install update</button></form><p><small>Device will reboot and apply after download.</small></p><p>24h category history: GET /history, POST /history-refresh, POST /history-play</p></body></html>"""
+    UPDATE_PAGE_HTML = """<!DOCTYPE html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><title>MetarMap</title>
+<style>
+body{font-family:Arial,sans-serif;max-width:420px;margin:24px auto;padding:0 16px;line-height:1.4}
+h1{font-size:1.4rem;margin:0 0 12px}
+h2{font-size:1.1rem;margin:28px 0 8px}
+p{margin:8px 0;color:#333}
+button{display:block;width:100%;padding:12px 16px;margin:8px 0;font-size:16px;border:none;border-radius:8px;cursor:pointer}
+.btn-update{background:#0d6efd;color:#fff}
+.btn-play{background:#198754;color:#fff}
+.btn-refresh{background:#6c757d;color:#fff}
+small{color:#666}
+hr{border:none;border-top:1px solid #ddd;margin:24px 0}
+</style></head><body>
+<h1>MetarMap</h1>
+<p>Firmware is <strong>not</strong> installed automatically; the device only checks at boot. Use this page when you want to download and install.</p>
+<form method="post" action="/start-update"><button class="btn-update" type="submit">Install update</button></form>
+<p><small>Device will reboot and apply after download.</small></p>
+<hr>
+<h2>24-hour flight categories</h2>
+<p>Play the packed history on the LED strip, or download a fresh pack first.</p>
+<form method="post" action="/history-play"><button class="btn-play" type="submit">Play 24h</button></form>
+<form method="post" action="/history-refresh"><button class="btn-refresh" type="submit">Refresh history</button></form>
+<p><small>Play uses the last pack (startup + hourly refresh). Refresh downloads again, then use Play.</small></p>
+</body></html>"""
 
     def open_ota_listen_socket():
         try:
