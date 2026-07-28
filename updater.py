@@ -9,7 +9,9 @@ import machine
 import os
 
 UPDATE_BASE_URL = "https://doorcountydrone.github.io/MarksMetarMaps"
-VERSION_URL = UPDATE_BASE_URL + "/version.json"
+# Prefer raw for version.json (Pages can lag/error); fall back to Pages in check_for_new_version.
+VERSION_URL = "https://raw.githubusercontent.com/doorcountydrone/MarksMetarMaps/main/version.json"
+VERSION_URL_PAGES = UPDATE_BASE_URL + "/version.json"
 PENDING_FILE = "update_pending.json"
 # Small reads keep peak RAM low (r.text allocates the whole body at once and fails on large main.py).
 _DOWNLOAD_CHUNK = 512
@@ -108,6 +110,8 @@ def check_for_new_version(current_version):
     try:
         ok, data = _get_url_text(VERSION_URL, 8, "version check")
         if not ok or not data:
+            ok, data = _get_url_text(VERSION_URL_PAGES, 8, "version check (Pages)")
+        if not ok or not data:
             return False, None
         try:
             info = json.loads(data)
@@ -176,6 +180,8 @@ def install_pending_update(version_info):
 def install_latest():
     try:
         ok, data = _get_url_text(VERSION_URL, 8, "install_latest version.json")
+        if not ok or not data:
+            ok, data = _get_url_text(VERSION_URL_PAGES, 8, "install_latest version.json (Pages)")
         if not ok or not data:
             return False
         try:
