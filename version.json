@@ -3,23 +3,23 @@
   "files": [
     {
       "name": "main.py",
-      "url": "https://doorcountydrone.github.io/MarksMetarMaps/main.py"
+      "url": "https://raw.githubusercontent.com/doorcountydrone/MarksMetarMaps/main/main.py"
     },
     {
       "name": "wifi_manager.py",
-      "url": "https://doorcountydrone.github.io/MarksMetarMaps/wifi_manager.py"
+      "url": "https://raw.githubusercontent.com/doorcountydrone/MarksMetarMaps/main/wifi_manager.py"
     },
     {
       "name": "fc_history.py",
-      "url": "https://doorcountydrone.github.io/MarksMetarMaps/fc_history.py"
+      "url": "https://raw.githubusercontent.com/doorcountydrone/MarksMetarMaps/main/fc_history.py"
     },
     {
       "name": "updater.py",
-      "url": "https://doorcountydrone.github.io/MarksMetarMaps/updater.py"
+      "url": "https://raw.githubusercontent.com/doorcountydrone/MarksMetarMaps/main/updater.py"
     },
     {
       "name": "boot.py",
-      "url": "https://doorcountydrone.github.io/MarksMetarMaps/boot.py"
+      "url": "https://raw.githubusercontent.com/doorcountydrone/MarksMetarMaps/main/boot.py"
     }
   ]
 }
