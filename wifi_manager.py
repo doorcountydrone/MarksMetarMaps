@@ -1240,7 +1240,7 @@ def get_html_help_page():
     <div class="card"><h3>Troubleshooting</h3>
     <p><b>App / browser:</b> Connect to MetarMap WiFi (192.168.4.1). Save fails if not on that network.</p>
     <p><b>Mobile data / hotspot:</b> Using cellular often causes SSL errors; use Wi-Fi when possible.</p>
-    <p><b>NO DATA AFTER 180 SEC:</b> Check WiFi and internet; power-cycle router and device.</p>
+    <p><b>NO DATA AFTER 180 SEC:</b> Check WiFi and internet. Device shows a warning then auto-reboots (~30s later). Power-cycle router if it repeats.</p>
     <p><b>Some airports never show data:</b> API may not have that station; try removing or replacing the code.</p>
     <p><b>Matrix text wrong:</b> Try a different Matrix layout in Setup.</p></div>
     </body></html>"""
@@ -1675,5 +1675,4 @@ def start():
     init_strip_leds_from_wifi_config()
     set_leds(12, 12, 0, STARTUP_BRIGHTNESS)
     run_server()
-
 
