@@ -56,7 +56,7 @@ CYCLE_DELAY = 10  # Seconds between full airport list cycles; loaded from config
 # ===== FIRMWARE VERSION (for OTA update check) =====
 # Device reports this string; GitHub Pages version.json "version" must be higher to offer OTA.
 # After you flash new code, this should match what you published (or stay lower until user updates).
-FIRMWARE_VERSION = "1.1.2"
+FIRMWARE_VERSION = "1.1.3"
 
 # ===== OTA UPDATE BUTTON (GPIO for short-press "install update") =====
 # Same pin as force-AP at boot: long hold (3s) during startup = setup AP mode; short press while running = start OTA if available.
@@ -2114,11 +2114,12 @@ try:
             print("History trigger GPIO init failed:", _ht_e)
             history_trigger = None
 
-    UPDATE_PAGE_HTML = """<!DOCTYPE html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><title>MetarMap</title>
+    UPDATE_PAGE_HTML = """<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>MetarMap Update</title>
 <style>
 body{font-family:Arial,sans-serif;max-width:420px;margin:24px auto;padding:0 16px;line-height:1.4}
 h1{font-size:1.4rem;margin:0 0 12px}
 h2{font-size:1.1rem;margin:28px 0 8px}
+.nav{margin-bottom:16px}.nav a{margin-right:12px;color:#0066cc}
 p{margin:8px 0;color:#333}
 button{display:block;width:100%;padding:12px 16px;margin:8px 0;font-size:16px;border:none;border-radius:8px;cursor:pointer}
 .btn-update{background:#0d6efd;color:#fff}
@@ -2128,6 +2129,7 @@ small{color:#666}
 hr{border:none;border-top:1px solid #ddd;margin:24px 0}
 </style></head><body>
 <h1>MetarMap</h1>
+<div class="nav"><a href="/">Setup</a> <a href="/page/airports">Airports</a> <a href="/page/weather">Weather</a> <a href="/page/help">Help</a> <a href="/page/update">Update</a></div>
 <p>Firmware is <strong>not</strong> installed automatically; the device only checks at boot. Use this page when you want to download and install.</p>
 <form method="post" action="/start-update"><button class="btn-update" type="submit">Install update</button></form>
 <p><small>Device will reboot and apply after download.</small></p>
@@ -2138,6 +2140,16 @@ hr{border:none;border-top:1px solid #ddd;margin:24px 0}
 <form method="post" action="/history-refresh"><button class="btn-refresh" type="submit">Refresh history</button></form>
 <p><small>Play uses the last pack (startup + hourly refresh). Refresh downloads again, then use Play.</small></p>
 </body></html>"""
+
+    def _http_send_html(conn, html_str):
+        b = html_str.encode("utf-8") if isinstance(html_str, str) else html_str
+        conn.send(
+            (
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n"
+                "Connection: close\r\nContent-Length: %d\r\n\r\n" % len(b)
+            ).encode("utf-8")
+        )
+        conn.sendall(b)
 
     def open_ota_listen_socket():
         try:
@@ -2688,17 +2700,190 @@ hr{border:none;border-top:1px solid #ddd;margin:24px 0}
                             conn.close()
                         except Exception:
                             pass
-                else:
-                    _html = UPDATE_PAGE_HTML.encode("utf-8")
-                    _cl = len(_html)
-                    conn.send(
+                    return
+                # Browser pages (same as AP wifi_manager UI) on LAN :8080
+                if first.startswith("GET ") and "/page/airports" in first:
+                    try:
+                        import wifi_manager as _wm
+                        _http_send_html(conn, _wm.get_html_airports_page())
+                    except Exception as _pg_e:
+                        print("GET /page/airports:", _pg_e)
+                        try:
+                            conn.send(b"HTTP/1.1 500\r\nConnection: close\r\n\r\n")
+                        except Exception:
+                            pass
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+                    return
+                if first.startswith("GET ") and "/page/weather" in first:
+                    try:
+                        import wifi_manager as _wm
+                        _http_send_html(conn, _wm.get_html_weather_page())
+                    except Exception as _pg_e:
+                        print("GET /page/weather:", _pg_e)
+                        try:
+                            conn.send(b"HTTP/1.1 500\r\nConnection: close\r\n\r\n")
+                        except Exception:
+                            pass
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+                    return
+                if first.startswith("GET ") and "/page/help" in first:
+                    try:
+                        import wifi_manager as _wm
+                        _http_send_html(conn, _wm.get_html_help_page())
+                    except Exception as _pg_e:
+                        print("GET /page/help:", _pg_e)
+                        try:
+                            conn.send(b"HTTP/1.1 500\r\nConnection: close\r\n\r\n")
+                        except Exception:
+                            pass
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+                    return
+                if first.startswith("GET ") and "/page/update" in first:
+                    try:
+                        _http_send_html(conn, UPDATE_PAGE_HTML)
+                    except Exception as _pg_e:
+                        print("GET /page/update:", _pg_e)
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+                    return
+                if first.startswith("GET ") and "/airports" in first:
+                    try:
+                        with open(AIRPORT_FILE, "r") as f:
+                            content = f.read()
+                        b = content.encode("utf-8")
+                        conn.send(
+                            b"HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n"
+                        )
+                        conn.send(("Content-Length: %d\r\n\r\n" % len(b)).encode("ascii"))
+                        conn.sendall(b)
+                    except Exception:
+                        conn.send(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+                    return
+                if first.startswith("POST ") and "/airports" in first:
+                    try:
+                        bs = req.find("\r\n\r\n") + 4
+                        body = req[bs:].strip() if bs >= 4 else ""
+                        lines = [line.strip().upper() for line in body.replace("\r", "").split("\n")]
+                        with open(AIRPORT_FILE, "w") as f:
+                            f.write("\n".join(lines))
+                        print("LAN :8080 saved", len(lines), "airports")
+                        _http_send_json_response(conn, True, "Saved %d airports" % len(lines))
+                    except Exception as _ap_e:
+                        print("POST /airports:", _ap_e)
+                        try:
+                            _http_send_json_response(conn, False, str(_ap_e))
+                        except Exception:
+                            pass
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+                    return
+                if first.startswith("POST ") and "/reboot" in first:
+                    try:
+                        _http_send_json_response(conn, True, "Rebooting")
+                    except Exception:
+                        pass
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+                    time.sleep(1)
+                    machine.reset()
+                    return
+                if first.startswith("POST ") and "/configure" in first:
+                    # Browser Setup form (same as AP) — save display and/or WiFi, then reboot
+                    try:
+                        import wifi_manager as _wm
+                        parsed = _wm.parse_request_data(req)
                         (
-                            "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n"
-                            "Connection: close\r\nContent-Length: %d\r\n\r\n" % _cl
-                        ).encode("utf-8")
-                    )
-                    conn.send(_html)
+                            ssid, password, display_type, led_matrix_brightness, led_matrix_pin,
+                            min_brightness, max_brightness, batch_size, weather_enabled, matrix_only,
+                            matrix_scroll_category, scroll_speed, matrix_wiring, scroll_pause_before,
+                            cycle_delay, num_leds, led_pin, sleep_schedule,
+                        ) = parsed
+                        _plc = _wm.optional_physical_led_count_from_request(req)
+                        ok = False
+                        if ssid and password:
+                            ok = _wm.save_wifi_config(
+                                ssid, password, display_type, led_matrix_brightness, led_matrix_pin,
+                                min_brightness, max_brightness, batch_size, weather_enabled, matrix_only,
+                                matrix_scroll_category, scroll_speed, matrix_wiring, scroll_pause_before,
+                                cycle_delay, num_leds=num_leds, led_pin=led_pin, physical_led_count=_plc,
+                                sleep_schedule=sleep_schedule,
+                            )
+                        else:
+                            ok = _wm.update_display_config_only(
+                                display_type, led_matrix_brightness, led_matrix_pin, min_brightness,
+                                max_brightness, batch_size, matrix_only, matrix_scroll_category,
+                                scroll_speed, matrix_wiring, scroll_pause_before, cycle_delay,
+                                num_leds=num_leds, led_pin=led_pin, physical_led_count=_plc,
+                                sleep_schedule=sleep_schedule,
+                            )
+                        if ok:
+                            _http_send_html(
+                                conn,
+                                _wm.get_html_display_saved_page(True, "Settings saved. Rebooting..."),
+                            )
+                            try:
+                                conn.close()
+                            except Exception:
+                                pass
+                            time.sleep(2)
+                            machine.reset()
+                        else:
+                            _http_send_html(
+                                conn,
+                                _wm.get_html_display_saved_page(False, "Failed to save settings."),
+                            )
+                            try:
+                                conn.close()
+                            except Exception:
+                                pass
+                    except Exception as _cfg_e:
+                        print("LAN POST /configure:", _cfg_e)
+                        try:
+                            conn.send(b"HTTP/1.1 500\r\nConnection: close\r\n\r\n")
+                            conn.close()
+                        except Exception:
+                            pass
+                    return
+                # Default GET / → Setup page (AP-style UI on LAN)
+                if first.startswith("GET "):
+                    try:
+                        import wifi_manager as _wm
+                        _http_send_html(conn, _wm.get_html_setup_page())
+                    except Exception as _home_e:
+                        print("GET / setup page:", _home_e)
+                        try:
+                            _http_send_html(conn, UPDATE_PAGE_HTML)
+                        except Exception:
+                            pass
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+                    return
+                try:
+                    _http_send_html(conn, UPDATE_PAGE_HTML)
                     conn.close()
+                except Exception:
+                    pass
             except OSError:
                 pass
             except Exception as e:
