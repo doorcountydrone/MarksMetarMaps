@@ -11,7 +11,7 @@ import ssd1306
 import framebuf
 import os  # Added missing import
 
-machine.freq(250_000_000)
+machine.freq(230_000_000)
 
 # Import brightness settings from wifi_manager
 try:
@@ -56,23 +56,38 @@ CYCLE_DELAY = 10  # Seconds between full airport list cycles; loaded from config
 # ===== FIRMWARE VERSION (for OTA update check) =====
 # Device reports this string; GitHub Pages version.json "version" must be higher to offer OTA.
 # After you flash new code, this should match what you published (or stay lower until user updates).
-FIRMWARE_VERSION = "1.0.8"
+FIRMWARE_VERSION = "1.1.0"
 
 # ===== OTA UPDATE BUTTON (GPIO for short-press "install update") =====
 # Same pin as force-AP at boot: long hold (3s) during startup = setup AP mode; short press while running = start OTA if available.
 # Set to -1 to disable physical button (use app or http://<ip>:8080 only).
 UPDATE_BUTTON_PIN = FORCE_AP_BUTTON_PIN
 
+# ===== 24h FLIGHT-CATEGORY HISTORY TRIGGER (extra button / future PIR) =====
+# Active-low to GND (internal pull-up). Short press / motion pulse = play packed 24h animation.
+# Keep separate from UPDATE_BUTTON_PIN. Set to a free GPIO (e.g. 14) when you wire a button or PIR; -1 = off (app/HTTP only).
+HISTORY_TRIGGER_PIN = -1
+# Auto-download 24h history after startup METAR passes, then again on this interval (seconds). 0 = startup only.
+HISTORY_REFRESH_INTERVAL_S = 3600
+# While strip history animation runs, scale frozen matrix pixels by this (0=off/dark, 1=unchanged). Scroll resumes after.
+HISTORY_MATRIX_DIM = 0
+
 # ===== DATA TIMEOUT SETTINGS =====
-NO_DATA_TIMEOUT = 180  #  without any data before showing warning
+NO_DATA_TIMEOUT = 180  # seconds without any airport METAR before warning
+NO_DATA_REBOOT_DELAY = 30  # seconds after warning before machine.reset()
 last_successful_data_time = None  # Track when we last got ANY airport data
 no_data_warning_active = False  # Track if we're currently showing the warning
+no_data_warning_since = None  # time.time() when warning started (reboot countdown)
 update_available = False  # Set True when OTA check finds newer version
 update_info = None  # Parsed version.json when update_available
 _ota_button_prev = 1  # 1 = released (pull-up); used for short-press edge detect on OTA button
 _ota_service_hook = None  # set to service_ota_http_and_button so display loops can poll OTA
 _ota_btn_irq_pending = False  # set by GPIO IRQ (press) so short taps aren't missed during long sleeps
 _ota_last_btn_ms = 0  # debounce duplicate IRQ/edges
+# 24h history: set True while fetch/play runs (avoids re-entrant HTTP/GPIO triggers)
+_history_busy = False
+_history_trigger_prev = 1
+_history_auto_anchor = 0  # time.time() of last auto refresh request (startup / hourly)
 # Set True in main loop when SLEEP_ENABLED and in OFF window and sleep_leds — blocks LDR/OTA from relighting strip from logical_colors
 _strip_dark_for_sleep = False
 # If boot happens inside the sleep window, keep displays awake until the next daily sleep_at; then normal schedule resumes.
@@ -589,32 +604,59 @@ elif DISPLAY_TYPE == "LED_MATRIX":
 elif DISPLAY_TYPE == "NONE":
     print("No display selected - running in LED strip only mode")
 
+def _clear_no_data_warning():
+    global no_data_warning_active, no_data_warning_since
+    no_data_warning_active = False
+    no_data_warning_since = None
+
+
+def pause_no_data_watchdog_for_sleep():
+    """Scheduled sleep skips METAR fetches — pause countdown and avoid reboot."""
+    global last_successful_data_time
+    _clear_no_data_warning()
+    last_successful_data_time = time.time()
+    print("No-data watchdog paused for display sleep")
+
+
 def update_data_success():
-    global last_successful_data_time, no_data_warning_active
+    global last_successful_data_time
     last_successful_data_time = time.time()
     if no_data_warning_active:
-        no_data_warning_active = False
+        _clear_no_data_warning()
         print("Data restored - clearing NO DATA warning")
 
+
 def check_data_timeout():
-    global last_successful_data_time, no_data_warning_active
+    global last_successful_data_time, no_data_warning_active, no_data_warning_since
+    if sleep_applies_to_displays_now():
+        return
     if last_successful_data_time is None:
         last_successful_data_time = time.time()
         return
     time_since_last_data = time.time() - last_successful_data_time
-    if time_since_last_data > NO_DATA_TIMEOUT and not no_data_warning_active:
-        print(f"=== NO DATA TIMEOUT ===")
-        print(f"No airport data received for {time_since_last_data:.1f} seconds")
-        print(f"Timeout: {NO_DATA_TIMEOUT} seconds")
+    if time_since_last_data <= NO_DATA_TIMEOUT:
+        if no_data_warning_active:
+            _clear_no_data_warning()
+            print("Data connection restored")
+        return
+    if not no_data_warning_active:
+        print("=== NO DATA TIMEOUT ===")
+        print("No airport data received for %.1f seconds (limit %d)" % (time_since_last_data, NO_DATA_TIMEOUT))
         if DISPLAY_TYPE == "LED_MATRIX":
             print("Displaying NO DATA warning on LED matrix...")
             display_no_data_warning()
         else:
-            print("NO DATA warning (no display available for warning)")
+            print("NO DATA warning (no matrix); auto-reboot in %d sec" % NO_DATA_REBOOT_DELAY)
         no_data_warning_active = True
-    elif time_since_last_data <= NO_DATA_TIMEOUT and no_data_warning_active:
-        no_data_warning_active = False
-        print("Data connection restored")
+        no_data_warning_since = time.time()
+        return
+    if no_data_warning_since is None:
+        no_data_warning_since = time.time()
+    elapsed_warning = time.time() - no_data_warning_since
+    if elapsed_warning >= NO_DATA_REBOOT_DELAY:
+        print("=== NO DATA AUTO REBOOT ===")
+        print("No METAR data for %.0f sec; rebooting after %d sec warning" % (time_since_last_data, NO_DATA_REBOOT_DELAY))
+        machine.reset()
 
 def display_no_data_warning():
     if led_matrix is None or DISPLAY_TYPE != "LED_MATRIX":
@@ -624,7 +666,7 @@ def display_no_data_warning():
         led_matrix.fill((0, 0, 0))
         led_matrix.write()
         warning_color = apply_auto_brightness((255, 140, 0))
-        warning_text = f"NO DATA AFTER {NO_DATA_TIMEOUT} SEC REBOOT METARMAP IF CONTINUES"
+        warning_text = f"NO DATA {NO_DATA_TIMEOUT}s AUTO REBOOT IN {NO_DATA_REBOOT_DELAY}s"
         print(f"Displaying: {warning_text}")
         scroll_single_text_ultra_smooth(warning_text, warning_color)
         time.sleep(2)
@@ -776,6 +818,26 @@ def scroll_single_text_ultra_smooth(text, text_color):
         gc.collect()
     except Exception as e:
         print(f"Error in scroll_single_text_ultra_smooth: {e}")
+
+def dim_led_matrix(factor=None):
+    """Scale current matrix pixels down (used while strip history animation freezes the scroll)."""
+    if led_matrix is None or DISPLAY_TYPE != "LED_MATRIX":
+        return
+    try:
+        f = HISTORY_MATRIX_DIM if factor is None else float(factor)
+        if f <= 0:
+            led_matrix.fill((0, 0, 0))
+            led_matrix.write()
+            return
+        if f >= 1.0:
+            return
+        for i in range(LED_MATRIX_NUM_LEDS):
+            r, g, b = led_matrix[i]
+            led_matrix[i] = (int(r * f), int(g * f), int(b * f))
+        led_matrix.write()
+    except Exception as e:
+        print("dim_led_matrix:", e)
+
 
 def display_info(line1, line2, flight_category="", airport=""):
     if DISPLAY_TYPE == "OLED":
@@ -1839,7 +1901,7 @@ if _ntp_startup_ok:
 flight_categories = {}
 last_successful_data_time = time.time()
 print(f"Firmware version: {FIRMWARE_VERSION}")
-print(f"Data timeout monitoring started. Timeout: {NO_DATA_TIMEOUT} seconds")
+print("Data timeout: %ds without METAR -> warning, auto-reboot %ds later" % (NO_DATA_TIMEOUT, NO_DATA_REBOOT_DELAY))
 
 print("\n=== Testing auto-brightness ===")
 brightness = test_auto_brightness()
@@ -2032,7 +2094,27 @@ try:
         except Exception:
             update_button = None
 
-    UPDATE_PAGE_HTML = """<!DOCTYPE html><html><head><meta name="viewport" content="width=device-width"><title>MetarMap Update</title></head><body><h1>MetarMap</h1><p>Firmware is <strong>not</strong> installed automatically; the device only checks at boot. Use this page when you want to download and install.</p><p>Install latest firmware from GitHub.</p><form method="post" action="/start-update"><button type="submit">Install update</button></form><p><small>Device will reboot and apply after download.</small></p></body></html>"""
+    fc_hist = None
+    history_trigger = None
+    _history_busy = False
+    _history_trigger_prev = 1
+    try:
+        import fc_history as _fc_history_mod
+        _hist_n = max(8, min(120, len(airports) if airports else 32))
+        fc_hist = _fc_history_mod.FlightCategoryHistory(max_airports=_hist_n)
+        print("fc_history: ready (max_airports=%d, %d bytes buf)" % (_hist_n, _hist_n * 6))
+    except Exception as _fh_e:
+        print("fc_history import failed:", _fh_e)
+        fc_hist = None
+    if HISTORY_TRIGGER_PIN >= 0 and HISTORY_TRIGGER_PIN != UPDATE_BUTTON_PIN:
+        try:
+            history_trigger = Pin(HISTORY_TRIGGER_PIN, Pin.IN, Pin.PULL_UP)
+            print("History trigger GPIO %d (button/PIR, active low)" % HISTORY_TRIGGER_PIN)
+        except Exception as _ht_e:
+            print("History trigger GPIO init failed:", _ht_e)
+            history_trigger = None
+
+    UPDATE_PAGE_HTML = """<!DOCTYPE html><html><head><meta name="viewport" content="width=device-width"><title>MetarMap Update</title></head><body><h1>MetarMap</h1><p>Firmware is <strong>not</strong> installed automatically; the device only checks at boot. Use this page when you want to download and install.</p><p>Install latest firmware from GitHub.</p><form method="post" action="/start-update"><button type="submit">Install update</button></form><p><small>Device will reboot and apply after download.</small></p><p>24h category history: GET /history, POST /history-refresh, POST /history-play</p></body></html>"""
 
     def open_ota_listen_socket():
         try:
@@ -2275,9 +2357,88 @@ try:
         conn.send(("Content-Length: %d\r\n\r\n" % len(b)).encode("ascii"))
         conn.sendall(b)
 
+    def _history_scale(rgb):
+        return _scale_color(rgb, current_ldr_brightness)
+
+    def maybe_queue_hourly_history_refresh():
+        """Queue a background 24h history re-fetch when HISTORY_REFRESH_INTERVAL_S has elapsed."""
+        global _history_auto_anchor
+        if fc_hist is None or HISTORY_REFRESH_INTERVAL_S <= 0 or _history_busy:
+            return
+        if fc_hist.refresh_pending() or fc_hist.play_pending():
+            return
+        now = int(time.time())
+        last = int(getattr(fc_hist, "fetched_at", 0) or 0)
+        basis = last if last > 0 else int(_history_auto_anchor or 0)
+        if basis <= 0 or (now - basis) < int(HISTORY_REFRESH_INTERVAL_S):
+            return
+        print("fc_history: auto-refresh due (every %ds)" % HISTORY_REFRESH_INTERVAL_S)
+        fc_hist.request_refresh()
+        _history_auto_anchor = now
+
+    def service_history_pending():
+        """Run queued history refresh/play (from app, HTTP, or HISTORY_TRIGGER_PIN)."""
+        global _history_busy
+        if fc_hist is None or _history_busy:
+            return
+        if fc_hist.refresh_pending():
+            fc_hist.clear_refresh_pending()
+            _history_busy = True
+            try:
+                print("fc_history: refresh starting…")
+                # Slice instead of limit= — works with older fc_history on the Pico
+                fc_hist.fetch_and_pack(
+                    airports[:STRIP_ACTIVE_LEDS], service_ota_http_and_button
+                )
+            finally:
+                _history_busy = False
+        if fc_hist.play_pending():
+            fc_hist.clear_play_pending()
+            if not fc_hist.ready:
+                _history_busy = True
+                try:
+                    print("fc_history: not ready — fetching before play…")
+                    fc_hist.fetch_and_pack(
+                        airports[:STRIP_ACTIVE_LEDS], service_ota_http_and_button
+                    )
+                finally:
+                    _history_busy = False
+            if fc_hist.ready:
+                _history_busy = True
+                try:
+                    dim_led_matrix()
+                    n = min(STRIP_ACTIVE_LEDS, len(airports), fc_hist.n_airports)
+                    fc_hist.play_on_strip(
+                        led,
+                        logical_colors,
+                        n,
+                        _history_scale,
+                        poll_callback=service_ota_http_and_button,
+                    )
+                finally:
+                    _history_busy = False
+                    # Clear dimmed freeze frame; next METAR scroll redraws at normal brightness
+                    try:
+                        if led_matrix is not None and DISPLAY_TYPE == "LED_MATRIX":
+                            led_matrix.fill((0, 0, 0))
+                            led_matrix.write()
+                    except Exception:
+                        pass
+
     def service_ota_http_and_button():
         global update_socket, _ota_rebind_after, _ota_button_prev, _ota_btn_irq_pending, _ota_last_btn_ms
-        """OTA button + port 8080."""
+        global _history_trigger_prev, _history_busy
+        """OTA button + port 8080 + history trigger/pending."""
+        # Extra button / future PIR: short active-low pulse -> play 24h animation
+        if history_trigger is not None and fc_hist is not None and not _history_busy:
+            try:
+                v = history_trigger.value()
+                if _history_trigger_prev == 1 and v == 0:
+                    print("History trigger: play requested")
+                    fc_hist.request_play()
+                _history_trigger_prev = v
+            except Exception:
+                pass
         if update_button is not None:
             triggered = False
             if _ota_btn_irq_pending:
@@ -2342,6 +2503,83 @@ try:
                         conn.close()
                     except Exception:
                         pass
+                    return
+                if first.startswith("GET ") and "/history" in first:
+                    try:
+                        if fc_hist is None:
+                            body = json.dumps({"ok": False, "ready": False, "state": "error", "error": "fc_history not loaded"})
+                        else:
+                            body = json.dumps(fc_hist.status_dict())
+                        b = body.encode("utf-8")
+                        conn.send(
+                            b"HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nConnection: close\r\n"
+                        )
+                        conn.send(("Content-Length: %d\r\n\r\n" % len(b)).encode("ascii"))
+                        conn.sendall(b)
+                    except Exception as _hs_ex:
+                        print("GET /history error:", _hs_ex)
+                        try:
+                            conn.send(b"HTTP/1.1 500\r\nConnection: close\r\n\r\n")
+                        except Exception:
+                            pass
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+                    return
+                if first.startswith("POST ") and "/history-refresh" in first:
+                    try:
+                        if fc_hist is None:
+                            _http_send_json_response(conn, False, "fc_history not loaded")
+                        else:
+                            fc_hist.request_refresh()
+                            _http_send_json_response(conn, True, "History refresh queued")
+                        try:
+                            conn.close()
+                        except Exception:
+                            pass
+                    except Exception as _hr_ex:
+                        print("POST /history-refresh error:", _hr_ex)
+                        try:
+                            conn.close()
+                        except Exception:
+                            pass
+                    try:
+                        service_history_pending()
+                    except Exception as _shp_e:
+                        print("service_history_pending:", _shp_e)
+                    return
+                if first.startswith("POST ") and "/history-play" in first:
+                    try:
+                        frame_ms = None
+                        try:
+                            bs = req.find("\r\n\r\n") + 4
+                            body_raw = req[bs:].strip() if bs >= 4 else ""
+                            if body_raw:
+                                j = json.loads(body_raw)
+                                if isinstance(j, dict) and "frame_ms" in j:
+                                    frame_ms = j.get("frame_ms")
+                        except Exception:
+                            pass
+                        if fc_hist is None:
+                            _http_send_json_response(conn, False, "fc_history not loaded")
+                        else:
+                            fc_hist.request_play(frame_ms=frame_ms)
+                            _http_send_json_response(conn, True, "History play queued")
+                        try:
+                            conn.close()
+                        except Exception:
+                            pass
+                    except Exception as _hp_ex:
+                        print("POST /history-play error:", _hp_ex)
+                        try:
+                            conn.close()
+                        except Exception:
+                            pass
+                    try:
+                        service_history_pending()
+                    except Exception as _shp_e:
+                        print("service_history_pending:", _shp_e)
                     return
                 if first.startswith("POST ") and "/update-config" in first:
                     try:
@@ -2423,6 +2661,15 @@ try:
                 pass
             except Exception as e:
                 print("OTA server handle:", e)
+        # After HTTP/button poll: hourly queue + run pending history work
+        try:
+            maybe_queue_hourly_history_refresh()
+        except Exception as _hr_auto_e:
+            print("history auto-refresh:", _hr_auto_e)
+        try:
+            service_history_pending()
+        except Exception as _shp_e:
+            print("service_history_pending:", _shp_e)
 
     _ota_service_hook = service_ota_http_and_button
 
@@ -2487,6 +2734,20 @@ try:
     if startup_sleep_hit:
         print("Startup METAR passes paused for sleep window; entering scheduler loop")
     clear_unused_strip_leds(len(airports))
+
+    # Download+pack 24h flight categories after startup METAR passes (same idea as bulk colors).
+    # Then auto-refresh every HISTORY_REFRESH_INTERVAL_S; app Play uses the latest packed buffer.
+    if fc_hist is not None:
+        fc_hist.request_refresh()
+        _history_auto_anchor = int(time.time())
+        print(
+            "fc_history: startup 24h pack queued; auto-refresh every %ds"
+            % HISTORY_REFRESH_INTERVAL_S
+        )
+        try:
+            service_history_pending()
+        except Exception as _ih_e:
+            print("fc_history initial pack:", _ih_e)
 
     # NTP sync once for sleep schedule (local_time() = gmtime(utc + offset))
     ntptime_synced = False
@@ -2559,6 +2820,7 @@ try:
             clear_displays_for_sleep()
             if not displays_sleeping:
                 displays_sleeping = True
+                pause_no_data_watchdog_for_sleep()
                 t = local_time()
                 _u = _next_local_tuple_combined_sleep_false_strictly_after_now()
                 if _u is not None:
@@ -2624,7 +2886,7 @@ try:
             sleep_with_ota_poll(5)
             continue
         elif no_data_warning_active and DISPLAY_TYPE != "LED_MATRIX":
-            print("NO DATA warning active (no display to show warning)")
+            print("NO DATA warning active (no matrix); reboot pending")
             ensure_wifi_connected()
             sleep_with_ota_poll(5)
             continue
