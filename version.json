@@ -1,5 +1,5 @@
 {
-  "version": "1.0.9",
+  "version": "1.1.0",
   "files": [
     {
       "name": "main.py",
@@ -8,6 +8,18 @@
     {
       "name": "wifi_manager.py",
       "url": "https://doorcountydrone.github.io/MarksMetarMaps/wifi_manager.py"
+    },
+    {
+      "name": "fc_history.py",
+      "url": "https://doorcountydrone.github.io/MarksMetarMaps/fc_history.py"
+    },
+    {
+      "name": "updater.py",
+      "url": "https://doorcountydrone.github.io/MarksMetarMaps/updater.py"
+    },
+    {
+      "name": "boot.py",
+      "url": "https://doorcountydrone.github.io/MarksMetarMaps/boot.py"
     }
   ]
 }
