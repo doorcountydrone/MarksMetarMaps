@@ -56,7 +56,7 @@ CYCLE_DELAY = 10  # Seconds between full airport list cycles; loaded from config
 # ===== FIRMWARE VERSION (for OTA update check) =====
 # Device reports this string; GitHub Pages version.json "version" must be higher to offer OTA.
 # After you flash new code, this should match what you published (or stay lower until user updates).
-FIRMWARE_VERSION = "1.1.3"
+FIRMWARE_VERSION = "1.1.4"
 
 # ===== OTA UPDATE BUTTON (GPIO for short-press "install update") =====
 # Same pin as force-AP at boot: long hold (3s) during startup = setup AP mode; short press while running = start OTA if available.
@@ -2138,7 +2138,7 @@ hr{border:none;border-top:1px solid #ddd;margin:24px 0}
 <p>Play the packed history on the LED strip, or download a fresh pack first.</p>
 <form method="post" action="/history-play"><button class="btn-play" type="submit">Play 24h</button></form>
 <form method="post" action="/history-refresh"><button class="btn-refresh" type="submit">Refresh history</button></form>
-<p><small>Play uses the last pack (startup + hourly refresh). Refresh downloads again, then use Play.</small></p>
+<p><small>Play uses the last pack (startup + hourly refresh). Refresh downloads again, then use Play. App can set replay count; browser Play runs once.</small></p>
 </body></html>"""
 
     def _http_send_html(conn, html_str):
@@ -2606,19 +2606,25 @@ hr{border:none;border-top:1px solid #ddd;margin:24px 0}
                 if first.startswith("POST ") and "/history-play" in first:
                     try:
                         frame_ms = None
+                        loops = None
                         try:
                             bs = req.find("\r\n\r\n") + 4
                             body_raw = req[bs:].strip() if bs >= 4 else ""
                             if body_raw:
                                 j = json.loads(body_raw)
-                                if isinstance(j, dict) and "frame_ms" in j:
-                                    frame_ms = j.get("frame_ms")
+                                if isinstance(j, dict):
+                                    if "frame_ms" in j:
+                                        frame_ms = j.get("frame_ms")
+                                    if "loops" in j:
+                                        loops = j.get("loops")
+                                    elif "repeat" in j:
+                                        loops = j.get("repeat")
                         except Exception:
                             pass
                         if fc_hist is None:
                             _http_send_json_response(conn, False, "fc_history not loaded")
                         else:
-                            fc_hist.request_play(frame_ms=frame_ms)
+                            fc_hist.request_play(frame_ms=frame_ms, loops=loops)
                             _http_send_json_response(conn, True, "History play queued")
                         try:
                             conn.close()
