@@ -56,12 +56,15 @@ CYCLE_DELAY = 10  # Seconds between full airport list cycles; loaded from config
 # ===== FIRMWARE VERSION (for OTA update check) =====
 # Device reports this string; GitHub Pages version.json "version" must be higher to offer OTA.
 # After you flash new code, this should match what you published (or stay lower until user updates).
-FIRMWARE_VERSION = "1.1.4"
+FIRMWARE_VERSION = "1.1.5"
 
 # ===== OTA UPDATE BUTTON (GPIO for short-press "install update") =====
-# Same pin as force-AP at boot: long hold (3s) during startup = setup AP mode; short press while running = start OTA if available.
+# Same pin as force-AP at boot: long hold (3s) during startup = setup AP mode.
+# While running: one short press starts OTA; two short presses play the packed 24h history.
+# A single press is delayed briefly so the firmware can distinguish it from a double press.
 # Set to -1 to disable physical button (use app or http://<ip>:8080 only).
 UPDATE_BUTTON_PIN = FORCE_AP_BUTTON_PIN
+UPDATE_BUTTON_MULTI_CLICK_MS = 1400
 
 # ===== 24h FLIGHT-CATEGORY HISTORY TRIGGER (extra button / future PIR) =====
 # Active-low to GND (internal pull-up). Short press / motion pulse = play packed 24h animation.
@@ -82,8 +85,11 @@ update_available = False  # Set True when OTA check finds newer version
 update_info = None  # Parsed version.json when update_available
 _ota_button_prev = 1  # 1 = released (pull-up); used for short-press edge detect on OTA button
 _ota_service_hook = None  # set to service_ota_http_and_button so display loops can poll OTA
-_ota_btn_irq_pending = False  # set by GPIO IRQ (press) so short taps aren't missed during long sleeps
+_ota_btn_irq_pending = 0  # press count captured by GPIO IRQ so a quick double press is not lost
+_ota_btn_irq_last_ms = 0  # IRQ-level debounce timestamp
 _ota_last_btn_ms = 0  # debounce duplicate IRQ/edges
+_ota_button_clicks = 0
+_ota_button_click_deadline_ms = 0
 # 24h history: set True while fetch/play runs (avoids re-entrant HTTP/GPIO triggers)
 _history_busy = False
 _history_trigger_prev = 1
@@ -98,8 +104,13 @@ _sleep_clock_trusted = False
 
 
 def _ota_btn_irq_handler(_pin):
-    global _ota_btn_irq_pending
-    _ota_btn_irq_pending = True
+    global _ota_btn_irq_pending, _ota_btn_irq_last_ms
+    now = time.ticks_ms()
+    if _ota_btn_irq_last_ms and time.ticks_diff(now, _ota_btn_irq_last_ms) < 150:
+        return
+    _ota_btn_irq_last_ms = now
+    if _ota_btn_irq_pending < 2:
+        _ota_btn_irq_pending += 1
 
 
 def _maybe_service_ota():
@@ -2462,6 +2473,7 @@ hr{border:none;border-top:1px solid #ddd;margin:24px 0}
 
     def service_ota_http_and_button():
         global update_socket, _ota_rebind_after, _ota_button_prev, _ota_btn_irq_pending, _ota_last_btn_ms
+        global _ota_button_clicks, _ota_button_click_deadline_ms
         global _history_trigger_prev, _history_busy
         """OTA button + port 8080 + history trigger/pending."""
         # Extra button / future PIR: short active-low pulse -> play 24h animation
@@ -2475,24 +2487,56 @@ hr{border:none;border-top:1px solid #ddd;margin:24px 0}
             except Exception:
                 pass
         if update_button is not None:
-            triggered = False
+            now = time.ticks_ms()
+            install_update = False
+
+            # Finish an earlier click sequence before accepting a new press.
+            if (
+                _ota_button_clicks
+                and _ota_button_click_deadline_ms
+                and time.ticks_diff(now, _ota_button_click_deadline_ms) >= 0
+            ):
+                if _ota_button_clicks == 1:
+                    install_update = True
+                _ota_button_clicks = 0
+                _ota_button_click_deadline_ms = 0
+
+            presses = 0
             if _ota_btn_irq_pending:
-                _ota_btn_irq_pending = False
-                triggered = True
+                presses = _ota_btn_irq_pending
+                _ota_btn_irq_pending = 0
+                # Keep polling state synchronized so this IRQ press is not counted twice.
+                try:
+                    _ota_button_prev = update_button.value()
+                except Exception:
+                    pass
             else:
                 v = update_button.value()
                 if _ota_button_prev == 1 and v == 0:
-                    triggered = True
+                    if not _ota_last_btn_ms or time.ticks_diff(now, _ota_last_btn_ms) >= 150:
+                        presses = 1
+                        _ota_last_btn_ms = now
                 _ota_button_prev = v
-            if triggered:
-                now = time.ticks_ms()
-                if _ota_last_btn_ms and abs(time.ticks_diff(now, _ota_last_btn_ms)) < 400:
-                    return
-                _ota_last_btn_ms = now
-                time.sleep_ms(40)
+
+            if presses:
+                if _ota_button_clicks == 0:
+                    _ota_button_click_deadline_ms = time.ticks_add(
+                        now, UPDATE_BUTTON_MULTI_CLICK_MS
+                    )
+                _ota_button_clicks += presses
+                if _ota_button_clicks >= 2:
+                    _ota_button_clicks = 0
+                    _ota_button_click_deadline_ms = 0
+                    if fc_hist is not None:
+                        print("Button: double press — history play requested")
+                        fc_hist.request_play()
+                    else:
+                        print("Button: double press — fc_history not loaded")
+
+            if install_update:
                 try:
                     import updater
-                    print("OTA: GPIO button — checking / installing…")
+                    print("Button: single press — checking / installing OTA…")
                     if update_available and update_info:
                         updater.install_pending_update(update_info)
                     else:
