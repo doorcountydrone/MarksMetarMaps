@@ -144,6 +144,7 @@ class FlightCategoryHistory:
         self.fetched_at = 0
         self.last_error = ""
         self.frame_ms = 1000  # default ~24s for 24 hourly frames
+        self.loops = 1  # how many times to replay the 24h animation
         self._play_pending = False
         self._refresh_pending = False
 
@@ -158,12 +159,18 @@ class FlightCategoryHistory:
             "state": self.state,
             "error": self.last_error or "",
             "frame_ms": int(self.frame_ms),
+            "loops": int(self.loops),
         }
 
-    def request_play(self, frame_ms=None):
+    def request_play(self, frame_ms=None, loops=None):
         if frame_ms is not None:
             try:
                 self.frame_ms = max(50, min(5000, int(frame_ms)))
+            except (TypeError, ValueError):
+                pass
+        if loops is not None:
+            try:
+                self.loops = max(1, min(20, int(loops)))
             except (TypeError, ValueError):
                 pass
         self._play_pending = True
@@ -366,51 +373,67 @@ class FlightCategoryHistory:
         frame_ms=None,
         poll_callback=None,
         write_every=True,
+        loops=None,
     ):
         """
         Animate packed history on the strip, then restore previous logical_colors.
         scale_color_fn(rgb_tuple) -> brightness-scaled tuple for NeoPixel write.
+        loops: how many times to replay the 24-hour sequence (default self.loops).
         """
         if not self.ready or self.n_airports <= 0:
             print("fc_history play: not ready")
             return False
         ms = self.frame_ms if frame_ms is None else max(50, min(5000, int(frame_ms)))
+        try:
+            n_loops = int(self.loops if loops is None else loops)
+        except (TypeError, ValueError):
+            n_loops = 1
+        n_loops = max(1, min(20, n_loops))
         n = min(self.n_airports, n_leds, len(logical_colors))
         # Snapshot current strip colors
         saved = [logical_colors[i] for i in range(n)]
         self.state = "playing"
         try:
-            for hour in range(HOURS):
+            for loop_i in range(n_loops):
                 if poll_callback:
                     try:
                         poll_callback()
                     except Exception:
                         pass
-                for i in range(n):
-                    code = _get_bits(self.buf, i, hour)
-                    rgb = FC_RGB[code]
-                    logical_colors[i] = rgb
-                    led[i] = scale_color_fn(rgb)
-                if write_every:
-                    led.write()
-                # Frame delay in small chunks so OTA/HTTP stay responsive
-                left = ms
-                while left > 0:
+                for hour in range(HOURS):
                     if poll_callback:
                         try:
                             poll_callback()
                         except Exception:
                             pass
-                    step = 50 if left >= 50 else left
-                    time.sleep_ms(step)
-                    left -= step
+                    for i in range(n):
+                        code = _get_bits(self.buf, i, hour)
+                        rgb = FC_RGB[code]
+                        logical_colors[i] = rgb
+                        led[i] = scale_color_fn(rgb)
+                    if write_every:
+                        led.write()
+                    # Frame delay in small chunks so OTA/HTTP stay responsive
+                    left = ms
+                    while left > 0:
+                        if poll_callback:
+                            try:
+                                poll_callback()
+                            except Exception:
+                                pass
+                        step = 50 if left >= 50 else left
+                        time.sleep_ms(step)
+                        left -= step
             # Restore live colors
             for i in range(n):
                 logical_colors[i] = saved[i]
                 led[i] = scale_color_fn(saved[i])
             led.write()
             self.state = "idle"
-            print("fc_history: playback done (%d frames @ %dms)" % (HOURS, ms))
+            print(
+                "fc_history: playback done (%d×%d frames @ %dms)"
+                % (n_loops, HOURS, ms)
+            )
             return True
         except Exception as e:
             self.state = "error"
