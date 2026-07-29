@@ -56,7 +56,7 @@ CYCLE_DELAY = 10  # Seconds between full airport list cycles; loaded from config
 # ===== FIRMWARE VERSION (for OTA update check) =====
 # Device reports this string; GitHub Pages version.json "version" must be higher to offer OTA.
 # After you flash new code, this should match what you published (or stay lower until user updates).
-FIRMWARE_VERSION = "1.1.5"
+FIRMWARE_VERSION = "1.1.6"
 
 # ===== OTA UPDATE BUTTON (GPIO for short-press "install update") =====
 # Same pin as force-AP at boot: long hold (3s) during startup = setup AP mode.
@@ -72,6 +72,8 @@ UPDATE_BUTTON_MULTI_CLICK_MS = 1400
 HISTORY_TRIGGER_PIN = -1
 # Auto-download 24h history after startup METAR passes, then again on this interval (seconds). 0 = startup only.
 HISTORY_REFRESH_INTERVAL_S = 3600
+# Saved from the Android replay-count slider; used by physical-button playback.
+HISTORY_REPLAY_LOOPS = 1
 # While strip history animation runs, scale frozen matrix pixels by this (0=off/dark, 1=unchanged). Scroll resumes after.
 HISTORY_MATRIX_DIM = 0
 
@@ -431,6 +433,10 @@ try:
                     WEATHER_ENABLED[code] = True
         else:
             WEATHER_ENABLED = {code: True for code in WX_TAGS}
+        try:
+            HISTORY_REPLAY_LOOPS = max(1, min(10, int(config.get("history_replay_loops", 1))))
+        except (TypeError, ValueError):
+            HISTORY_REPLAY_LOOPS = 1
         print(f"Loaded WiFi configuration for: {WIFI_SSID}")
         print(f"Display Type: {DISPLAY_TYPE}")
         print(f"LED Matrix Brightness: {LED_MATRIX_BRIGHTNESS}")
@@ -2113,6 +2119,7 @@ try:
         import fc_history as _fc_history_mod
         _hist_n = max(8, min(120, len(airports) if airports else 32))
         fc_hist = _fc_history_mod.FlightCategoryHistory(max_airports=_hist_n)
+        fc_hist.loops = HISTORY_REPLAY_LOOPS
         print("fc_history: ready (max_airports=%d, %d bytes buf)" % (_hist_n, _hist_n * 6))
     except Exception as _fh_e:
         print("fc_history import failed:", _fh_e)
@@ -2403,6 +2410,33 @@ hr{border:none;border-top:1px solid #ddd;margin:24px 0}
         conn.send(("Content-Length: %d\r\n\r\n" % len(b)).encode("ascii"))
         conn.sendall(b)
 
+    def _save_history_replay_loops(value):
+        """Set the button replay count in memory and persist it in wifi_config.json."""
+        global HISTORY_REPLAY_LOOPS
+        try:
+            n = max(1, min(10, int(value)))
+        except (TypeError, ValueError):
+            return False
+        HISTORY_REPLAY_LOOPS = n
+        if fc_hist is not None:
+            fc_hist.loops = n
+        try:
+            with open(CONFIG_FILE, "r") as f:
+                cfg = json.load(f)
+            try:
+                old_n = int(cfg.get("history_replay_loops", 1))
+            except (TypeError, ValueError):
+                old_n = 1
+            if old_n != n:
+                cfg["history_replay_loops"] = n
+                with open(CONFIG_FILE, "w") as f:
+                    json.dump(cfg, f)
+                print("History replay count saved:", n)
+            return True
+        except Exception as e:
+            print("History replay count save failed:", e)
+            return False
+
     def _history_scale(rgb):
         return _scale_color(rgb, current_ldr_brightness)
 
@@ -2647,6 +2681,33 @@ hr{border:none;border-top:1px solid #ddd;margin:24px 0}
                     except Exception as _shp_e:
                         print("service_history_pending:", _shp_e)
                     return
+                if first.startswith("POST ") and "/history-settings" in first:
+                    try:
+                        bs = req.find("\r\n\r\n") + 4
+                        body_raw = req[bs:].strip() if bs >= 4 else "{}"
+                        settings = json.loads(body_raw) if body_raw else {}
+                        loops = settings.get("loops") if isinstance(settings, dict) else None
+                        if fc_hist is None:
+                            _http_send_json_response(conn, False, "fc_history not loaded")
+                        elif loops is None:
+                            _http_send_json_response(conn, False, "Missing loops")
+                        elif _save_history_replay_loops(loops):
+                            _http_send_json_response(
+                                conn, True, "Button replay count saved: %d" % HISTORY_REPLAY_LOOPS
+                            )
+                        else:
+                            _http_send_json_response(conn, False, "Could not save replay count")
+                    except Exception as _hse:
+                        print("POST /history-settings error:", _hse)
+                        try:
+                            _http_send_json_response(conn, False, "Invalid history settings")
+                        except Exception:
+                            pass
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+                    return
                 if first.startswith("POST ") and "/history-play" in first:
                     try:
                         frame_ms = None
@@ -2668,6 +2729,8 @@ hr{border:none;border-top:1px solid #ddd;margin:24px 0}
                         if fc_hist is None:
                             _http_send_json_response(conn, False, "fc_history not loaded")
                         else:
+                            if loops is not None:
+                                _save_history_replay_loops(loops)
                             fc_hist.request_play(frame_ms=frame_ms, loops=loops)
                             _http_send_json_response(conn, True, "History play queued")
                         try:
