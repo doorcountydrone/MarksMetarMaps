@@ -18,7 +18,8 @@ FC_RGB = (
     (255, 0, 130),
 )
 # Degrees of lat/lon for nearest-TAF search when the strip airport itself has no TAF.
-NEAREST_BBOX_DEG = 1.25
+# Start small (dense metro areas return huge stationinfo JSON) and expand if needed.
+NEAREST_BBOX_STEPS = (0.35, 0.55, 0.80)
 
 
 def _set_bits(buf, airport_idx, hour, code):
@@ -68,13 +69,17 @@ def _http_get_text(url, timeout=12):
 
 
 def _http_get_json(url, timeout=12):
+    """Fetch JSON; free the raw text as soon as parsing succeeds."""
     text = _http_get_text(url, timeout=timeout)
     if not text:
         return None
     try:
-        return json.loads(text)
+        data = json.loads(text)
     except Exception:
-        return None
+        data = None
+    del text
+    gc.collect()
+    return data
 
 
 def _site_has_taf(site_types):
@@ -158,13 +163,11 @@ def _periods_to_hourly(fcsts, now_epoch):
             _fc_from_vis_clouds(p.get("visib"), p.get("clouds"), p.get("vertVis")),
             0,
         )
-        change = str(p.get("fcstChange") or "").upper()
-        # TEMPO/PROB are temporary; still consider them (more restrictive wins)
-        parsed.append((t0, t1, code, change))
+        parsed.append((t0, t1, code))
     for h in range(HOURS):
         t = int(now_epoch) + h * 3600 + 1800  # mid-hour sample
         best = None
-        for t0, t1, code, change in parsed:
+        for t0, t1, code in parsed:
             if t0 <= t < t1:
                 if best is None or code > best:
                     best = code
@@ -172,6 +175,7 @@ def _periods_to_hourly(fcsts, now_epoch):
             slots[h] = best
         elif h > 0:
             slots[h] = slots[h - 1]
+    del parsed
     return slots
 
 
@@ -240,7 +244,7 @@ class FlightCategoryForecast:
         out = {}
         if not id_list:
             return out
-        cs = 5
+        cs = 2  # keep responses small on Pico heap
         i = 0
         while i < len(id_list):
             if poll_callback:
@@ -255,6 +259,7 @@ class FlightCategoryForecast:
             for attempt in range(2):
                 try:
                     print("fc_forecast: stationinfo %s try %d" % (ids, attempt + 1))
+                    gc.collect()
                     data = _http_get_json(url)
                     if data is not None:
                         break
@@ -274,11 +279,7 @@ class FlightCategoryForecast:
                         lon = float(st.get("lon"))
                     except (TypeError, ValueError):
                         continue
-                    out[icao] = {
-                        "lat": lat,
-                        "lon": lon,
-                        "has_taf": _site_has_taf(st.get("siteType")),
-                    }
+                    out[icao] = (lat, lon, _site_has_taf(st.get("siteType")))
             del data
             gc.collect()
             i += cs
@@ -286,12 +287,59 @@ class FlightCategoryForecast:
         return out
 
     def _nearest_taf_station(self, lat, lon, poll_callback=None):
-        d = NEAREST_BBOX_DEG
-        bbox = "%.3f,%.3f,%.3f,%.3f" % (lat - d, lon - d, lat + d, lon + d)
-        url = (
-            "https://aviationweather.gov/api/data/stationinfo?bbox=%s&format=json"
-            % bbox
-        )
+        """Expanding bbox search — small first to avoid huge stationinfo payloads."""
+        for d in NEAREST_BBOX_STEPS:
+            bbox = "%.3f,%.3f,%.3f,%.3f" % (lat - d, lon - d, lat + d, lon + d)
+            url = (
+                "https://aviationweather.gov/api/data/stationinfo?bbox=%s&format=json"
+                % bbox
+            )
+            data = None
+            for attempt in range(2):
+                if poll_callback:
+                    try:
+                        poll_callback()
+                    except Exception:
+                        pass
+                try:
+                    print("fc_forecast: nearest ±%.2f° try %d" % (d, attempt + 1))
+                    gc.collect()
+                    data = _http_get_json(url, timeout=15)
+                    if data is not None:
+                        break
+                except Exception as e:
+                    print("fc_forecast nearest:", e)
+                    gc.collect()
+                    time.sleep_ms(250)
+            best_id = None
+            best_d = None
+            if isinstance(data, list):
+                for st in data:
+                    if not isinstance(st, dict):
+                        continue
+                    if not _site_has_taf(st.get("siteType")):
+                        continue
+                    icao = str(st.get("icaoId") or st.get("id") or "").upper()
+                    if not icao:
+                        continue
+                    try:
+                        slat = float(st.get("lat"))
+                        slon = float(st.get("lon"))
+                    except (TypeError, ValueError):
+                        continue
+                    dd = _dist2(lat, lon, slat, slon)
+                    if best_d is None or dd < best_d:
+                        best_d = dd
+                        best_id = icao
+            del data
+            gc.collect()
+            if best_id:
+                return best_id
+        return None
+
+    def _fetch_one_taf_fcsts(self, icao, poll_callback=None):
+        """Fetch a single station TAF (JSON). One ID keeps heap use predictable."""
+        url = "https://aviationweather.gov/api/data/taf?ids=%s&format=json" % icao
         data = None
         for attempt in range(2):
             if poll_callback:
@@ -300,85 +348,39 @@ class FlightCategoryForecast:
                 except Exception:
                     pass
             try:
-                print("fc_forecast: nearest bbox try %d" % (attempt + 1))
+                print("fc_forecast: taf %s try %d" % (icao, attempt + 1))
+                gc.collect()
                 data = _http_get_json(url, timeout=15)
                 if data is not None:
                     break
             except Exception as e:
-                print("fc_forecast nearest:", e)
+                print("fc_forecast taf fetch:", e)
                 gc.collect()
                 time.sleep_ms(250)
-        best_id = None
-        best_d = None
+        fcsts = None
         if isinstance(data, list):
-            for st in data:
-                if not isinstance(st, dict):
+            for taf in data:
+                if not isinstance(taf, dict):
                     continue
-                if not _site_has_taf(st.get("siteType")):
-                    continue
-                icao = str(st.get("icaoId") or st.get("id") or "").upper()
-                if not icao:
-                    continue
-                try:
-                    slat = float(st.get("lat"))
-                    slon = float(st.get("lon"))
-                except (TypeError, ValueError):
-                    continue
-                dd = _dist2(lat, lon, slat, slon)
-                if best_d is None or dd < best_d:
-                    best_d = dd
-                    best_id = icao
+                tid = str(taf.get("icaoId") or "").upper()
+                if tid == icao and isinstance(taf.get("fcsts"), list):
+                    fcsts = taf.get("fcsts")
+                    break
+            # Fallback: first entry if ids matched oddly
+            if fcsts is None and data:
+                taf0 = data[0]
+                if isinstance(taf0, dict) and isinstance(taf0.get("fcsts"), list):
+                    fcsts = taf0.get("fcsts")
+        elif isinstance(data, dict) and isinstance(data.get("fcsts"), list):
+            fcsts = data.get("fcsts")
         del data
         gc.collect()
-        return best_id
+        return fcsts
 
-    def _fetch_tafs(self, id_list, poll_callback=None):
-        """Return dict icao -> list of forecast period dicts."""
-        out = {}
-        if not id_list:
-            return out
-        cs = 3
-        i = 0
-        while i < len(id_list):
-            if poll_callback:
-                try:
-                    poll_callback()
-                except Exception:
-                    pass
-            chunk = id_list[i : i + cs]
-            ids = ",".join(chunk)
-            url = "https://aviationweather.gov/api/data/taf?ids=%s&format=json" % ids
-            data = None
-            for attempt in range(2):
-                try:
-                    print("fc_forecast: taf %s try %d" % (ids, attempt + 1))
-                    data = _http_get_json(url, timeout=15)
-                    if data is not None:
-                        break
-                except Exception as e:
-                    print("fc_forecast taf fetch:", e)
-                    gc.collect()
-                    time.sleep_ms(200)
-            if isinstance(data, list):
-                for taf in data:
-                    if not isinstance(taf, dict):
-                        continue
-                    icao = str(taf.get("icaoId") or "").upper()
-                    if not icao:
-                        continue
-                    fcsts = taf.get("fcsts")
-                    if isinstance(fcsts, list):
-                        out[icao] = fcsts
-            elif isinstance(data, dict):
-                icao = str(data.get("icaoId") or "").upper()
-                fcsts = data.get("fcsts")
-                if icao and isinstance(fcsts, list):
-                    out[icao] = fcsts
-            del data
-            gc.collect()
-            i += cs
-            time.sleep_ms(100)
-        return out
+    def _pack_slots_for_indices(self, idxs, slots):
+        for idx in idxs:
+            for h in range(HOURS):
+                _set_bits(self.buf, idx, h, slots[h])
 
     def fetch_and_pack(self, airports, poll_callback=None, limit=None):
         self.state = "fetching"
@@ -398,7 +400,7 @@ class FlightCategoryForecast:
         except Exception:
             now_epoch = 0
 
-        # 1) Collect strip ICAOs + station metadata
+        # 1) Collect strip ICAOs
         strip_ids = []
         idx_for = {}
         for idx in range(n):
@@ -423,7 +425,7 @@ class FlightCategoryForecast:
         need_nearest = []
         for apu in strip_ids:
             st = stations.get(apu)
-            if st and st.get("has_taf"):
+            if st and st[2]:
                 source_for[apu] = apu
             else:
                 need_nearest.append(apu)
@@ -433,37 +435,43 @@ class FlightCategoryForecast:
             if not st:
                 print("fc_forecast: no coords for %s — skipping nearest" % apu)
                 continue
-            near = self._nearest_taf_station(st["lat"], st["lon"], poll_callback)
+            near = self._nearest_taf_station(st[0], st[1], poll_callback)
             if near:
                 source_for[apu] = near
                 print("fc_forecast: %s has no TAF → nearest %s" % (apu, near))
             else:
                 print("fc_forecast: no nearby TAF for %s" % apu)
 
-        self.source_map = dict(source_for)
-        taf_ids = []
-        seen_taf = {}
-        for apu, src in source_for.items():
-            if src not in seen_taf:
-                seen_taf[src] = True
-                taf_ids.append(src)
-
-        # 3) Fetch TAF periods
-        taf_data = self._fetch_tafs(taf_ids, poll_callback)
-
-        # 4) Pack hourly slots per strip index
-        ok_count = 0
-        for apu, idxs in idx_for.items():
-            src = source_for.get(apu)
-            fcsts = taf_data.get(src) if src else None
-            slots = _periods_to_hourly(fcsts, now_epoch) if fcsts else [0] * HOURS
-            for idx in idxs:
-                for h in range(HOURS):
-                    _set_bits(self.buf, idx, h, slots[h])
-                if fcsts:
-                    ok_count += 1
-        del taf_data
         del stations
+        gc.collect()
+        self.source_map = dict(source_for)
+
+        # Unique TAF sources → strip indices that use them
+        source_idxs = {}
+        for apu, src in source_for.items():
+            if src not in source_idxs:
+                source_idxs[src] = []
+            source_idxs[src].extend(idx_for.get(apu, []))
+
+        # 3) Fetch one TAF at a time and pack immediately (do not keep all JSON)
+        ok_count = 0
+        for src, idxs in source_idxs.items():
+            fcsts = self._fetch_one_taf_fcsts(src, poll_callback)
+            if not fcsts:
+                print("fc_forecast: no TAF body for %s" % src)
+                continue
+            slots = _periods_to_hourly(fcsts, now_epoch)
+            del fcsts
+            gc.collect()
+            self._pack_slots_for_indices(idxs, slots)
+            ok_count += len(idxs)
+            del slots
+            gc.collect()
+            time.sleep_ms(80)
+
+        del source_idxs
+        del source_for
+        del idx_for
         gc.collect()
 
         self.fetched_at = int(time.time())
