@@ -56,15 +56,15 @@ CYCLE_DELAY = 10  # Seconds between full airport list cycles; loaded from config
 # ===== FIRMWARE VERSION (for OTA update check) =====
 # Device reports this string; GitHub Pages version.json "version" must be higher to offer OTA.
 # After you flash new code, this should match what you published (or stay lower until user updates).
-FIRMWARE_VERSION = "1.1.6"
+FIRMWARE_VERSION = "1.1.7"
 
 # ===== OTA UPDATE BUTTON (GPIO for short-press "install update") =====
 # Same pin as force-AP at boot: long hold (3s) during startup = setup AP mode.
-# While running: one short press starts OTA; two short presses play the packed 24h history.
-# A single press is delayed briefly so the firmware can distinguish it from a double press.
+# While running: 1 short press = OTA; 2 = past-24h history; 3 = next-24h TAF forecast.
+# Single/double wait briefly so a triple press can be distinguished.
 # Set to -1 to disable physical button (use app or http://<ip>:8080 only).
 UPDATE_BUTTON_PIN = FORCE_AP_BUTTON_PIN
-UPDATE_BUTTON_MULTI_CLICK_MS = 1400
+UPDATE_BUTTON_MULTI_CLICK_MS = 1600
 
 # ===== 24h FLIGHT-CATEGORY HISTORY TRIGGER (extra button / future PIR) =====
 # Active-low to GND (internal pull-up). Short press / motion pulse = play packed 24h animation.
@@ -72,6 +72,8 @@ UPDATE_BUTTON_MULTI_CLICK_MS = 1400
 HISTORY_TRIGGER_PIN = -1
 # Auto-download 24h history after startup METAR passes, then again on this interval (seconds). 0 = startup only.
 HISTORY_REFRESH_INTERVAL_S = 3600
+# Same interval for TAF forecast pack refresh (0 = startup only).
+FORECAST_REFRESH_INTERVAL_S = 3600
 # Saved from the Android replay-count slider; used by physical-button playback.
 HISTORY_REPLAY_LOOPS = 1
 # While strip history animation runs, scale frozen matrix pixels by this (0=off/dark, 1=unchanged). Scroll resumes after.
@@ -92,10 +94,11 @@ _ota_btn_irq_last_ms = 0  # IRQ-level debounce timestamp
 _ota_last_btn_ms = 0  # debounce duplicate IRQ/edges
 _ota_button_clicks = 0
 _ota_button_click_deadline_ms = 0
-# 24h history: set True while fetch/play runs (avoids re-entrant HTTP/GPIO triggers)
+# 24h history/forecast: set True while fetch/play runs (avoids re-entrant HTTP/GPIO triggers)
 _history_busy = False
 _history_trigger_prev = 1
 _history_auto_anchor = 0  # time.time() of last auto refresh request (startup / hourly)
+_forecast_auto_anchor = 0
 # Set True in main loop when SLEEP_ENABLED and in OFF window and sleep_leds — blocks LDR/OTA from relighting strip from logical_colors
 _strip_dark_for_sleep = False
 # If boot happens inside the sleep window, keep displays awake until the next daily sleep_at; then normal schedule resumes.
@@ -111,7 +114,7 @@ def _ota_btn_irq_handler(_pin):
     if _ota_btn_irq_last_ms and time.ticks_diff(now, _ota_btn_irq_last_ms) < 150:
         return
     _ota_btn_irq_last_ms = now
-    if _ota_btn_irq_pending < 2:
+    if _ota_btn_irq_pending < 3:
         _ota_btn_irq_pending += 1
 
 
@@ -2112,6 +2115,7 @@ try:
             update_button = None
 
     fc_hist = None
+    fc_fcst = None
     history_trigger = None
     _history_busy = False
     _history_trigger_prev = 1
@@ -2124,6 +2128,15 @@ try:
     except Exception as _fh_e:
         print("fc_history import failed:", _fh_e)
         fc_hist = None
+    try:
+        import fc_forecast as _fc_forecast_mod
+        _fcst_n = max(8, min(120, len(airports) if airports else 32))
+        fc_fcst = _fc_forecast_mod.FlightCategoryForecast(max_airports=_fcst_n)
+        fc_fcst.loops = HISTORY_REPLAY_LOOPS
+        print("fc_forecast: ready (max_airports=%d, %d bytes buf)" % (_fcst_n, _fcst_n * 6))
+    except Exception as _ff_e:
+        print("fc_forecast import failed:", _ff_e)
+        fc_fcst = None
     if HISTORY_TRIGGER_PIN >= 0 and HISTORY_TRIGGER_PIN != UPDATE_BUTTON_PIN:
         try:
             history_trigger = Pin(HISTORY_TRIGGER_PIN, Pin.IN, Pin.PULL_UP)
@@ -2142,6 +2155,7 @@ p{margin:8px 0;color:#333}
 button{display:block;width:100%;padding:12px 16px;margin:8px 0;font-size:16px;border:none;border-radius:8px;cursor:pointer}
 .btn-update{background:#0d6efd;color:#fff}
 .btn-play{background:#198754;color:#fff}
+.btn-forecast{background:#0dcaf0;color:#000}
 .btn-refresh{background:#6c757d;color:#fff}
 small{color:#666}
 hr{border:none;border-top:1px solid #ddd;margin:24px 0}
@@ -2154,9 +2168,11 @@ hr{border:none;border-top:1px solid #ddd;margin:24px 0}
 <hr>
 <h2>24-hour flight categories</h2>
 <p>Play the packed history on the LED strip, or download a fresh pack first.</p>
-<form method="post" action="/history-play"><button class="btn-play" type="submit">Play 24h</button></form>
+<form method="post" action="/history-play"><button class="btn-play" type="submit">Play past 24h</button></form>
 <form method="post" action="/history-refresh"><button class="btn-refresh" type="submit">Refresh history</button></form>
-<p><small>Play uses the last pack (startup + hourly refresh). Refresh downloads again, then use Play. App can set replay count; browser Play runs once.</small></p>
+<form method="post" action="/forecast-play"><button class="btn-forecast" type="submit">Play forecast 24h</button></form>
+<form method="post" action="/forecast-refresh"><button class="btn-refresh" type="submit">Refresh forecast</button></form>
+<p><small>Past = METARs. Forecast = TAFs (nearest TAF station if an airport has none). Button: 2 presses = past, 3 = forecast. App sets replay count.</small></p>
 </body></html>"""
 
     def _http_send_html(conn, html_str):
@@ -2420,6 +2436,8 @@ hr{border:none;border-top:1px solid #ddd;margin:24px 0}
         HISTORY_REPLAY_LOOPS = n
         if fc_hist is not None:
             fc_hist.loops = n
+        if fc_fcst is not None:
+            fc_fcst.loops = n
         try:
             with open(CONFIG_FILE, "r") as f:
                 cfg = json.load(f)
@@ -2456,23 +2474,64 @@ hr{border:none;border-top:1px solid #ddd;margin:24px 0}
         fc_hist.request_refresh()
         _history_auto_anchor = now
 
-    def service_history_pending():
-        """Run queued history refresh/play (from app, HTTP, or HISTORY_TRIGGER_PIN)."""
-        global _history_busy
-        if fc_hist is None or _history_busy:
+    def maybe_queue_hourly_forecast_refresh():
+        """Queue a background TAF forecast re-fetch on FORECAST_REFRESH_INTERVAL_S."""
+        global _forecast_auto_anchor
+        if fc_fcst is None or FORECAST_REFRESH_INTERVAL_S <= 0 or _history_busy:
             return
-        if fc_hist.refresh_pending():
+        if fc_fcst.refresh_pending() or fc_fcst.play_pending():
+            return
+        now = int(time.time())
+        last = int(getattr(fc_fcst, "fetched_at", 0) or 0)
+        basis = last if last > 0 else int(_forecast_auto_anchor or 0)
+        if basis <= 0 or (now - basis) < int(FORECAST_REFRESH_INTERVAL_S):
+            return
+        print("fc_forecast: auto-refresh due (every %ds)" % FORECAST_REFRESH_INTERVAL_S)
+        fc_fcst.request_refresh()
+        _forecast_auto_anchor = now
+
+    def _dim_and_play_pack(pack):
+        """Play a packed history/forecast buffer on the strip with matrix darkened."""
+        global _history_busy
+        if pack is None or not pack.ready:
+            return
+        _history_busy = True
+        try:
+            dim_led_matrix()
+            n = min(STRIP_ACTIVE_LEDS, len(airports), pack.n_airports)
+            pack.play_on_strip(
+                led,
+                logical_colors,
+                n,
+                _history_scale,
+                poll_callback=service_ota_http_and_button,
+            )
+        finally:
+            _history_busy = False
+            try:
+                if led_matrix is not None and DISPLAY_TYPE == "LED_MATRIX":
+                    led_matrix.fill((0, 0, 0))
+                    led_matrix.write()
+            except Exception:
+                pass
+
+    def service_history_pending():
+        """Run queued history/forecast refresh/play (from app, HTTP, or button)."""
+        global _history_busy
+        if _history_busy:
+            return
+        # History pack first
+        if fc_hist is not None and fc_hist.refresh_pending():
             fc_hist.clear_refresh_pending()
             _history_busy = True
             try:
                 print("fc_history: refresh starting…")
-                # Slice instead of limit= — works with older fc_history on the Pico
                 fc_hist.fetch_and_pack(
                     airports[:STRIP_ACTIVE_LEDS], service_ota_http_and_button
                 )
             finally:
                 _history_busy = False
-        if fc_hist.play_pending():
+        if fc_hist is not None and fc_hist.play_pending():
             fc_hist.clear_play_pending()
             if not fc_hist.ready:
                 _history_busy = True
@@ -2484,26 +2543,31 @@ hr{border:none;border-top:1px solid #ddd;margin:24px 0}
                 finally:
                     _history_busy = False
             if fc_hist.ready:
+                _dim_and_play_pack(fc_hist)
+        # Forecast pack
+        if fc_fcst is not None and fc_fcst.refresh_pending():
+            fc_fcst.clear_refresh_pending()
+            _history_busy = True
+            try:
+                print("fc_forecast: refresh starting…")
+                fc_fcst.fetch_and_pack(
+                    airports[:STRIP_ACTIVE_LEDS], service_ota_http_and_button
+                )
+            finally:
+                _history_busy = False
+        if fc_fcst is not None and fc_fcst.play_pending():
+            fc_fcst.clear_play_pending()
+            if not fc_fcst.ready:
                 _history_busy = True
                 try:
-                    dim_led_matrix()
-                    n = min(STRIP_ACTIVE_LEDS, len(airports), fc_hist.n_airports)
-                    fc_hist.play_on_strip(
-                        led,
-                        logical_colors,
-                        n,
-                        _history_scale,
-                        poll_callback=service_ota_http_and_button,
+                    print("fc_forecast: not ready — fetching before play…")
+                    fc_fcst.fetch_and_pack(
+                        airports[:STRIP_ACTIVE_LEDS], service_ota_http_and_button
                     )
                 finally:
                     _history_busy = False
-                    # Clear dimmed freeze frame; next METAR scroll redraws at normal brightness
-                    try:
-                        if led_matrix is not None and DISPLAY_TYPE == "LED_MATRIX":
-                            led_matrix.fill((0, 0, 0))
-                            led_matrix.write()
-                    except Exception:
-                        pass
+            if fc_fcst.ready:
+                _dim_and_play_pack(fc_fcst)
 
     def service_ota_http_and_button():
         global update_socket, _ota_rebind_after, _ota_button_prev, _ota_btn_irq_pending, _ota_last_btn_ms
@@ -2532,6 +2596,18 @@ hr{border:none;border-top:1px solid #ddd;margin:24px 0}
             ):
                 if _ota_button_clicks == 1:
                     install_update = True
+                elif _ota_button_clicks == 2:
+                    if fc_hist is not None:
+                        print("Button: double press — history play requested")
+                        fc_hist.request_play()
+                    else:
+                        print("Button: double press — fc_history not loaded")
+                elif _ota_button_clicks >= 3:
+                    if fc_fcst is not None:
+                        print("Button: triple press — forecast play requested")
+                        fc_fcst.request_play()
+                    else:
+                        print("Button: triple press — fc_forecast not loaded")
                 _ota_button_clicks = 0
                 _ota_button_click_deadline_ms = 0
 
@@ -2558,14 +2634,14 @@ hr{border:none;border-top:1px solid #ddd;margin:24px 0}
                         now, UPDATE_BUTTON_MULTI_CLICK_MS
                     )
                 _ota_button_clicks += presses
-                if _ota_button_clicks >= 2:
+                if _ota_button_clicks >= 3:
                     _ota_button_clicks = 0
                     _ota_button_click_deadline_ms = 0
-                    if fc_hist is not None:
-                        print("Button: double press — history play requested")
-                        fc_hist.request_play()
+                    if fc_fcst is not None:
+                        print("Button: triple press — forecast play requested")
+                        fc_fcst.request_play()
                     else:
-                        print("Button: double press — fc_history not loaded")
+                        print("Button: triple press — fc_forecast not loaded")
 
             if install_update:
                 try:
@@ -2687,8 +2763,8 @@ hr{border:none;border-top:1px solid #ddd;margin:24px 0}
                         body_raw = req[bs:].strip() if bs >= 4 else "{}"
                         settings = json.loads(body_raw) if body_raw else {}
                         loops = settings.get("loops") if isinstance(settings, dict) else None
-                        if fc_hist is None:
-                            _http_send_json_response(conn, False, "fc_history not loaded")
+                        if fc_hist is None and fc_fcst is None:
+                            _http_send_json_response(conn, False, "history/forecast not loaded")
                         elif loops is None:
                             _http_send_json_response(conn, False, "Missing loops")
                         elif _save_history_replay_loops(loops):
@@ -2739,6 +2815,91 @@ hr{border:none;border-top:1px solid #ddd;margin:24px 0}
                             pass
                     except Exception as _hp_ex:
                         print("POST /history-play error:", _hp_ex)
+                        try:
+                            conn.close()
+                        except Exception:
+                            pass
+                    try:
+                        service_history_pending()
+                    except Exception as _shp_e:
+                        print("service_history_pending:", _shp_e)
+                    return
+                if first.startswith("GET ") and "/forecast" in first:
+                    try:
+                        if fc_fcst is None:
+                            body = json.dumps({"ok": False, "ready": False, "state": "error", "error": "fc_forecast not loaded"})
+                        else:
+                            body = json.dumps(fc_fcst.status_dict())
+                        b = body.encode("utf-8")
+                        conn.send(
+                            b"HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nConnection: close\r\n"
+                        )
+                        conn.send(("Content-Length: %d\r\n\r\n" % len(b)).encode("ascii"))
+                        conn.sendall(b)
+                    except Exception as _fs_ex:
+                        print("GET /forecast error:", _fs_ex)
+                        try:
+                            conn.send(b"HTTP/1.1 500\r\nConnection: close\r\n\r\n")
+                        except Exception:
+                            pass
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+                    return
+                if first.startswith("POST ") and "/forecast-refresh" in first:
+                    try:
+                        if fc_fcst is None:
+                            _http_send_json_response(conn, False, "fc_forecast not loaded")
+                        else:
+                            fc_fcst.request_refresh()
+                            _http_send_json_response(conn, True, "Forecast refresh queued")
+                        try:
+                            conn.close()
+                        except Exception:
+                            pass
+                    except Exception as _fr_ex:
+                        print("POST /forecast-refresh error:", _fr_ex)
+                        try:
+                            conn.close()
+                        except Exception:
+                            pass
+                    try:
+                        service_history_pending()
+                    except Exception as _shp_e:
+                        print("service_history_pending:", _shp_e)
+                    return
+                if first.startswith("POST ") and "/forecast-play" in first:
+                    try:
+                        frame_ms = None
+                        loops = None
+                        try:
+                            bs = req.find("\r\n\r\n") + 4
+                            body_raw = req[bs:].strip() if bs >= 4 else ""
+                            if body_raw:
+                                j = json.loads(body_raw)
+                                if isinstance(j, dict):
+                                    if "frame_ms" in j:
+                                        frame_ms = j.get("frame_ms")
+                                    if "loops" in j:
+                                        loops = j.get("loops")
+                                    elif "repeat" in j:
+                                        loops = j.get("repeat")
+                        except Exception:
+                            pass
+                        if fc_fcst is None:
+                            _http_send_json_response(conn, False, "fc_forecast not loaded")
+                        else:
+                            if loops is not None:
+                                _save_history_replay_loops(loops)
+                            fc_fcst.request_play(frame_ms=frame_ms, loops=loops)
+                            _http_send_json_response(conn, True, "Forecast play queued")
+                        try:
+                            conn.close()
+                        except Exception:
+                            pass
+                    except Exception as _fp_ex:
+                        print("POST /forecast-play error:", _fp_ex)
                         try:
                             conn.close()
                         except Exception:
@@ -3001,11 +3162,15 @@ hr{border:none;border-top:1px solid #ddd;margin:24px 0}
                 pass
             except Exception as e:
                 print("OTA server handle:", e)
-        # After HTTP/button poll: hourly queue + run pending history work
+        # After HTTP/button poll: hourly queue + run pending history/forecast work
         try:
             maybe_queue_hourly_history_refresh()
         except Exception as _hr_auto_e:
             print("history auto-refresh:", _hr_auto_e)
+        try:
+            maybe_queue_hourly_forecast_refresh()
+        except Exception as _fr_auto_e:
+            print("forecast auto-refresh:", _fr_auto_e)
         try:
             service_history_pending()
         except Exception as _shp_e:
@@ -3088,6 +3253,17 @@ hr{border:none;border-top:1px solid #ddd;margin:24px 0}
             service_history_pending()
         except Exception as _ih_e:
             print("fc_history initial pack:", _ih_e)
+    if fc_fcst is not None:
+        fc_fcst.request_refresh()
+        _forecast_auto_anchor = int(time.time())
+        print(
+            "fc_forecast: startup TAF pack queued; auto-refresh every %ds"
+            % FORECAST_REFRESH_INTERVAL_S
+        )
+        try:
+            service_history_pending()
+        except Exception as _if_e:
+            print("fc_forecast initial pack:", _if_e)
 
     # NTP sync once for sleep schedule (local_time() = gmtime(utc + offset))
     ntptime_synced = False
