@@ -1,5 +1,5 @@
 {
-  "version": "1.1.6",
+  "version": "1.1.7",
   "files": [
     {
       "name": "main.py",
@@ -12,6 +12,10 @@
     {
       "name": "fc_history.py",
       "url": "https://raw.githubusercontent.com/doorcountydrone/MarksMetarMaps/main/fc_history.py"
+    },
+    {
+      "name": "fc_forecast.py",
+      "url": "https://raw.githubusercontent.com/doorcountydrone/MarksMetarMaps/main/fc_forecast.py"
     },
     {
       "name": "updater.py",
