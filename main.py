@@ -56,7 +56,7 @@ CYCLE_DELAY = 10  # Seconds between full airport list cycles; loaded from config
 # ===== FIRMWARE VERSION (for OTA update check) =====
 # Device reports this string; GitHub Pages version.json "version" must be higher to offer OTA.
 # After you flash new code, this should match what you published (or stay lower until user updates).
-FIRMWARE_VERSION = "1.1.9"
+FIRMWARE_VERSION = "1.1.10"
 
 # ===== OTA UPDATE BUTTON (GPIO for short-press "install update") =====
 # Same pin as force-AP at boot: long hold (3s) during startup = setup AP mode.
@@ -651,6 +651,9 @@ def check_data_timeout():
     global last_successful_data_time, no_data_warning_active, no_data_warning_since
     if sleep_applies_to_displays_now():
         return
+    # History/forecast pack or playback blocks METAR cycles — do not treat as "no data"
+    if _history_busy:
+        return
     if last_successful_data_time is None:
         last_successful_data_time = time.time()
         return
@@ -914,6 +917,8 @@ def _history_fetch_poll():
     """OTA/HTTP poll + throttled fetching indicator (matrix blink or strip flash)."""
     global _fetch_progress_last_ms
     _maybe_service_ota()
+    # Keep no-data watchdog from firing while long packs block METAR cycles
+    update_data_success()
     now = time.ticks_ms()
     if _fetch_progress_last_ms and time.ticks_diff(now, _fetch_progress_last_ms) < 2000:
         return
@@ -2594,6 +2599,7 @@ hr{border:none;border-top:1px solid #ddd;margin:24px 0}
             )
         finally:
             _history_busy = False
+            update_data_success()
             try:
                 if led_matrix is not None and DISPLAY_TYPE == "LED_MATRIX":
                     led_matrix.fill((0, 0, 0))
@@ -2610,6 +2616,7 @@ hr{border:none;border-top:1px solid #ddd;margin:24px 0}
         def _do_fetch(label, pack):
             global _fetch_progress_last_ms
             _fetch_progress_last_ms = 0
+            update_data_success()
             _show_fetch_banner(label)
             try:
                 pack.fetch_and_pack(
@@ -2617,6 +2624,7 @@ hr{border:none;border-top:1px solid #ddd;margin:24px 0}
                 )
             finally:
                 _clear_fetch_indicator()
+                update_data_success()
 
         # History pack first
         if fc_hist is not None and fc_hist.refresh_pending():
