@@ -56,7 +56,7 @@ CYCLE_DELAY = 10  # Seconds between full airport list cycles; loaded from config
 # ===== FIRMWARE VERSION (for OTA update check) =====
 # Device reports this string; GitHub Pages version.json "version" must be higher to offer OTA.
 # After you flash new code, this should match what you published (or stay lower until user updates).
-FIRMWARE_VERSION = "1.1.8"
+FIRMWARE_VERSION = "1.1.9"
 
 # ===== OTA UPDATE BUTTON (GPIO for short-press "install update") =====
 # Same pin as force-AP at boot: long hold (3s) during startup = setup AP mode.
@@ -99,6 +99,7 @@ _history_busy = False
 _history_trigger_prev = 1
 _history_auto_anchor = 0  # time.time() of last auto refresh request (startup / hourly)
 _forecast_auto_anchor = 0
+_fetch_progress_last_ms = 0  # throttle matrix/strip "still fetching" pulse
 # Set True in main loop when SLEEP_ENABLED and in OFF window and sleep_leds — blocks LDR/OTA from relighting strip from logical_colors
 _strip_dark_for_sleep = False
 # If boot happens inside the sleep window, keep displays awake until the next daily sleep_at; then normal schedule resumes.
@@ -857,6 +858,91 @@ def dim_led_matrix(factor=None):
         led_matrix.write()
     except Exception as e:
         print("dim_led_matrix:", e)
+
+
+def _flash_strip_fetch_pulse():
+    """Brief low white flash on airport LEDs, then restore live colors (strip-only / no matrix)."""
+    if led is None or MATRIX_ONLY:
+        return
+    try:
+        n = min(STRIP_ACTIVE_LEDS, NUM_LEDS, len(led))
+        b = max(2, min(12, int(MIN_BRIGHTNESS) + 2))
+        for i in range(n):
+            led[i] = (b, b, b)
+        led.write()
+        time.sleep_ms(50)
+        for i in range(n):
+            c = logical_colors[i] if i < len(logical_colors) else (0, 0, 0)
+            led[i] = _scale_color(c, current_ldr_brightness)
+        led.write()
+    except Exception:
+        pass
+
+
+def _pulse_matrix_fetch():
+    """Cheap amber blink — no text allocation (used between fetch batches)."""
+    if led_matrix is None or DISPLAY_TYPE != "LED_MATRIX":
+        return
+    try:
+        b = max(2, min(24, int(current_ldr_brightness) if current_ldr_brightness else MIN_BRIGHTNESS))
+        led_matrix.fill((b, max(1, b // 2), 0))
+        led_matrix.write()
+        time.sleep_ms(40)
+        led_matrix.fill((0, 0, 0))
+        led_matrix.write()
+    except Exception:
+        pass
+
+
+def _show_fetch_banner(msg):
+    """One short matrix scroll at fetch start; strip-only gets a single pulse."""
+    try:
+        if led_matrix is not None and DISPLAY_TYPE == "LED_MATRIX":
+            # Short word keeps scroll fast; full LDR refresh once is fine here
+            scroll_single_text_ultra_smooth(
+                msg, apply_auto_brightness((255, 160, 0))
+            )
+            led_matrix.fill((0, 0, 0))
+            led_matrix.write()
+        else:
+            _flash_strip_fetch_pulse()
+    except Exception as e:
+        print("fetch banner:", e)
+
+
+def _history_fetch_poll():
+    """OTA/HTTP poll + throttled fetching indicator (matrix blink or strip flash)."""
+    global _fetch_progress_last_ms
+    _maybe_service_ota()
+    now = time.ticks_ms()
+    if _fetch_progress_last_ms and time.ticks_diff(now, _fetch_progress_last_ms) < 2000:
+        return
+    _fetch_progress_last_ms = now
+    try:
+        if led_matrix is not None and DISPLAY_TYPE == "LED_MATRIX":
+            _pulse_matrix_fetch()
+        else:
+            _flash_strip_fetch_pulse()
+    except Exception:
+        pass
+
+
+def _clear_fetch_indicator():
+    try:
+        if led_matrix is not None and DISPLAY_TYPE == "LED_MATRIX":
+            led_matrix.fill((0, 0, 0))
+            led_matrix.write()
+    except Exception:
+        pass
+    try:
+        if led is not None and not MATRIX_ONLY:
+            n = min(STRIP_ACTIVE_LEDS, NUM_LEDS, len(led))
+            for i in range(n):
+                c = logical_colors[i] if i < len(logical_colors) else (0, 0, 0)
+                led[i] = _scale_color(c, current_ldr_brightness)
+            led.write()
+    except Exception:
+        pass
 
 
 def display_info(line1, line2, flight_category="", airport=""):
@@ -2517,18 +2603,28 @@ hr{border:none;border-top:1px solid #ddd;margin:24px 0}
 
     def service_history_pending():
         """Run queued history/forecast refresh/play (from app, HTTP, or button)."""
-        global _history_busy
+        global _history_busy, _fetch_progress_last_ms
         if _history_busy:
             return
+
+        def _do_fetch(label, pack):
+            global _fetch_progress_last_ms
+            _fetch_progress_last_ms = 0
+            _show_fetch_banner(label)
+            try:
+                pack.fetch_and_pack(
+                    airports[:STRIP_ACTIVE_LEDS], _history_fetch_poll
+                )
+            finally:
+                _clear_fetch_indicator()
+
         # History pack first
         if fc_hist is not None and fc_hist.refresh_pending():
             fc_hist.clear_refresh_pending()
             _history_busy = True
             try:
                 print("fc_history: refresh starting…")
-                fc_hist.fetch_and_pack(
-                    airports[:STRIP_ACTIVE_LEDS], service_ota_http_and_button
-                )
+                _do_fetch("FETCHING", fc_hist)
             finally:
                 _history_busy = False
         if fc_hist is not None and fc_hist.play_pending():
@@ -2537,9 +2633,7 @@ hr{border:none;border-top:1px solid #ddd;margin:24px 0}
                 _history_busy = True
                 try:
                     print("fc_history: not ready — fetching before play…")
-                    fc_hist.fetch_and_pack(
-                        airports[:STRIP_ACTIVE_LEDS], service_ota_http_and_button
-                    )
+                    _do_fetch("FETCHING", fc_hist)
                 finally:
                     _history_busy = False
             if fc_hist.ready:
@@ -2550,9 +2644,7 @@ hr{border:none;border-top:1px solid #ddd;margin:24px 0}
             _history_busy = True
             try:
                 print("fc_forecast: refresh starting…")
-                fc_fcst.fetch_and_pack(
-                    airports[:STRIP_ACTIVE_LEDS], service_ota_http_and_button
-                )
+                _do_fetch("FETCH FCST", fc_fcst)
             finally:
                 _history_busy = False
         if fc_fcst is not None and fc_fcst.play_pending():
@@ -2561,9 +2653,7 @@ hr{border:none;border-top:1px solid #ddd;margin:24px 0}
                 _history_busy = True
                 try:
                     print("fc_forecast: not ready — fetching before play…")
-                    fc_fcst.fetch_and_pack(
-                        airports[:STRIP_ACTIVE_LEDS], service_ota_http_and_button
-                    )
+                    _do_fetch("FETCH FCST", fc_fcst)
                 finally:
                     _history_busy = False
             if fc_fcst.ready:
