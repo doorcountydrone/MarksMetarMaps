@@ -17,9 +17,7 @@ FC_RGB = (
     (255, 0, 0),
     (255, 0, 130),
 )
-# Degrees of lat/lon for nearest-TAF search when the strip airport itself has no TAF.
-# Start small (dense metro areas return huge stationinfo JSON) and expand if needed.
-NEAREST_BBOX_STEPS = (0.35, 0.55, 0.80)
+# Nearest TAF: one regional stationinfo bbox + in-memory distance (not per-airport HTTP).
 
 
 def _set_bits(buf, airport_idx, hour, code):
@@ -286,56 +284,66 @@ class FlightCategoryForecast:
             time.sleep_ms(80)
         return out
 
-    def _nearest_taf_station(self, lat, lon, poll_callback=None):
-        """Expanding bbox search — small first to avoid huge stationinfo payloads."""
-        for d in NEAREST_BBOX_STEPS:
-            bbox = "%.3f,%.3f,%.3f,%.3f" % (lat - d, lon - d, lat + d, lon + d)
-            url = (
-                "https://aviationweather.gov/api/data/stationinfo?bbox=%s&format=json"
-                % bbox
-            )
-            data = None
-            for attempt in range(2):
-                if poll_callback:
-                    try:
-                        poll_callback()
-                    except Exception:
-                        pass
+    def _nearest_from_list(self, lat, lon, sites):
+        """sites: list of (icao, lat, lon). Return nearest icao or None."""
+        best_id = None
+        best_d = None
+        for icao, slat, slon in sites:
+            dd = _dist2(lat, lon, slat, slon)
+            if best_d is None or dd < best_d:
+                best_d = dd
+                best_id = icao
+        return best_id
+
+    def _fetch_taf_sites_bbox(self, lat0, lon0, lat1, lon1, poll_callback=None):
+        """One stationinfo bbox -> list of (icao, lat, lon) for TAF sites only."""
+        if lat0 > lat1:
+            lat0, lat1 = lat1, lat0
+        if lon0 > lon1:
+            lon0, lon1 = lon1, lon0
+        pad = 0.75
+        bbox = "%.3f,%.3f,%.3f,%.3f" % (lat0 - pad, lon0 - pad, lat1 + pad, lon1 + pad)
+        url = (
+            "https://aviationweather.gov/api/data/stationinfo?bbox=%s&format=json"
+            % bbox
+        )
+        data = None
+        for attempt in range(2):
+            if poll_callback:
                 try:
-                    print("fc_forecast: nearest ±%.2f° try %d" % (d, attempt + 1))
-                    gc.collect()
-                    data = _http_get_json(url, timeout=15)
-                    if data is not None:
-                        break
-                except Exception as e:
-                    print("fc_forecast nearest:", e)
-                    gc.collect()
-                    time.sleep_ms(250)
-            best_id = None
-            best_d = None
-            if isinstance(data, list):
-                for st in data:
-                    if not isinstance(st, dict):
-                        continue
-                    if not _site_has_taf(st.get("siteType")):
-                        continue
-                    icao = str(st.get("icaoId") or st.get("id") or "").upper()
-                    if not icao:
-                        continue
-                    try:
-                        slat = float(st.get("lat"))
-                        slon = float(st.get("lon"))
-                    except (TypeError, ValueError):
-                        continue
-                    dd = _dist2(lat, lon, slat, slon)
-                    if best_d is None or dd < best_d:
-                        best_d = dd
-                        best_id = icao
-            del data
-            gc.collect()
-            if best_id:
-                return best_id
-        return None
+                    poll_callback()
+                except Exception:
+                    pass
+            try:
+                print("fc_forecast: regional TAF sites try %d" % (attempt + 1))
+                gc.collect()
+                data = _http_get_json(url, timeout=18)
+                if data is not None:
+                    break
+            except Exception as e:
+                print("fc_forecast regional sites:", e)
+                gc.collect()
+                time.sleep_ms(250)
+        out = []
+        if isinstance(data, list):
+            for st in data:
+                if not isinstance(st, dict):
+                    continue
+                if not _site_has_taf(st.get("siteType")):
+                    continue
+                icao = str(st.get("icaoId") or st.get("id") or "").upper()
+                if not icao:
+                    continue
+                try:
+                    slat = float(st.get("lat"))
+                    slon = float(st.get("lon"))
+                except (TypeError, ValueError):
+                    continue
+                out.append((icao, slat, slon))
+        del data
+        gc.collect()
+        print("fc_forecast: regional TAF sites = %d" % len(out))
+        return out
 
     def _fetch_one_taf_fcsts(self, icao, poll_callback=None):
         """Fetch a single station TAF (JSON). One ID keeps heap use predictable."""
@@ -366,7 +374,6 @@ class FlightCategoryForecast:
                 if tid == icao and isinstance(taf.get("fcsts"), list):
                     fcsts = taf.get("fcsts")
                     break
-            # Fallback: first entry if ids matched oddly
             if fcsts is None and data:
                 taf0 = data[0]
                 if isinstance(taf0, dict) and isinstance(taf0.get("fcsts"), list):
@@ -400,7 +407,6 @@ class FlightCategoryForecast:
         except Exception:
             now_epoch = 0
 
-        # 1) Collect strip ICAOs
         strip_ids = []
         idx_for = {}
         for idx in range(n):
@@ -420,22 +426,61 @@ class FlightCategoryForecast:
             return False
 
         stations = self._fetch_stationinfo_ids(strip_ids, poll_callback)
-        # 2) Resolve TAF source per strip airport
-        source_for = {}  # strip icao -> taf icao
+        source_for = {}
         need_nearest = []
+        strip_taf_sites = []
+        min_lat = max_lat = min_lon = max_lon = None
         for apu in strip_ids:
             st = stations.get(apu)
-            if st and st[2]:
+            if not st:
+                continue
+            lat, lon, has_taf = st[0], st[1], st[2]
+            if min_lat is None:
+                min_lat = max_lat = lat
+                min_lon = max_lon = lon
+            else:
+                if lat < min_lat:
+                    min_lat = lat
+                if lat > max_lat:
+                    max_lat = lat
+                if lon < min_lon:
+                    min_lon = lon
+                if lon > max_lon:
+                    max_lon = lon
+            if has_taf:
                 source_for[apu] = apu
+                strip_taf_sites.append((apu, lat, lon))
             else:
                 need_nearest.append(apu)
+
+        # Prefer strip TAF sites; optionally ONE regional lookup (not per-airport).
+        taf_pool = list(strip_taf_sites)
+        if need_nearest and min_lat is not None:
+            try:
+                regional = self._fetch_taf_sites_bbox(
+                    min_lat, min_lon, max_lat, max_lon, poll_callback
+                )
+            except Exception as e:
+                print("fc_forecast: regional lookup failed:", e)
+                regional = []
+            if regional:
+                seen = {t[0]: True for t in taf_pool}
+                for item in regional:
+                    if item[0] not in seen:
+                        seen[item[0]] = True
+                        taf_pool.append(item)
+                del seen
+            del regional
+            gc.collect()
+            if not taf_pool:
+                taf_pool = list(strip_taf_sites)
 
         for apu in need_nearest:
             st = stations.get(apu)
             if not st:
                 print("fc_forecast: no coords for %s — skipping nearest" % apu)
                 continue
-            near = self._nearest_taf_station(st[0], st[1], poll_callback)
+            near = self._nearest_from_list(st[0], st[1], taf_pool)
             if near:
                 source_for[apu] = near
                 print("fc_forecast: %s has no TAF → nearest %s" % (apu, near))
@@ -443,17 +488,17 @@ class FlightCategoryForecast:
                 print("fc_forecast: no nearby TAF for %s" % apu)
 
         del stations
+        del taf_pool
+        del strip_taf_sites
         gc.collect()
         self.source_map = dict(source_for)
 
-        # Unique TAF sources → strip indices that use them
         source_idxs = {}
         for apu, src in source_for.items():
             if src not in source_idxs:
                 source_idxs[src] = []
             source_idxs[src].extend(idx_for.get(apu, []))
 
-        # 3) Fetch one TAF at a time and pack immediately (do not keep all JSON)
         ok_count = 0
         for src, idxs in source_idxs.items():
             fcsts = self._fetch_one_taf_fcsts(src, poll_callback)
