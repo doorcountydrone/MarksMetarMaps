@@ -56,17 +56,19 @@ CYCLE_DELAY = 10  # Seconds between full airport list cycles; loaded from config
 # ===== FIRMWARE VERSION (for OTA update check) =====
 # Device reports this string; GitHub Pages version.json "version" must be higher to offer OTA.
 # After you flash new code, this should match what you published (or stay lower until user updates).
-FIRMWARE_VERSION = "1.1.16"
+FIRMWARE_VERSION = "1.1.17"
 
-# ===== OTA UPDATE BUTTON (GPIO for short-press "install update") =====
+# ===== OTA / PLAY BUTTON (GPIO) =====
 # Same pin as force-AP at boot: long hold (3s) during startup = setup AP mode.
-# While running: 1 short press = OTA; 2 = past-24h history; 3 = next-24h TAF forecast.
-# Single/double wait briefly so a triple press can be distinguished.
+# While running (hold length on release — multi-click was unreliable with bounce):
+#   tap  (< ~0.5s)     = OTA check/install
+#   hold (~0.5–1.5s)   = past-24h history
+#   hold (>= ~1.5s)    = next-24h TAF forecast
 # Set to -1 to disable physical button (use app or http://<ip>:8080 only).
 UPDATE_BUTTON_PIN = FORCE_AP_BUTTON_PIN
-UPDATE_BUTTON_MULTI_CLICK_MS = 1800
-UPDATE_BUTTON_DEBOUNCE_MS = 25  # ignore chatter on the same edge
-UPDATE_BUTTON_REARM_MS = 60  # ignore press until this long after a release
+UPDATE_BUTTON_TAP_MS = 500  # release sooner than this → OTA
+UPDATE_BUTTON_PAST_MS = 1500  # release before this → PAST; at/after → FUTURE
+UPDATE_BUTTON_BOUNCE_MS = 40  # ignore chatter shorter than this
 
 # ===== 24h FLIGHT-CATEGORY HISTORY TRIGGER (extra button / future PIR) =====
 # Active-low to GND (internal pull-up). Short press / motion pulse = play packed 24h animation.
@@ -89,21 +91,18 @@ no_data_warning_active = False  # Track if we're currently showing the warning
 no_data_warning_since = None  # time.time() when warning started (reboot countdown)
 update_available = False  # Set True when OTA check finds newer version
 update_info = None  # Parsed version.json when update_available
-_ota_button_prev = 1  # 1 = released (pull-up); used for short-press edge detect on OTA button
+_ota_button_prev = 1  # 1 = released (pull-up)
 _ota_service_hook = None  # set to service_ota_http_and_button so display loops can poll OTA
-_ota_btn_irq_count = 0  # accepted presses (drained in service loop)
-_ota_btn_last_count_ms = 0
-_ota_btn_last_rise_ms = 0  # last release edge (for re-arm timing in IRQ)
-_ota_btn_seen_release = True  # False after a count until a rising edge
-_ota_button_clicks = 0
-_ota_button_click_deadline_ms = 0
+_ota_btn_down_ms = 0  # ticks when press started; 0 = not held
+_ota_btn_pending_hold_ms = 0  # completed hold duration for service to act on
+_ota_btn_ignore_until_ms = 0  # post-release bounce lockout
 # 24h history/forecast: set True while fetch/play runs (avoids re-entrant HTTP/GPIO triggers)
 _history_busy = False
 _history_trigger_prev = 1
 _history_auto_anchor = 0  # time.time() of last auto refresh request (startup / hourly)
 _forecast_auto_anchor = 0
 _fetch_progress_last_ms = 0  # throttle matrix/strip "still fetching" pulse
-_play_banner_label = None  # "PAST" / "FUTURE" — set by button multi-press, shown before play
+_play_banner_label = None  # "PAST" / "FUTURE" — set by button, shown before play
 # Set True in main loop when SLEEP_ENABLED and in OFF window and sleep_leds — blocks LDR/OTA from relighting strip from logical_colors
 _strip_dark_for_sleep = False
 # If boot happens inside the sleep window, keep displays awake until the next daily sleep_at; then normal schedule resumes.
@@ -114,29 +113,26 @@ _sleep_clock_trusted = False
 
 
 def _ota_btn_irq_handler(pin):
-    """Rising+falling IRQ: count one press per down, re-arm on release (no poll wait)."""
-    global _ota_btn_irq_count, _ota_btn_last_count_ms, _ota_btn_last_rise_ms, _ota_btn_seen_release
+    """Timestamp press/release in IRQ so short taps are not lost between slow polls."""
+    global _ota_btn_down_ms, _ota_btn_pending_hold_ms, _ota_btn_ignore_until_ms
     now = time.ticks_ms()
+    if _ota_btn_ignore_until_ms and time.ticks_diff(now, _ota_btn_ignore_until_ms) < 0:
+        return
     try:
         v = pin.value()
     except Exception:
         return
-    if v == 1:
-        # Released — next falling edge may count (after REARM_MS)
-        _ota_btn_last_rise_ms = now
-        _ota_btn_seen_release = True
+    if v == 0:
+        if not _ota_btn_down_ms:
+            _ota_btn_down_ms = now
         return
-    # Pressed (falling). One count per press; bounce while held is ignored.
-    if not _ota_btn_seen_release:
-        return
-    if _ota_btn_last_rise_ms and time.ticks_diff(now, _ota_btn_last_rise_ms) < UPDATE_BUTTON_REARM_MS:
-        return
-    if _ota_btn_last_count_ms and time.ticks_diff(now, _ota_btn_last_count_ms) < UPDATE_BUTTON_DEBOUNCE_MS:
-        return
-    _ota_btn_seen_release = False
-    _ota_btn_last_count_ms = now
-    if _ota_btn_irq_count < 3:
-        _ota_btn_irq_count += 1
+    # Released
+    if _ota_btn_down_ms:
+        held = time.ticks_diff(now, _ota_btn_down_ms)
+        _ota_btn_down_ms = 0
+        _ota_btn_ignore_until_ms = time.ticks_add(now, UPDATE_BUTTON_BOUNCE_MS)
+        if held >= UPDATE_BUTTON_BOUNCE_MS:
+            _ota_btn_pending_hold_ms = held
 
 
 def _maybe_service_ota():
@@ -838,8 +834,8 @@ def scroll_single_text_ultra_smooth(text, text_color):
             time.sleep(SCROLL_PAUSE_BEFORE)
         frame_target_ms = int(SCROLL_SPEED * 1000)
         for start_col in range(total_frames):
-            # OTA / :8080 only occasionally — full service every frame made scroll/weather feel very slow
-            if start_col % 72 == 0:
+            # Button often (hold timing); full OTA/HTTP less often (keeps scroll smooth)
+            if start_col % 10 == 0:
                 _maybe_service_ota()
             frame_start = time.ticks_ms()
             led_matrix.fill((0, 0, 0))
@@ -2369,7 +2365,7 @@ hr{border:none;border-top:1px solid #ddd;margin:24px 0}
 <form method="post" action="/history-refresh"><button class="btn-refresh" type="submit">Refresh history</button></form>
 <form method="post" action="/forecast-play"><button class="btn-forecast" type="submit">Play forecast 24h</button></form>
 <form method="post" action="/forecast-refresh"><button class="btn-refresh" type="submit">Refresh forecast</button></form>
-<p><small>Past = METARs. Forecast = TAFs (nearest TAF station if an airport has none). Button: 2 presses = past, 3 = forecast. App sets replay count.</small></p>
+<p><small>Past = METARs. Forecast = TAFs (nearest TAF station if an airport has none). Button: tap = OTA, hold ~0.5s = past, hold ~1.5s = forecast. App sets replay count.</small></p>
 </body></html>"""
 
     def _http_send_html(conn, html_str):
@@ -2780,8 +2776,7 @@ hr{border:none;border-top:1px solid #ddd;margin:24px 0}
 
     def service_ota_http_and_button():
         global update_socket, _ota_rebind_after, _ota_button_prev
-        global _ota_btn_irq_count, _ota_btn_last_count_ms, _ota_btn_last_rise_ms, _ota_btn_seen_release
-        global _ota_button_clicks, _ota_button_click_deadline_ms
+        global _ota_btn_down_ms, _ota_btn_pending_hold_ms, _ota_btn_ignore_until_ms
         global _history_trigger_prev, _history_busy, _play_banner_label
         """OTA button + port 8080 + history trigger/pending."""
         # Extra button / future PIR: short active-low pulse -> play 24h animation
@@ -2798,88 +2793,59 @@ hr{border:none;border-top:1px solid #ddd;margin:24px 0}
         if update_button is not None:
             now = time.ticks_ms()
             install_update = False
-
-            # Finish an earlier click sequence before accepting a new press.
-            if (
-                _ota_button_clicks
-                and _ota_button_click_deadline_ms
-                and time.ticks_diff(now, _ota_button_click_deadline_ms) >= 0
-            ):
-                if _ota_button_clicks == 1:
-                    install_update = True
-                elif _ota_button_clicks == 2:
-                    if fc_hist is not None:
-                        print("Button: double press — history play requested")
-                        _play_banner_label = "PAST"
-                        fc_hist.request_play()
-                    else:
-                        print("Button: double press — fc_history not loaded")
-                elif _ota_button_clicks >= 3:
-                    if fc_fcst is not None:
-                        print("Button: triple press — forecast play requested")
-                        _play_banner_label = "FUTURE"
-                        fc_fcst.request_play()
-                    else:
-                        print("Button: triple press — fc_forecast not loaded")
-                _ota_button_clicks = 0
-                _ota_button_click_deadline_ms = 0
-
-            # Drain IRQ-captured clicks (counted on the pin edges, not waiting for poll)
-            presses = _ota_btn_irq_count
-            _ota_btn_irq_count = 0
+            play_past = False
+            play_future = False
 
             try:
                 btn_v = update_button.value()
             except Exception:
                 btn_v = 1
 
-            # Poll backup: sync release / missed edges if IRQ was busy
-            if btn_v == 1 and _ota_button_prev == 0:
-                _ota_btn_last_rise_ms = now
-                _ota_btn_seen_release = True
-            elif btn_v == 1:
-                _ota_btn_seen_release = True
-            if (
-                presses == 0
-                and _ota_btn_seen_release
-                and _ota_button_prev == 1
-                and btn_v == 0
+            # Poll backup when IRQ misses an edge (still respects bounce lockout)
+            if not (
+                _ota_btn_ignore_until_ms
+                and time.ticks_diff(now, _ota_btn_ignore_until_ms) < 0
             ):
-                ok_rearm = (
-                    not _ota_btn_last_rise_ms
-                    or time.ticks_diff(now, _ota_btn_last_rise_ms) >= UPDATE_BUTTON_REARM_MS
-                )
-                ok_gap = (
-                    not _ota_btn_last_count_ms
-                    or time.ticks_diff(now, _ota_btn_last_count_ms) >= UPDATE_BUTTON_DEBOUNCE_MS
-                )
-                if ok_rearm and ok_gap:
-                    presses = 1
-                    _ota_btn_seen_release = False
-                    _ota_btn_last_count_ms = now
+                if _ota_button_prev == 1 and btn_v == 0 and not _ota_btn_down_ms:
+                    _ota_btn_down_ms = now
+                elif _ota_button_prev == 0 and btn_v == 1 and _ota_btn_down_ms:
+                    held = time.ticks_diff(now, _ota_btn_down_ms)
+                    _ota_btn_down_ms = 0
+                    _ota_btn_ignore_until_ms = time.ticks_add(now, UPDATE_BUTTON_BOUNCE_MS)
+                    if held >= UPDATE_BUTTON_BOUNCE_MS and not _ota_btn_pending_hold_ms:
+                        _ota_btn_pending_hold_ms = held
             _ota_button_prev = btn_v
 
-            if presses:
-                if _ota_button_clicks == 0:
-                    _ota_button_click_deadline_ms = time.ticks_add(
-                        now, UPDATE_BUTTON_MULTI_CLICK_MS
-                    )
-                _ota_button_clicks = min(3, _ota_button_clicks + presses)
-                print("Button: %d press(es) in window" % _ota_button_clicks)
-                if _ota_button_clicks >= 3:
-                    _ota_button_clicks = 0
-                    _ota_button_click_deadline_ms = 0
-                    if fc_fcst is not None:
-                        print("Button: triple press — forecast play requested")
-                        _play_banner_label = "FUTURE"
-                        fc_fcst.request_play()
-                    else:
-                        print("Button: triple press — fc_forecast not loaded")
+            held_ms = _ota_btn_pending_hold_ms
+            if held_ms:
+                _ota_btn_pending_hold_ms = 0
+                print("Button: hold %d ms" % held_ms)
+                if held_ms < UPDATE_BUTTON_TAP_MS:
+                    install_update = True
+                elif held_ms < UPDATE_BUTTON_PAST_MS:
+                    play_past = True
+                else:
+                    play_future = True
+
+            if play_past:
+                if fc_hist is not None:
+                    print("Button: hold — history play requested")
+                    _play_banner_label = "PAST"
+                    fc_hist.request_play()
+                else:
+                    print("Button: hold — fc_history not loaded")
+            if play_future:
+                if fc_fcst is not None:
+                    print("Button: hold — forecast play requested")
+                    _play_banner_label = "FUTURE"
+                    fc_fcst.request_play()
+                else:
+                    print("Button: hold — fc_forecast not loaded")
 
             if install_update:
                 try:
                     import updater
-                    print("Button: single press — checking / installing OTA…")
+                    print("Button: tap — checking / installing OTA…")
                     if update_available and update_info:
                         updater.install_pending_update(update_info)
                     else:
