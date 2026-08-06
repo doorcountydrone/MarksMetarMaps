@@ -56,7 +56,7 @@ CYCLE_DELAY = 10  # Seconds between full airport list cycles; loaded from config
 # ===== FIRMWARE VERSION (for OTA update check) =====
 # Device reports this string; GitHub Pages version.json "version" must be higher to offer OTA.
 # After you flash new code, this should match what you published (or stay lower until user updates).
-FIRMWARE_VERSION = "1.1.12"
+FIRMWARE_VERSION = "1.1.13"
 
 # ===== OTA UPDATE BUTTON (GPIO for short-press "install update") =====
 # Same pin as force-AP at boot: long hold (3s) during startup = setup AP mode.
@@ -65,8 +65,10 @@ FIRMWARE_VERSION = "1.1.12"
 # Set to -1 to disable physical button (use app or http://<ip>:8080 only).
 UPDATE_BUTTON_PIN = FORCE_AP_BUTTON_PIN
 UPDATE_BUTTON_MULTI_CLICK_MS = 1600
-UPDATE_BUTTON_DEBOUNCE_MS = 350  # mechanical bounce / IRQ double-edge guard
-UPDATE_BUTTON_MIN_CLICK_GAP_MS = 280  # min time between counted clicks in a multi-press
+# Keep IRQ bounce filter short so intentional double/triple presses still register.
+# Fake doubles are blocked by requiring a release between counted clicks.
+UPDATE_BUTTON_DEBOUNCE_MS = 45  # mechanical bounce only (not multi-click spacing)
+UPDATE_BUTTON_MIN_CLICK_GAP_MS = 90  # min time between counted clicks after a release
 
 # ===== 24h FLIGHT-CATEGORY HISTORY TRIGGER (extra button / future PIR) =====
 # Active-low to GND (internal pull-up). Short press / motion pulse = play packed 24h animation.
@@ -2820,20 +2822,19 @@ hr{border:none;border-top:1px solid #ddd;margin:24px 0}
 
             presses = 0
             if btn_v is not None and not _ota_button_need_release:
+                edge = False
                 if _ota_btn_irq_pending:
                     _ota_btn_irq_pending = False
-                    # One physical gesture → at most one counted click here
+                    # Count only if pin is still low (real press, not bounce noise)
+                    if btn_v == 0:
+                        edge = True
+                elif _ota_button_prev == 1 and btn_v == 0:
+                    edge = True
+                _ota_button_prev = btn_v
+                if edge:
                     if not _ota_last_btn_ms or time.ticks_diff(now, _ota_last_btn_ms) >= UPDATE_BUTTON_MIN_CLICK_GAP_MS:
                         presses = 1
                         _ota_last_btn_ms = now
-                    _ota_button_prev = btn_v
-                else:
-                    if _ota_button_prev == 1 and btn_v == 0:
-                        if not _ota_last_btn_ms or time.ticks_diff(now, _ota_last_btn_ms) >= UPDATE_BUTTON_DEBOUNCE_MS:
-                            if not _ota_last_btn_ms or time.ticks_diff(now, _ota_last_btn_ms) >= UPDATE_BUTTON_MIN_CLICK_GAP_MS:
-                                presses = 1
-                                _ota_last_btn_ms = now
-                    _ota_button_prev = btn_v
 
             if presses:
                 if _ota_button_clicks == 0:
@@ -2841,7 +2842,7 @@ hr{border:none;border-top:1px solid #ddd;margin:24px 0}
                         now, UPDATE_BUTTON_MULTI_CLICK_MS
                     )
                 _ota_button_clicks += presses
-                _ota_button_need_release = True
+                _ota_button_need_release = True  # one count per down; wait for up
                 if _ota_button_clicks >= 3:
                     _ota_button_clicks = 0
                     _ota_button_click_deadline_ms = 0
