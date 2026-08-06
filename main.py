@@ -56,7 +56,7 @@ CYCLE_DELAY = 10  # Seconds between full airport list cycles; loaded from config
 # ===== FIRMWARE VERSION (for OTA update check) =====
 # Device reports this string; GitHub Pages version.json "version" must be higher to offer OTA.
 # After you flash new code, this should match what you published (or stay lower until user updates).
-FIRMWARE_VERSION = "1.1.10"
+FIRMWARE_VERSION = "1.1.11"
 
 # ===== OTA UPDATE BUTTON (GPIO for short-press "install update") =====
 # Same pin as force-AP at boot: long hold (3s) during startup = setup AP mode.
@@ -100,6 +100,7 @@ _history_trigger_prev = 1
 _history_auto_anchor = 0  # time.time() of last auto refresh request (startup / hourly)
 _forecast_auto_anchor = 0
 _fetch_progress_last_ms = 0  # throttle matrix/strip "still fetching" pulse
+_play_banner_label = None  # "PAST" / "FUTURE" — set by button multi-press, shown before play
 # Set True in main loop when SLEEP_ENABLED and in OFF window and sleep_leds — blocks LDR/OTA from relighting strip from logical_colors
 _strip_dark_for_sleep = False
 # If boot happens inside the sleep window, keep displays awake until the next daily sleep_at; then normal schedule resumes.
@@ -842,6 +843,89 @@ def scroll_single_text_ultra_smooth(text, text_color):
         gc.collect()
     except Exception as e:
         print(f"Error in scroll_single_text_ultra_smooth: {e}")
+
+
+def show_static_matrix_text(text, text_color, hold_s=2.0):
+    """Draw short uppercase text centered on the matrix and hold (no scroll)."""
+    if led_matrix is None or DISPLAY_TYPE != "LED_MATRIX" or PIXEL_INDICES is None:
+        return
+    try:
+        text = str(text).upper()
+        columns = []
+        default_char_width = 4
+        spacing = 1
+        vertical_offset = 1
+        for char in text:
+            if font_4x6 and char in font_4x6:
+                char_bitmap = font_4x6[char]
+                current_char_width = len(char_bitmap[0]) if char_bitmap and char_bitmap[0] else default_char_width
+                for col in range(current_char_width):
+                    column_data = 0
+                    for row in range(6):
+                        if row < len(char_bitmap) and col < len(char_bitmap[row]) and char_bitmap[row][col]:
+                            matrix_row = row + vertical_offset
+                            if matrix_row < LED_MATRIX_HEIGHT:
+                                column_data |= (1 << matrix_row)
+                    columns.append(column_data)
+                columns.append(0)
+            else:
+                for _ in range(default_char_width + spacing):
+                    columns.append(0)
+        # Drop trailing spacer column if present
+        while columns and columns[-1] == 0:
+            columns.pop()
+        text_w = len(columns)
+        start_x = max(0, (LED_MATRIX_WIDTH - text_w) // 2)
+        led_matrix.fill((0, 0, 0))
+        for i, col_data in enumerate(columns):
+            x = start_x + i
+            if x >= LED_MATRIX_WIDTH or col_data == 0:
+                continue
+            for y in range(LED_MATRIX_HEIGHT):
+                if col_data & (1 << y):
+                    led_matrix[PIXEL_INDICES[x][y]] = text_color
+        led_matrix.write()
+        del columns
+        gc.collect()
+        if hold_s > 0:
+            time.sleep(hold_s)
+    except Exception as e:
+        print("show_static_matrix_text:", e)
+
+
+def show_play_mode_banner(label, hold_s=2.0):
+    """Static PAST / FUTURE cue on matrix and/or OLED before strip animation."""
+    label = str(label or "").upper()
+    if not label:
+        return
+    try:
+        if led_matrix is not None and DISPLAY_TYPE == "LED_MATRIX":
+            # Past = green-ish, Future = cyan-ish (matches VFR / “ahead” feel)
+            if label.startswith("FUT"):
+                base = (0, 220, 255)
+            else:
+                base = (0, 255, 80)
+            show_static_matrix_text(label, apply_auto_brightness(base), hold_s=hold_s)
+            led_matrix.fill((0, 0, 0))
+            led_matrix.write()
+        elif DISPLAY_TYPE == "OLED" and oled is not None:
+            oled.fill(0)
+            if fonts_available:
+                try:
+                    writ = writer.Writer(oled, sans18)
+                    writ.set_textpos(20, 0)
+                    writ.printstring(label[:10])
+                except Exception:
+                    oled.text(label[:16], 0, 24, 1)
+            else:
+                oled.text(label[:16], 0, 24, 1)
+            oled.show()
+            time.sleep(hold_s)
+            oled.fill(0)
+            oled.show()
+    except Exception as e:
+        print("show_play_mode_banner:", e)
+
 
 def dim_led_matrix(factor=None):
     """Scale current matrix pixels down (used while strip history animation freezes the scroll)."""
@@ -2583,11 +2667,15 @@ hr{border:none;border-top:1px solid #ddd;margin:24px 0}
 
     def _dim_and_play_pack(pack):
         """Play a packed history/forecast buffer on the strip with matrix darkened."""
-        global _history_busy
+        global _history_busy, _play_banner_label
         if pack is None or not pack.ready:
             return
         _history_busy = True
         try:
+            banner = _play_banner_label
+            _play_banner_label = None
+            if banner:
+                show_play_mode_banner(banner, hold_s=2.0)
             dim_led_matrix()
             n = min(STRIP_ACTIVE_LEDS, len(airports), pack.n_airports)
             pack.play_on_strip(
@@ -2599,6 +2687,7 @@ hr{border:none;border-top:1px solid #ddd;margin:24px 0}
             )
         finally:
             _history_busy = False
+            _play_banner_label = None
             update_data_success()
             try:
                 if led_matrix is not None and DISPLAY_TYPE == "LED_MATRIX":
@@ -2670,7 +2759,7 @@ hr{border:none;border-top:1px solid #ddd;margin:24px 0}
     def service_ota_http_and_button():
         global update_socket, _ota_rebind_after, _ota_button_prev, _ota_btn_irq_pending, _ota_last_btn_ms
         global _ota_button_clicks, _ota_button_click_deadline_ms
-        global _history_trigger_prev, _history_busy
+        global _history_trigger_prev, _history_busy, _play_banner_label
         """OTA button + port 8080 + history trigger/pending."""
         # Extra button / future PIR: short active-low pulse -> play 24h animation
         if history_trigger is not None and fc_hist is not None and not _history_busy:
@@ -2678,6 +2767,7 @@ hr{border:none;border-top:1px solid #ddd;margin:24px 0}
                 v = history_trigger.value()
                 if _history_trigger_prev == 1 and v == 0:
                     print("History trigger: play requested")
+                    _play_banner_label = "PAST"
                     fc_hist.request_play()
                 _history_trigger_prev = v
             except Exception:
@@ -2697,12 +2787,14 @@ hr{border:none;border-top:1px solid #ddd;margin:24px 0}
                 elif _ota_button_clicks == 2:
                     if fc_hist is not None:
                         print("Button: double press — history play requested")
+                        _play_banner_label = "PAST"
                         fc_hist.request_play()
                     else:
                         print("Button: double press — fc_history not loaded")
                 elif _ota_button_clicks >= 3:
                     if fc_fcst is not None:
                         print("Button: triple press — forecast play requested")
+                        _play_banner_label = "FUTURE"
                         fc_fcst.request_play()
                     else:
                         print("Button: triple press — fc_forecast not loaded")
@@ -2737,6 +2829,7 @@ hr{border:none;border-top:1px solid #ddd;margin:24px 0}
                     _ota_button_click_deadline_ms = 0
                     if fc_fcst is not None:
                         print("Button: triple press — forecast play requested")
+                        _play_banner_label = "FUTURE"
                         fc_fcst.request_play()
                     else:
                         print("Button: triple press — fc_forecast not loaded")
