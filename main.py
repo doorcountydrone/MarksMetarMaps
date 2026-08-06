@@ -56,7 +56,7 @@ CYCLE_DELAY = 10  # Seconds between full airport list cycles; loaded from config
 # ===== FIRMWARE VERSION (for OTA update check) =====
 # Device reports this string; GitHub Pages version.json "version" must be higher to offer OTA.
 # After you flash new code, this should match what you published (or stay lower until user updates).
-FIRMWARE_VERSION = "1.1.11"
+FIRMWARE_VERSION = "1.1.12"
 
 # ===== OTA UPDATE BUTTON (GPIO for short-press "install update") =====
 # Same pin as force-AP at boot: long hold (3s) during startup = setup AP mode.
@@ -65,6 +65,8 @@ FIRMWARE_VERSION = "1.1.11"
 # Set to -1 to disable physical button (use app or http://<ip>:8080 only).
 UPDATE_BUTTON_PIN = FORCE_AP_BUTTON_PIN
 UPDATE_BUTTON_MULTI_CLICK_MS = 1600
+UPDATE_BUTTON_DEBOUNCE_MS = 350  # mechanical bounce / IRQ double-edge guard
+UPDATE_BUTTON_MIN_CLICK_GAP_MS = 280  # min time between counted clicks in a multi-press
 
 # ===== 24h FLIGHT-CATEGORY HISTORY TRIGGER (extra button / future PIR) =====
 # Active-low to GND (internal pull-up). Short press / motion pulse = play packed 24h animation.
@@ -89,11 +91,12 @@ update_available = False  # Set True when OTA check finds newer version
 update_info = None  # Parsed version.json when update_available
 _ota_button_prev = 1  # 1 = released (pull-up); used for short-press edge detect on OTA button
 _ota_service_hook = None  # set to service_ota_http_and_button so display loops can poll OTA
-_ota_btn_irq_pending = 0  # press count captured by GPIO IRQ so a quick double press is not lost
+_ota_btn_irq_pending = False  # true when a falling edge was seen (not a press counter)
 _ota_btn_irq_last_ms = 0  # IRQ-level debounce timestamp
 _ota_last_btn_ms = 0  # debounce duplicate IRQ/edges
 _ota_button_clicks = 0
 _ota_button_click_deadline_ms = 0
+_ota_button_need_release = False  # ignore further edges until button is released
 # 24h history/forecast: set True while fetch/play runs (avoids re-entrant HTTP/GPIO triggers)
 _history_busy = False
 _history_trigger_prev = 1
@@ -113,11 +116,11 @@ _sleep_clock_trusted = False
 def _ota_btn_irq_handler(_pin):
     global _ota_btn_irq_pending, _ota_btn_irq_last_ms
     now = time.ticks_ms()
-    if _ota_btn_irq_last_ms and time.ticks_diff(now, _ota_btn_irq_last_ms) < 150:
+    if _ota_btn_irq_last_ms and time.ticks_diff(now, _ota_btn_irq_last_ms) < UPDATE_BUTTON_DEBOUNCE_MS:
         return
     _ota_btn_irq_last_ms = now
-    if _ota_btn_irq_pending < 3:
-        _ota_btn_irq_pending += 1
+    # Flag only — bounce must not accumulate into a fake double/triple press
+    _ota_btn_irq_pending = True
 
 
 def _maybe_service_ota():
@@ -2758,7 +2761,7 @@ hr{border:none;border-top:1px solid #ddd;margin:24px 0}
 
     def service_ota_http_and_button():
         global update_socket, _ota_rebind_after, _ota_button_prev, _ota_btn_irq_pending, _ota_last_btn_ms
-        global _ota_button_clicks, _ota_button_click_deadline_ms
+        global _ota_button_clicks, _ota_button_click_deadline_ms, _ota_button_need_release
         global _history_trigger_prev, _history_busy, _play_banner_label
         """OTA button + port 8080 + history trigger/pending."""
         # Extra button / future PIR: short active-low pulse -> play 24h animation
@@ -2801,22 +2804,36 @@ hr{border:none;border-top:1px solid #ddd;margin:24px 0}
                 _ota_button_clicks = 0
                 _ota_button_click_deadline_ms = 0
 
+            # Wait for release after each counted click (stops bounce = fake 2nd press)
+            try:
+                btn_v = update_button.value()
+            except Exception:
+                btn_v = 1
+            if _ota_button_need_release:
+                if btn_v == 1:
+                    _ota_button_need_release = False
+                    _ota_button_prev = 1
+                else:
+                    _ota_btn_irq_pending = False
+                    _ota_button_prev = btn_v
+                    btn_v = None  # skip edge detect while held
+
             presses = 0
-            if _ota_btn_irq_pending:
-                presses = _ota_btn_irq_pending
-                _ota_btn_irq_pending = 0
-                # Keep polling state synchronized so this IRQ press is not counted twice.
-                try:
-                    _ota_button_prev = update_button.value()
-                except Exception:
-                    pass
-            else:
-                v = update_button.value()
-                if _ota_button_prev == 1 and v == 0:
-                    if not _ota_last_btn_ms or time.ticks_diff(now, _ota_last_btn_ms) >= 150:
+            if btn_v is not None and not _ota_button_need_release:
+                if _ota_btn_irq_pending:
+                    _ota_btn_irq_pending = False
+                    # One physical gesture → at most one counted click here
+                    if not _ota_last_btn_ms or time.ticks_diff(now, _ota_last_btn_ms) >= UPDATE_BUTTON_MIN_CLICK_GAP_MS:
                         presses = 1
                         _ota_last_btn_ms = now
-                _ota_button_prev = v
+                    _ota_button_prev = btn_v
+                else:
+                    if _ota_button_prev == 1 and btn_v == 0:
+                        if not _ota_last_btn_ms or time.ticks_diff(now, _ota_last_btn_ms) >= UPDATE_BUTTON_DEBOUNCE_MS:
+                            if not _ota_last_btn_ms or time.ticks_diff(now, _ota_last_btn_ms) >= UPDATE_BUTTON_MIN_CLICK_GAP_MS:
+                                presses = 1
+                                _ota_last_btn_ms = now
+                    _ota_button_prev = btn_v
 
             if presses:
                 if _ota_button_clicks == 0:
@@ -2824,6 +2841,7 @@ hr{border:none;border-top:1px solid #ddd;margin:24px 0}
                         now, UPDATE_BUTTON_MULTI_CLICK_MS
                     )
                 _ota_button_clicks += presses
+                _ota_button_need_release = True
                 if _ota_button_clicks >= 3:
                     _ota_button_clicks = 0
                     _ota_button_click_deadline_ms = 0
