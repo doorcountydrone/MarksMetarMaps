@@ -56,7 +56,7 @@ CYCLE_DELAY = 10  # Seconds between full airport list cycles; loaded from config
 # ===== FIRMWARE VERSION (for OTA update check) =====
 # Device reports this string; GitHub Pages version.json "version" must be higher to offer OTA.
 # After you flash new code, this should match what you published (or stay lower until user updates).
-FIRMWARE_VERSION = "1.1.14"
+FIRMWARE_VERSION = "1.1.15"
 
 # ===== OTA UPDATE BUTTON (GPIO for short-press "install update") =====
 # Same pin as force-AP at boot: long hold (3s) during startup = setup AP mode.
@@ -65,8 +65,8 @@ FIRMWARE_VERSION = "1.1.14"
 # Set to -1 to disable physical button (use app or http://<ip>:8080 only).
 UPDATE_BUTTON_PIN = FORCE_AP_BUTTON_PIN
 UPDATE_BUTTON_MULTI_CLICK_MS = 1800
-# Min time between IRQ-counted presses. Long enough to kill bounce; short enough for 2/3 taps.
-UPDATE_BUTTON_DEBOUNCE_MS = 100
+UPDATE_BUTTON_DEBOUNCE_MS = 40  # ignore chatter right after a counted edge
+UPDATE_BUTTON_REARM_MS = 70  # must stay released this long before next press counts
 
 # ===== 24h FLIGHT-CATEGORY HISTORY TRIGGER (extra button / future PIR) =====
 # Active-low to GND (internal pull-up). Short press / motion pulse = play packed 24h animation.
@@ -92,7 +92,9 @@ update_info = None  # Parsed version.json when update_available
 _ota_button_prev = 1  # 1 = released (pull-up); used for short-press edge detect on OTA button
 _ota_service_hook = None  # set to service_ota_http_and_button so display loops can poll OTA
 _ota_btn_irq_count = 0  # falling edges accepted by IRQ (drained in service loop)
-_ota_btn_irq_last_ms = 0  # last accepted IRQ click (debounce)
+_ota_btn_irq_last_ms = 0  # last accepted click edge
+_ota_btn_armed = True  # False after a count until a stable release
+_ota_btn_rearm_after_ms = 0  # ticks deadline when pin may re-arm after release
 _ota_button_clicks = 0
 _ota_button_click_deadline_ms = 0
 # 24h history/forecast: set True while fetch/play runs (avoids re-entrant HTTP/GPIO triggers)
@@ -112,12 +114,16 @@ _sleep_clock_trusted = False
 
 
 def _ota_btn_irq_handler(_pin):
-    """Count falling edges with debounce. Must not drop quick 2nd/3rd taps waiting for poll."""
-    global _ota_btn_irq_count, _ota_btn_irq_last_ms
+    """Count one falling edge per press; ignore bounce until a stable release re-arms."""
+    global _ota_btn_irq_count, _ota_btn_irq_last_ms, _ota_btn_armed, _ota_btn_rearm_after_ms
+    if not _ota_btn_armed:
+        return
     now = time.ticks_ms()
     if _ota_btn_irq_last_ms and time.ticks_diff(now, _ota_btn_irq_last_ms) < UPDATE_BUTTON_DEBOUNCE_MS:
         return
     _ota_btn_irq_last_ms = now
+    _ota_btn_armed = False
+    _ota_btn_rearm_after_ms = 0
     if _ota_btn_irq_count < 3:
         _ota_btn_irq_count += 1
 
@@ -2760,7 +2766,7 @@ hr{border:none;border-top:1px solid #ddd;margin:24px 0}
 
     def service_ota_http_and_button():
         global update_socket, _ota_rebind_after, _ota_button_prev
-        global _ota_btn_irq_count, _ota_btn_irq_last_ms
+        global _ota_btn_irq_count, _ota_btn_irq_last_ms, _ota_btn_armed, _ota_btn_rearm_after_ms
         global _ota_button_clicks, _ota_button_click_deadline_ms
         global _history_trigger_prev, _history_busy, _play_banner_label
         """OTA button + port 8080 + history trigger/pending."""
@@ -2808,18 +2814,37 @@ hr{border:none;border-top:1px solid #ddd;margin:24px 0}
             presses = _ota_btn_irq_count
             _ota_btn_irq_count = 0
 
-            # Poll backup if IRQ missed a falling edge
             try:
                 btn_v = update_button.value()
             except Exception:
                 btn_v = 1
-            if presses == 0 and _ota_button_prev == 1 and btn_v == 0:
+
+            # Re-arm only after a stable release (blocks release-bounce phantom clicks)
+            if btn_v == 1:
+                if not _ota_btn_armed:
+                    if not _ota_btn_rearm_after_ms:
+                        _ota_btn_rearm_after_ms = time.ticks_add(now, UPDATE_BUTTON_REARM_MS)
+                    elif time.ticks_diff(now, _ota_btn_rearm_after_ms) >= 0:
+                        _ota_btn_armed = True
+                        _ota_btn_rearm_after_ms = 0
+            else:
+                _ota_btn_rearm_after_ms = 0
+
+            # Poll backup if IRQ missed a falling edge
+            if (
+                presses == 0
+                and _ota_btn_armed
+                and _ota_button_prev == 1
+                and btn_v == 0
+            ):
                 if (
                     not _ota_btn_irq_last_ms
                     or time.ticks_diff(now, _ota_btn_irq_last_ms) >= UPDATE_BUTTON_DEBOUNCE_MS
                 ):
                     presses = 1
                     _ota_btn_irq_last_ms = now
+                    _ota_btn_armed = False
+                    _ota_btn_rearm_after_ms = 0
             _ota_button_prev = btn_v
 
             if presses:
