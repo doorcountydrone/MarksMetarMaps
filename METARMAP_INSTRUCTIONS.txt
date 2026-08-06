@@ -1,0 +1,276 @@
+================================================================================
+  METARMAP – Pico W wiring and full instructions
+================================================================================
+
+This file explains how to wire the Raspberry Pi Pico W for MetarMap and how to
+use the Android app. Pin numbers are GPIO (logic) numbers unless noted.
+
+--------------------------------------------------------------------------------
+1. PIN WIRING (Pico W)
+--------------------------------------------------------------------------------
+
+LED STRIP (WS2812B / NeoPixel)
+  • Data input:  GPIO 0  (default in code; not changed from app)
+  • Ground:     GND
+  • Power:      5 V (or 3.3 V for short strips; prefer 5 V for many LEDs)
+  • Number of LEDs: 120 in main.py (change in code if your strip is different)
+
+LED MATRIX (8x32 WS2812B)
+  • Data input:  GPIO 1  (default; can be changed in app: WiFi Config → LED matrix pin, 0–28)
+  • Ground:     GND
+  • Power:      5 V (or 3.3 V for small matrices)
+
+OLED (128x64 I2C, e.g. SSD1306)
+  • SDA:        GPIO 16
+  • SCL:        GPIO 17
+  • VCC:        3.3 V
+  • GND:        GND
+  • Optional:   GPIO 18 is set HIGH to enable/power the OLED (if your board uses it)
+
+AUTO-BRIGHTNESS (LDR – light-dependent resistor, optional)
+  • Wire the LDR between GPIO 21 and GPIO 26 (ADC0).
+  • GPIO 21: output HIGH from the Pico (supplies 3.3 V to one leg of the LDR).
+  • GPIO 26 (ADC0): other leg of the LDR; the Pico reads the analog voltage here.
+  • A resistor (e.g. 10 kΩ) from GPIO 26 to GND gives a proper voltage divider and
+    can improve the reading; some setups work with just the LDR between 21 and 26.
+  • If LDR is not used: leave it unwired and use manual brightness in the app (see WiFi Config → Min/Max brightness below).
+
+FORCE AP / OTA BUTTON (optional, same GPIO)
+  • Button:     GPIO 15  (internal pull-up; button connects GPIO 15 to GND when pressed)
+  • At boot: hold ~3 seconds to force setup/AP mode even if WiFi is already configured.
+  • While running (one press — length decides the action):
+      tap (under ~0.5s)     → OTA check/install if a newer version is available
+      hold ~0.5–1.5s        → play packed past-24h animation (shows PAST)
+      hold ~1.5s or longer  → play next-24h TAF forecast (shows FUTURE)
+    Set UPDATE_BUTTON_PIN = -1 in main.py to disable the physical button.
+
+HISTORY / MOTION TRIGGER (optional, separate GPIO)
+  • Set HISTORY_TRIGGER_PIN in main.py to a free GPIO (e.g. 14); -1 = disabled (default).
+  • Active-low to GND (pull-up). Short press or PIR pulse plays the packed 24h flight-category
+    animation on the LED strip. Android Weather tab or browser http://<pico-ip>:8080:
+    Play 24h / Refresh history.
+  • Requires fc_history.py on the Pico (firmware 1.1.1+; included in OTA with main.py).
+
+24-HOUR FLIGHT CATEGORY HISTORY (fc_history)
+  • After startup METAR work (bulk or first pass, then second pass), MetarMap downloads and
+    packs the last 24 hours of flight categories for active strip airports. It does not
+    auto-play at boot—only prepares the buffer.
+  • Auto-refresh: every HISTORY_REFRESH_INTERVAL_S seconds (default 3600 = 1 hour).
+  • Play uses the last packed buffer. Refresh history forces a new download.
+  • The Android replay-count slider saves its value on both the app and Pico. Physical-button
+    past hold and forecast hold both use that saved count after reboot.
+  • Next-24h forecast (fc_forecast): packs TAF flight categories for the coming day. Airports
+    without a TAF use the nearest TAF station (stationinfo + distance). Startup + hourly refresh
+    like history. App: Play forecast / Refresh forecast; browser :8080 has matching buttons.
+  • During strip playback the LED matrix goes dark (HISTORY_MATRIX_DIM = 0); scrolling resumes
+    when the animation finishes.
+  • Colors: VFR green, MVFR blue, IFR red, LIFR magenta (same as live strip categories).
+
+SUMMARY TABLE
+  Component        GPIO/Pin    Notes
+  ─────────────────────────────────────────────────────────────
+  LED strip data   GP0        WS2812B data in
+  LED matrix data GP1        Configurable in app (0–28)
+  I2C SDA (OLED)  GP16       OLED data
+  I2C SCL (OLED)  GP17       OLED clock
+  OLED enable     GP18       Output HIGH
+  LDR enable      GP21       Output HIGH for LDR circuit
+  LDR read        GP26/ADC0  Analog input
+  AP / OTA button GP15       Boot hold = AP; tap=OTA; hold~0.5s=past; hold~1.5s=forecast
+  History / PIR   (optional) HISTORY_TRIGGER_PIN in main.py (default off)
+
+--------------------------------------------------------------------------------
+2. WHAT IS METARMAP?
+--------------------------------------------------------------------------------
+
+MetarMap is a hardware project built around a Raspberry Pi Pico W. It fetches
+real-time aviation weather (METAR) data from the internet and displays it on
+an LED matrix or OLED screen. The Pico W connects to your Wi-Fi, retrieves
+METAR reports for your chosen airports, and shows the weather conditions with
+colored LED indicators.
+
+METAR (Meteorological Aerodrome Report) is a standard format for reporting
+weather at airports. Pilots and aviation enthusiasts use it to check visibility,
+clouds, precipitation, wind, and other conditions before flying.
+
+--------------------------------------------------------------------------------
+3. GETTING STARTED
+--------------------------------------------------------------------------------
+
+1) Connect to MetarMap WiFi
+   On first use, the Pico W creates its own WiFi access point (AP). Connect your
+   phone to that network (typically named something like MetarMap-Setup or
+   MetarMap-AP). Your phone must be on this network to configure the device.
+   When connected, the app automatically loads current settings from MetarMap.
+
+2) Configure WiFi (WiFi Config tab)
+   Enter your home/office WiFi SSID and password. When you tap Save & Reboot,
+   the Pico W saves the credentials, connects to your network, and exits AP mode.
+   You'll see a full-screen "Update successful" or "Update failed" result. If
+   you're not connected to MetarMap WiFi, the update will fail. After setup,
+   MetarMap connects directly to your WiFi and fetches METAR data automatically.
+
+3) Add Airports (Airports tab)
+   Fetch the current airport list from MetarMap, or add codes (e.g. KORD, LAX,
+   EGLL) manually. Save to MetarMap to write the list to the device. The Pico W
+   fetches METAR for airports in list order; switch off an airport to skip that
+   LED position (blank on device).
+
+--------------------------------------------------------------------------------
+4. WIFI CONFIG TAB
+--------------------------------------------------------------------------------
+
+• SSID & Password: Leave blank to update only display/batch settings without
+  changing WiFi. Fill in to set full WiFi credentials.
+
+• Display type: Choose LED Matrix, OLED, or no display.
+
+• Matrix layout: If the matrix text looks garbled or wrong, try a different
+  option (Row major, Column major, Snake row, Snake column). Different LED
+  matrices need different layouts.
+
+• LED matrix pin: GPIO pin (0–28) for the matrix data line.
+
+• Min/Max brightness: 0–255 for the strip. If you are not using an LDR, use
+  manual brightness by setting Min and Max to the same value (e.g. 15 for
+  medium). Use different min/max values only when using an LDR for auto-brightness.
+
+• Batch size: Airports to fetch per API request (1–20). Lower = more requests;
+  higher = fewer, larger fetches.
+
+• Seconds between full cycles: 5–1800 seconds (30 min max). Pause before
+  restarting the airport list. Higher = less frequent updates.
+
+• Scroll speed: 1 (slow) to 10 (fast). Controls how quickly text scrolls across
+  the matrix.
+
+• Pause before scroll: 0–2 seconds. How long text stays still before it starts
+  scrolling—adjust for readability.
+
+• Matrix only: When ON, the strip shows only flight categories (no weather
+  effects); matrix still scrolls. When OFF, full weather effects on the strip.
+
+• Save: Saves settings without rebooting.
+• Save & Reboot: Saves settings and reboots MetarMap to apply changes.
+
+You'll see a full-screen "Update successful" or "Update failed"—connect to
+MetarMap WiFi first.
+
+--------------------------------------------------------------------------------
+5. AIRPORTS TAB
+--------------------------------------------------------------------------------
+
+• MetarMap URL: Usually 192.168.4.1 when connected to the Pico's AP, or the
+  Pico's IP on your network after it joins WiFi.
+
+• LED #: Each row shows its strip position (LED 1, 2, …). Switch off = skip
+  that position (blank on device); skipped rows show "LED N (skip)".
+
+• Fetch from MetarMap: Downloads the current airport list.
+• Save to MetarMap: Uploads your list. If not connected, save will fail.
+
+• Batch add: Paste multiple codes (space, comma, or newline). Use NULL, -, or
+  SKIP for an empty slot (one per keyword).
+• Add: Single 3–4 letter code.
+• Up/Down arrows: Reorder.
+• Delete: Trash icon to remove.
+
+--------------------------------------------------------------------------------
+6. PRE-MADE VS DIY METARMAP
+--------------------------------------------------------------------------------
+
+Pre-made MetarMaps come with airports already programmed. No need to add or
+remove any.
+
+Adding or removing airports is for DIY MetarMaps. This lets you customize your
+airport list without doing any programming—just use the app.
+
+For DIY projects: put airports in the same order as your LED wiring. The first
+airport in the list corresponds to the first LED, the second to the second LED,
+and so on.
+
+--------------------------------------------------------------------------------
+7. WEATHER TAB
+--------------------------------------------------------------------------------
+
+Each weather code represents a condition that can trigger LED effects on
+MetarMap. Turn OFF any condition you want to block from lighting the LEDs.
+
+• Save: Saves settings without rebooting.
+• Save & Reboot: Saves settings and reboots MetarMap to apply changes.
+
+Connect to MetarMap WiFi first for updates to succeed.
+
+--------------------------------------------------------------------------------
+8. WEATHER CODES & LED EFFECTS
+--------------------------------------------------------------------------------
+
+Precipitation (Rain)
+  • BR (Mist) – Cyan, 12 quick flashes
+  • -RA (Light rain) – Cyan, 6 flashes, 0.5s on/off
+  • RA (Rain) – Cyan, 5 flashes, 1.2s on
+  • +RA (Heavy rain) – Cyan, 4 flashes, 2.2s on
+
+Precipitation (Snow)
+  • -SN (Light snow) – White, 6 flashes, 0.5s on
+  • SN (Snow) – White, 5 flashes, 1.2s on
+  • +SN (Heavy snow) – White, 4 flashes, 2.2s on
+
+
+Lightning
+  • DSNT LTG (Lightning) – Yellow, 35 rapid flashes
+  • TS, CC, CA, CG, VCTS (Cloud–cloud, cloud–air, cloud–ground, vicinity) – White, 35 rapid flashes
+
+Wind & Fog
+  • WND (Wind) – Yellow, 4 flashes, 1s on
+  • FG (Fog) – White fade to dark, 1 cycle
+  • FZFG (Freezing fog) – White to blue fade
+  • FZFD (Freezing drizzle) – White to cyan fade
+
+Clear & Storms
+  • CLR (Clear) – White to green fade
+  • $ (Maintenance) – Red, 5 rapid flashes
+  • TORNADO, FC (+FC, funnel cloud) – Red to blue fade, 15 cycles
+  
+
+--------------------------------------------------------------------------------
+  OTA (over-the-air) firmware updates
+--------------------------------------------------------------------------------
+
+The Pico checks https://doorcountydrone.github.io/MarksMetarMaps/version.json
+(and may also use the raw GitHub copy) after WiFi connects. Your device prints
+its firmware line, e.g.:
+  Firmware version: 1.1.0
+Then either:
+  OTA: New version available 1.1.0
+  OTA: up to date (device 1.1.0 remote 1.1.0)
+  OTA: version check HTTP 404 ...  (version.json URL wrong or Pages not deployed)
+  OTA check failed: ...   (network or HTML error page instead of JSON)
+
+If a browser shows "trouble finding the resource" for main.py / wifi_manager.py,
+those files are not on GitHub Pages. Use raw GitHub URLs in version.json instead
+(see README "OTA updates").
+
+version.json must include a higher "version" than FIRMWARE_VERSION in main.py
+and a "files" array with every .py module to replace (name + URL). Current OTA
+ships main.py, wifi_manager.py, fc_history.py, fc_forecast.py, updater.py, and boot.py together.
+Example:
+
+  {
+    "version": "1.1.0",
+    "files": [
+      {"name": "main.py", "url": "https://raw.githubusercontent.com/doorcountydrone/MarksMetarMaps/main/main.py"},
+      {"name": "wifi_manager.py", "url": "https://raw.githubusercontent.com/doorcountydrone/MarksMetarMaps/main/wifi_manager.py"},
+      {"name": "fc_history.py", "url": "https://raw.githubusercontent.com/doorcountydrone/MarksMetarMaps/main/fc_history.py"},
+      {"name": "updater.py", "url": "https://raw.githubusercontent.com/doorcountydrone/MarksMetarMaps/main/updater.py"},
+      {"name": "boot.py", "url": "https://raw.githubusercontent.com/doorcountydrone/MarksMetarMaps/main/boot.py"}
+    ]
+  }
+
+Install: physical button (if configured), Android WiFi Config → Install update,
+or browser POST to http://<pico-ip>:8080/start-update when an update was detected.
+
+
+================================================================================
+  End of instructions
+================================================================================
