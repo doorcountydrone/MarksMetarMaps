@@ -56,7 +56,7 @@ CYCLE_DELAY = 10  # Seconds between full airport list cycles; loaded from config
 # ===== FIRMWARE VERSION (for OTA update check) =====
 # Device reports this string; GitHub Pages version.json "version" must be higher to offer OTA.
 # After you flash new code, this should match what you published (or stay lower until user updates).
-FIRMWARE_VERSION = "1.1.17"
+FIRMWARE_VERSION = "1.1.18"
 
 # ===== OTA / PLAY BUTTON (GPIO) =====
 # Same pin as force-AP at boot: long hold (3s) during startup = setup AP mode.
@@ -356,7 +356,7 @@ if not check_wifi_config() or force_ap_mode:
             led.write()
             time.sleep(0.3)
     import wifi_manager
-    wifi_manager.start()
+    wifi_manager.start(force_ap=force_ap_mode)
 
 # Initialize system (minimal startup prints to save RAM)
 print("\n===== MetarMap Starting =====")
@@ -571,7 +571,7 @@ except Exception as e:
     led.write()
     time.sleep(2)
     import wifi_manager
-    wifi_manager.start()
+    wifi_manager.start(force_ap=False)
 
 # NOW initialize displays based on configuration from file
 oled = None
@@ -2041,7 +2041,7 @@ gc.collect()
 if not connect_to_wifi(WIFI_SSID, WIFI_PASSWORD):
     print("WiFi connection failed. Starting setup mode...")
     import wifi_manager
-    wifi_manager.start()
+    wifi_manager.start(force_ap=False)
 
 _ntp_startup_ok = sync_ntp_once()
 try:
