@@ -43,6 +43,10 @@ FORCE AP / OTA BUTTON (optional, same GPIO)
       hold ~0.5–1.5s        → play packed past-24h animation (shows PAST)
       hold ~1.5s or longer  → play next-24h TAF forecast (shows FUTURE)
     Set UPDATE_BUTTON_PIN = -1 in main.py to disable the physical button.
+  • If the Pico falls into setup/AP because the router was not ready (e.g. after a power
+    failure) and home Wi‑Fi is already saved: after ~8 minutes with no phone/app using
+    the setup AP, it reboots and tries the router again. Forced AP (boot hold) and
+    first-time setup (no SSID saved) stay in AP until you configure them.
 
 HISTORY / MOTION TRIGGER (optional, separate GPIO)
   • Set HISTORY_TRIGGER_PIN in main.py to a free GPIO (e.g. 14); -1 = disabled (default).
