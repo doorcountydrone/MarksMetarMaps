@@ -22,6 +22,10 @@ AP_PASSWORD = 'metar123'
 CONFIG_FILE = 'wifi_config.json'
 # Same file name as main.py uses for airport codes
 AIRPORT_FILE = 'airports4.txt'
+# If STA credentials exist and nobody is using setup AP, reboot after this idle time
+# so a late-coming router (power fail) can be joined on the next boot.
+AP_IDLE_REBOOT_S = 480  # 8 minutes
+AP_ACCEPT_TIMEOUT_S = 1.0
 
 # LED configuration
 NUM_LEDS = 256  # updated by init_strip_leds_from_wifi_config() from wifi_config num_leds
@@ -275,6 +279,34 @@ def create_ap():
         print("Failed to activate AP")
         set_leds(15, 0, 0)
         return None
+
+
+def _saved_sta_ssid():
+    """Return saved home-router SSID from wifi_config.json, or ''."""
+    try:
+        with open(CONFIG_FILE, "r") as f:
+            cfg = json.load(f)
+        return str(cfg.get("ssid") or "").strip()
+    except Exception:
+        return ""
+
+
+def _ap_client_count(ap_if):
+    """How many stations are associated to the setup AP. -1 if unknown."""
+    if ap_if is None:
+        return -1
+    try:
+        st = ap_if.status("stations")
+        if st is None:
+            return 0
+        return len(st)
+    except Exception:
+        return -1
+
+
+def _bump_ap_idle_deadline_ms(idle_reboot_s):
+    return time.ticks_add(time.ticks_ms(), int(idle_reboot_s) * 1000)
+
 
 def urldecode(string):
     string = string.replace('+', ' ')
@@ -1239,6 +1271,7 @@ def get_html_help_page():
     <p>Rain: BR, -RA, RA, +RA (cyan flashes). Snow: -SN, SN, +SN, SHSN (white). Lightning: LTG, DSNT (yellow); CC, CA, CG, VCTS (white). Wind: WND (yellow). Fog: FG, FZFG, FZFD (fades). Clear: CLR (white to green). Storms: TS, $, FC, +FC, TORNADO (red/blue).</p></div>
     <div class="card"><h3>Troubleshooting</h3>
     <p><b>App / browser:</b> Connect to MetarMap WiFi (192.168.4.1). Save fails if not on that network.</p>
+    <p><b>Stuck in setup after power fail:</b> If home Wi‑Fi credentials are already saved and nobody is using the setup network, MetarMap reboots after about 8 minutes to try joining the router again.</p>
     <p><b>Mobile data / hotspot:</b> Using cellular often causes SSL errors; use Wi-Fi when possible.</p>
     <p><b>NO DATA AFTER 180 SEC:</b> Check WiFi and internet. Device shows a warning then auto-reboots (~30s later). Power-cycle router if it repeats.</p>
     <p><b>Some airports never show data:</b> API may not have that station; try removing or replacing the code.</p>
@@ -1297,7 +1330,7 @@ def get_html_error_page(message):
     """
     return html
 
-def run_server():
+def run_server(force_ap=False):
     ap_if = create_ap()
     if not ap_if:
         print("Failed to set up access point")
@@ -1312,9 +1345,55 @@ def run_server():
         print("Error starting server:", e)
         set_leds(15, 0, 0)
         return
+
+    saved_ssid = _saved_sta_ssid()
+    allow_idle_reboot = (not force_ap) and bool(saved_ssid) and AP_IDLE_REBOOT_S > 0
+    idle_deadline = None
+    if allow_idle_reboot:
+        idle_deadline = _bump_ap_idle_deadline_ms(AP_IDLE_REBOOT_S)
+        print(
+            "AP idle reboot: %ds with no setup client — then retry WiFi '%s'"
+            % (AP_IDLE_REBOOT_S, saved_ssid)
+        )
+    elif force_ap:
+        print("AP idle reboot off (forced AP / setup button)")
+    else:
+        print("AP idle reboot off (no saved router SSID — stay in setup until configured)")
+
+    try:
+        s.settimeout(AP_ACCEPT_TIMEOUT_S)
+    except Exception:
+        pass
+
     while True:
+        conn = None
         try:
-            conn, addr = s.accept()
+            try:
+                conn, addr = s.accept()
+            except OSError:
+                # accept() timed out — check idle reboot / AP clients
+                if allow_idle_reboot and idle_deadline is not None:
+                    nsta = _ap_client_count(ap_if)
+                    if nsta > 0:
+                        idle_deadline = _bump_ap_idle_deadline_ms(AP_IDLE_REBOOT_S)
+                    elif time.ticks_diff(time.ticks_ms(), idle_deadline) >= 0:
+                        print(
+                            "AP idle %ds — reboot to retry STA WiFi '%s'"
+                            % (AP_IDLE_REBOOT_S, saved_ssid)
+                        )
+                        try:
+                            set_leds(10, 0, 10)
+                            time.sleep(1)
+                            clear_leds()
+                        except Exception:
+                            pass
+                        machine.reset()
+                continue
+
+            # HTTP activity (app/browser) — keep AP alive
+            if allow_idle_reboot:
+                idle_deadline = _bump_ap_idle_deadline_ms(AP_IDLE_REBOOT_S)
+
             print("Client connected from", addr[0])
             set_leds(0, 10, 10)
             time.sleep(0.2)
@@ -1663,16 +1742,17 @@ def run_server():
         except Exception as e:
             print("Error handling request:", e)
             try:
-                conn.close()
-            except:
+                if conn is not None:
+                    conn.close()
+            except Exception:
                 pass
         time.sleep(0.1)
         gc.collect()
 
-def start():
+def start(force_ap=False):
     print("===== Starting WiFi Manager =====")
     gc.collect()
     init_strip_leds_from_wifi_config()
     set_leds(12, 12, 0, STARTUP_BRIGHTNESS)
-    run_server()
+    run_server(force_ap=force_ap)
 
