@@ -56,7 +56,7 @@ CYCLE_DELAY = 10  # Seconds between full airport list cycles; loaded from config
 # ===== FIRMWARE VERSION (for OTA update check) =====
 # Device reports this string; GitHub Pages version.json "version" must be higher to offer OTA.
 # After you flash new code, this should match what you published (or stay lower until user updates).
-FIRMWARE_VERSION = "1.1.19"
+FIRMWARE_VERSION = "1.1.20"
 
 # ===== OTA / PLAY BUTTON (GPIO) =====
 # Same pin as force-AP at boot: long hold (3s) during startup = setup AP mode.
@@ -836,11 +836,21 @@ def scroll_single_text_ultra_smooth(text, text_color):
             led_matrix.write()
             time.sleep(SCROLL_PAUSE_BEFORE)
         frame_target_ms = int(SCROLL_SPEED * 1000)
-        for start_col in range(total_frames):
-            # Button often (hold timing); full OTA/HTTP less often (keeps scroll smooth)
-            if start_col % 10 == 0:
+        start_col = 0
+        while start_col < total_frames:
+            # Poll often while button held so hold hints update; else every 10 frames
+            if _ota_btn_down_ms or _ota_btn_hold_hint or (start_col % 10 == 0):
                 _maybe_service_ota()
             frame_start = time.ticks_ms()
+            # Pause METAR scroll while holding — otherwise scroll overwrites OTA/PAST/FUTURE instantly
+            if _ota_btn_down_ms or _ota_btn_hold_hint:
+                frame_end = time.ticks_ms()
+                draw_time = frame_end - frame_start
+                if draw_time < frame_target_ms:
+                    remaining_ms = frame_target_ms - draw_time
+                    if remaining_ms > 0:
+                        time.sleep(remaining_ms / 1000.0)
+                continue
             led_matrix.fill((0, 0, 0))
             max_x = min(LED_MATRIX_WIDTH, len(columns) - start_col)
             for x in range(max_x):
@@ -857,6 +867,7 @@ def scroll_single_text_ultra_smooth(text, text_color):
                 remaining_ms = frame_target_ms - draw_time
                 if remaining_ms > 0:
                     time.sleep(remaining_ms / 1000.0)
+            start_col += 1
         del columns
         gc.collect()
     except Exception as e:
