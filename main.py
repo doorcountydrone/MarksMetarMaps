@@ -56,7 +56,7 @@ CYCLE_DELAY = 10  # Seconds between full airport list cycles; loaded from config
 # ===== FIRMWARE VERSION (for OTA update check) =====
 # Device reports this string; GitHub Pages version.json "version" must be higher to offer OTA.
 # After you flash new code, this should match what you published (or stay lower until user updates).
-FIRMWARE_VERSION = "1.1.18"
+FIRMWARE_VERSION = "1.1.19"
 
 # ===== OTA / PLAY BUTTON (GPIO) =====
 # Same pin as force-AP at boot: long hold (3s) during startup = setup AP mode.
@@ -64,11 +64,13 @@ FIRMWARE_VERSION = "1.1.18"
 #   tap  (< ~0.5s)     = OTA check/install
 #   hold (~0.5–1.5s)   = past-24h history
 #   hold (>= ~1.5s)    = next-24h TAF forecast
+# While holding, matrix/OLED/strip show OTA → PAST → FUTURE as thresholds are crossed.
 # Set to -1 to disable physical button (use app or http://<ip>:8080 only).
 UPDATE_BUTTON_PIN = FORCE_AP_BUTTON_PIN
 UPDATE_BUTTON_TAP_MS = 500  # release sooner than this → OTA
 UPDATE_BUTTON_PAST_MS = 1500  # release before this → PAST; at/after → FUTURE
 UPDATE_BUTTON_BOUNCE_MS = 40  # ignore chatter shorter than this
+UPDATE_BUTTON_HINT_ARM_MS = 180  # delay before first hold hint (avoids flash on bounce)
 
 # ===== 24h FLIGHT-CATEGORY HISTORY TRIGGER (extra button / future PIR) =====
 # Active-low to GND (internal pull-up). Short press / motion pulse = play packed 24h animation.
@@ -96,6 +98,7 @@ _ota_service_hook = None  # set to service_ota_http_and_button so display loops 
 _ota_btn_down_ms = 0  # ticks when press started; 0 = not held
 _ota_btn_pending_hold_ms = 0  # completed hold duration for service to act on
 _ota_btn_ignore_until_ms = 0  # post-release bounce lockout
+_ota_btn_hold_hint = None  # last live hint while held: None | "OTA" | "PAST" | "FUTURE"
 # 24h history/forecast: set True while fetch/play runs (avoids re-entrant HTTP/GPIO triggers)
 _history_busy = False
 _history_trigger_prev = 1
@@ -918,6 +921,8 @@ def show_play_mode_banner(label, hold_s=2.0):
             # Past = green-ish, Future = cyan-ish (matches VFR / “ahead” feel)
             if label.startswith("FUT"):
                 base = (0, 220, 255)
+            elif label.startswith("OTA"):
+                base = (255, 140, 0)
             else:
                 base = (0, 255, 80)
             show_static_matrix_text(label, apply_auto_brightness(base), hold_s=hold_s)
@@ -935,11 +940,95 @@ def show_play_mode_banner(label, hold_s=2.0):
             else:
                 oled.text(label[:16], 0, 24, 1)
             oled.show()
-            time.sleep(hold_s)
-            oled.fill(0)
-            oled.show()
+            if hold_s > 0:
+                time.sleep(hold_s)
+                oled.fill(0)
+                oled.show()
     except Exception as e:
         print("show_play_mode_banner:", e)
+
+
+def _hold_hint_for_ms(held_ms):
+    """Label for current hold duration, or None before hint arms."""
+    if held_ms < UPDATE_BUTTON_HINT_ARM_MS:
+        return None
+    if held_ms < UPDATE_BUTTON_TAP_MS:
+        return "OTA"
+    if held_ms < UPDATE_BUTTON_PAST_MS:
+        return "PAST"
+    return "FUTURE"
+
+
+def _hold_hint_rgb(label):
+    if label == "OTA":
+        return (255, 140, 0)
+    if label == "PAST":
+        return (0, 255, 80)
+    if label == "FUTURE":
+        return (0, 220, 255)
+    return (0, 0, 0)
+
+
+def _restore_strip_logical_colors():
+    if led is None or MATRIX_ONLY:
+        return
+    try:
+        n = min(STRIP_ACTIVE_LEDS, NUM_LEDS, len(led))
+        for i in range(n):
+            c = logical_colors[i] if i < len(logical_colors) else (0, 0, 0)
+            led[i] = _scale_color(c, current_ldr_brightness)
+        led.write()
+    except Exception:
+        pass
+
+
+def _apply_strip_hold_tint(rgb):
+    if led is None or MATRIX_ONLY:
+        return
+    try:
+        n = min(STRIP_ACTIVE_LEDS, NUM_LEDS, len(led))
+        for i in range(n):
+            led[i] = _scale_color(rgb, current_ldr_brightness)
+        led.write()
+    except Exception:
+        pass
+
+
+def show_button_hold_hint(label):
+    """Non-blocking live cue while the OTA/play button is held (OTA → PAST → FUTURE)."""
+    global _ota_btn_hold_hint
+    label = str(label).upper() if label else None
+    if label == _ota_btn_hold_hint:
+        return
+    prev = _ota_btn_hold_hint
+    _ota_btn_hold_hint = label
+    try:
+        if not label:
+            if prev:
+                try:
+                    if led_matrix is not None and DISPLAY_TYPE == "LED_MATRIX":
+                        led_matrix.fill((0, 0, 0))
+                        led_matrix.write()
+                except Exception:
+                    pass
+                try:
+                    if DISPLAY_TYPE == "OLED" and oled is not None:
+                        oled.fill(0)
+                        oled.show()
+                except Exception:
+                    pass
+                _restore_strip_logical_colors()
+            return
+        rgb = _hold_hint_rgb(label)
+        if led_matrix is not None and DISPLAY_TYPE == "LED_MATRIX":
+            show_static_matrix_text(label, apply_auto_brightness(rgb), hold_s=0)
+        elif DISPLAY_TYPE == "OLED" and oled is not None:
+            show_play_mode_banner(label, hold_s=0)
+        else:
+            _apply_strip_hold_tint(rgb)
+        print("Button hold hint:", label)
+    except Exception as e:
+        print("show_button_hold_hint:", e)
 
 
 def dim_led_matrix(factor=None):
@@ -2776,7 +2865,7 @@ hr{border:none;border-top:1px solid #ddd;margin:24px 0}
 
     def service_ota_http_and_button():
         global update_socket, _ota_rebind_after, _ota_button_prev
-        global _ota_btn_down_ms, _ota_btn_pending_hold_ms, _ota_btn_ignore_until_ms
+        global _ota_btn_down_ms, _ota_btn_pending_hold_ms, _ota_btn_ignore_until_ms, _ota_btn_hold_hint
         global _history_trigger_prev, _history_busy, _play_banner_label
         """OTA button + port 8080 + history trigger/pending."""
         # Extra button / future PIR: short active-low pulse -> play 24h animation
@@ -2816,9 +2905,24 @@ hr{border:none;border-top:1px solid #ddd;margin:24px 0}
                         _ota_btn_pending_hold_ms = held
             _ota_button_prev = btn_v
 
+            # Live hold feedback while pressed (OTA → PAST → FUTURE)
+            if (
+                not _history_busy
+                and _ota_btn_down_ms
+                and btn_v == 0
+            ):
+                show_button_hold_hint(
+                    _hold_hint_for_ms(time.ticks_diff(now, _ota_btn_down_ms))
+                )
+            elif _ota_btn_hold_hint and (
+                btn_v == 1 or not _ota_btn_down_ms or _ota_btn_pending_hold_ms
+            ):
+                show_button_hold_hint(None)
+
             held_ms = _ota_btn_pending_hold_ms
             if held_ms:
                 _ota_btn_pending_hold_ms = 0
+                show_button_hold_hint(None)
                 print("Button: hold %d ms" % held_ms)
                 if held_ms < UPDATE_BUTTON_TAP_MS:
                     install_update = True
