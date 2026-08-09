@@ -56,7 +56,7 @@ CYCLE_DELAY = 10  # Seconds between full airport list cycles; loaded from config
 # ===== FIRMWARE VERSION (for OTA update check) =====
 # Device reports this string; GitHub Pages version.json "version" must be higher to offer OTA.
 # After you flash new code, this should match what you published (or stay lower until user updates).
-FIRMWARE_VERSION = "1.1.21"
+FIRMWARE_VERSION = "1.1.22"
 
 # ===== OTA / PLAY BUTTON (GPIO) =====
 # Same pin as force-AP at boot: long hold (3s) during startup = setup AP mode.
@@ -1113,14 +1113,14 @@ def _show_fetch_banner(msg):
 
 
 def _history_fetch_poll():
-    """Light poll during pack download — HTTP only; do not re-enter play/fetch or button actions."""
+    """During pack download: accept button queue + HTTP status; never start another fetch/play."""
     global _fetch_progress_last_ms
     fn = _ota_service_hook
     if fn is not None:
         try:
-            fn(run_pending_history=False, allow_button_actions=False)
+            # Button may queue PAST/FUTURE while busy; do not run pending history here
+            fn(run_pending_history=False, allow_button_actions=True)
         except TypeError:
-            # Older hook signature during partial OTA — avoid crashing mid-fetch
             try:
                 fn()
             except Exception:
@@ -2420,7 +2420,7 @@ try:
     fc_hist = None
     fc_fcst = None
     history_trigger = None
-    _history_busy = False
+    # Use module-level _history_busy only (do not assign a local here — it shadows busy checks)
     _history_trigger_prev = 1
     try:
         import fc_history as _fc_history_mod
@@ -2763,7 +2763,7 @@ hr{border:none;border-top:1px solid #ddd;margin:24px 0}
 
     def maybe_queue_hourly_history_refresh():
         """Queue a background 24h history re-fetch when HISTORY_REFRESH_INTERVAL_S has elapsed."""
-        global _history_auto_anchor
+        global _history_auto_anchor, _history_busy
         if fc_hist is None or HISTORY_REFRESH_INTERVAL_S <= 0 or _history_busy:
             return
         if fc_hist.refresh_pending() or fc_hist.play_pending():
@@ -2779,7 +2779,7 @@ hr{border:none;border-top:1px solid #ddd;margin:24px 0}
 
     def maybe_queue_hourly_forecast_refresh():
         """Queue a background TAF forecast re-fetch on FORECAST_REFRESH_INTERVAL_S."""
-        global _forecast_auto_anchor
+        global _forecast_auto_anchor, _history_busy
         if fc_fcst is None or FORECAST_REFRESH_INTERVAL_S <= 0 or _history_busy:
             return
         if fc_fcst.refresh_pending() or fc_fcst.play_pending():
@@ -2793,11 +2793,22 @@ hr{border:none;border-top:1px solid #ddd;margin:24px 0}
         fc_fcst.request_refresh()
         _forecast_auto_anchor = now
 
+    def _airports_for_pack():
+        """Airport list for history/forecast pack: active strip only, trailing blanks trimmed."""
+        n = min(len(airports), STRIP_ACTIVE_LEDS, 120)
+        while n > 0 and (not airports[n - 1] or not str(airports[n - 1]).strip()):
+            n -= 1
+        return airports[:n] if n > 0 else airports[:0]
+
     def _dim_and_play_pack(pack):
         """Play a packed history/forecast buffer on the strip with matrix darkened."""
         global _history_busy, _play_banner_label
         if pack is None or not pack.ready:
-            return
+            print("play pack: skipped (not ready)")
+            return False
+        if led is None:
+            print("play pack: skipped (no strip)")
+            return False
         _history_busy = True
         try:
             banner = _play_banner_label
@@ -2805,7 +2816,8 @@ hr{border:none;border-top:1px solid #ddd;margin:24px 0}
             if banner:
                 show_play_mode_banner(banner, hold_s=2.0)
             dim_led_matrix()
-            n = min(STRIP_ACTIVE_LEDS, len(airports), pack.n_airports)
+            n = min(STRIP_ACTIVE_LEDS, len(airports), pack.n_airports, len(logical_colors))
+            print("play pack: %d LEDs, frame_ms=%s loops=%s" % (n, pack.frame_ms, pack.loops))
             pack.play_on_strip(
                 led,
                 logical_colors,
@@ -2813,6 +2825,7 @@ hr{border:none;border-top:1px solid #ddd;margin:24px 0}
                 _history_scale,
                 poll_callback=_history_play_poll,
             )
+            return True
         finally:
             _history_busy = False
             _play_banner_label = None
@@ -2825,7 +2838,7 @@ hr{border:none;border-top:1px solid #ddd;margin:24px 0}
                 pass
 
     def service_history_pending():
-        """Run queued history/forecast refresh/play (from app, HTTP, or button)."""
+        """Run queued history/forecast play first, then refresh. Play never waits behind refresh."""
         global _history_busy, _fetch_progress_last_ms
         if _history_busy:
             return
@@ -2836,27 +2849,20 @@ hr{border:none;border-top:1px solid #ddd;margin:24px 0}
             update_data_success()
             _show_fetch_banner(label)
             try:
-                pack.fetch_and_pack(
-                    airports[:STRIP_ACTIVE_LEDS], _history_fetch_poll
-                )
+                pack.fetch_and_pack(_airports_for_pack(), _history_fetch_poll)
             finally:
                 _clear_fetch_indicator()
                 update_data_success()
 
-        # History pack first
-        if fc_hist is not None and fc_hist.refresh_pending():
-            fc_hist.clear_refresh_pending()
-            _history_busy = True
-            try:
-                print("fc_history: refresh starting…")
-                _do_fetch("FETCHING", fc_hist)
-            finally:
-                _history_busy = False
+        played = False
+
+        # --- PLAY FIRST (so PAST/FUTURE is not stuck behind hourly refresh) ---
         if fc_hist is not None and fc_hist.play_pending():
             fc_hist.clear_play_pending()
+            # Prefer existing pack; only fetch when nothing playable
             if fc_hist.ready:
                 print("fc_history: play (packed buffer ready)")
-                _dim_and_play_pack(fc_hist)
+                played = bool(_dim_and_play_pack(fc_hist))
             else:
                 _history_busy = True
                 try:
@@ -2865,23 +2871,23 @@ hr{border:none;border-top:1px solid #ddd;margin:24px 0}
                 finally:
                     _history_busy = False
                 if fc_hist.ready:
-                    _dim_and_play_pack(fc_hist)
+                    played = bool(_dim_and_play_pack(fc_hist))
                 else:
-                    print("fc_history: still not ready after fetch — play skipped")
-        # Forecast pack
-        if fc_fcst is not None and fc_fcst.refresh_pending():
-            fc_fcst.clear_refresh_pending()
-            _history_busy = True
-            try:
-                print("fc_forecast: refresh starting…")
-                _do_fetch("FETCH FCST", fc_fcst)
-            finally:
-                _history_busy = False
+                    print("fc_history: still not ready after fetch — play skipped (%s)" % (
+                        getattr(fc_hist, "last_error", "") or "unknown"
+                    ))
+                    try:
+                        _show_fetch_banner("NO DATA")
+                    except Exception:
+                        pass
+            # Do not chain into refresh/forecast in the same turn after a play request
+            return
+
         if fc_fcst is not None and fc_fcst.play_pending():
             fc_fcst.clear_play_pending()
             if fc_fcst.ready:
                 print("fc_forecast: play (packed buffer ready)")
-                _dim_and_play_pack(fc_fcst)
+                played = bool(_dim_and_play_pack(fc_fcst))
             else:
                 _history_busy = True
                 try:
@@ -2890,9 +2896,43 @@ hr{border:none;border-top:1px solid #ddd;margin:24px 0}
                 finally:
                     _history_busy = False
                 if fc_fcst.ready:
-                    _dim_and_play_pack(fc_fcst)
+                    played = bool(_dim_and_play_pack(fc_fcst))
                 else:
-                    print("fc_forecast: still not ready after fetch — play skipped")
+                    print("fc_forecast: still not ready after fetch — play skipped (%s)" % (
+                        getattr(fc_fcst, "last_error", "") or "unknown"
+                    ))
+                    try:
+                        _show_fetch_banner("NO DATA")
+                    except Exception:
+                        pass
+            return
+
+        # --- Background refresh only when nothing is waiting to play ---
+        if fc_hist is not None and fc_hist.refresh_pending():
+            fc_hist.clear_refresh_pending()
+            _history_busy = True
+            try:
+                print("fc_history: refresh starting…")
+                _do_fetch("FETCHING", fc_hist)
+            finally:
+                _history_busy = False
+            # Play may have been queued during refresh — honor it before more fetching
+            if fc_hist.play_pending() or (fc_fcst is not None and fc_fcst.play_pending()):
+                service_history_pending()
+                return
+        if fc_fcst is not None and fc_fcst.refresh_pending():
+            fc_fcst.clear_refresh_pending()
+            _history_busy = True
+            try:
+                print("fc_forecast: refresh starting…")
+                _do_fetch("FETCH FCST", fc_fcst)
+            finally:
+                _history_busy = False
+            if (fc_hist is not None and fc_hist.play_pending()) or (
+                fc_fcst is not None and fc_fcst.play_pending()
+            ):
+                service_history_pending()
+                return
 
     def _history_play_poll():
         """During strip playback: keep :8080 alive; do not start another play/fetch."""
@@ -2965,25 +3005,35 @@ hr{border:none;border-top:1px solid #ddd;margin:24px 0}
                 _ota_btn_pending_hold_ms = 0
                 show_button_hold_hint(None)
                 print("Button: hold %d ms" % held_ms)
-                if not allow_button_actions or _history_busy:
-                    print("Button: ignored (busy or nested poll)")
+                if not allow_button_actions:
+                    print("Button: ignored (nested poll)")
                 elif held_ms < UPDATE_BUTTON_TAP_MS:
-                    install_update = True
+                    if _history_busy:
+                        print("Button: OTA ignored (busy fetching/playing)")
+                    else:
+                        install_update = True
                 elif held_ms < UPDATE_BUTTON_PAST_MS:
+                    # Always queue play — even during an in-progress refresh
                     play_past = True
                 else:
                     play_future = True
 
             if play_past:
                 if fc_hist is not None:
-                    print("Button: hold — history play requested")
+                    print(
+                        "Button: hold — history play requested (ready=%s busy=%s)"
+                        % (bool(fc_hist.ready), bool(_history_busy))
+                    )
                     _play_banner_label = "PAST"
                     fc_hist.request_play()
                 else:
                     print("Button: hold — fc_history not loaded")
             if play_future:
                 if fc_fcst is not None:
-                    print("Button: hold — forecast play requested")
+                    print(
+                        "Button: hold — forecast play requested (ready=%s busy=%s)"
+                        % (bool(fc_fcst.ready), bool(_history_busy))
+                    )
                     _play_banner_label = "FUTURE"
                     fc_fcst.request_play()
                 else:
@@ -3591,7 +3641,6 @@ hr{border:none;border-top:1px solid #ddd;margin:24px 0}
     # Then auto-refresh every HISTORY_REFRESH_INTERVAL_S; app Play uses the latest packed buffer.
     if fc_hist is not None:
         fc_hist.request_refresh()
-        _history_auto_anchor = int(time.time())
         print(
             "fc_history: startup 24h pack queued; auto-refresh every %ds"
             % HISTORY_REFRESH_INTERVAL_S
@@ -3602,7 +3651,6 @@ hr{border:none;border-top:1px solid #ddd;margin:24px 0}
             print("fc_history initial pack:", _ih_e)
     if fc_fcst is not None:
         fc_fcst.request_refresh()
-        _forecast_auto_anchor = int(time.time())
         print(
             "fc_forecast: startup TAF pack queued; auto-refresh every %ds"
             % FORECAST_REFRESH_INTERVAL_S
