@@ -56,7 +56,7 @@ CYCLE_DELAY = 10  # Seconds between full airport list cycles; loaded from config
 # ===== FIRMWARE VERSION (for OTA update check) =====
 # Device reports this string; GitHub Pages version.json "version" must be higher to offer OTA.
 # After you flash new code, this should match what you published (or stay lower until user updates).
-FIRMWARE_VERSION = "1.1.22"
+FIRMWARE_VERSION = "1.1.23"
 
 # ===== OTA / PLAY BUTTON (GPIO) =====
 # Same pin as force-AP at boot: long hold (3s) during startup = setup AP mode.
@@ -1113,20 +1113,8 @@ def _show_fetch_banner(msg):
 
 
 def _history_fetch_poll():
-    """During pack download: accept button queue + HTTP status; never start another fetch/play."""
+    """Progress pulse only during history download — no nested HTTP/SSL (saves RAM)."""
     global _fetch_progress_last_ms
-    fn = _ota_service_hook
-    if fn is not None:
-        try:
-            # Button may queue PAST/FUTURE while busy; do not run pending history here
-            fn(run_pending_history=False, allow_button_actions=True)
-        except TypeError:
-            try:
-                fn()
-            except Exception:
-                pass
-        except Exception:
-            pass
     update_data_success()
     now = time.ticks_ms()
     if _fetch_progress_last_ms and time.ticks_diff(now, _fetch_progress_last_ms) < 2000:
@@ -2798,7 +2786,32 @@ hr{border:none;border-top:1px solid #ddd;margin:24px 0}
         n = min(len(airports), STRIP_ACTIVE_LEDS, 120)
         while n > 0 and (not airports[n - 1] or not str(airports[n - 1]).strip()):
             n -= 1
-        return airports[:n] if n > 0 else airports[:0]
+        out = airports[:n] if n > 0 else []
+        print("fc pack airports: %d (strip_active=%d)" % (len(out), STRIP_ACTIVE_LEDS))
+        return out
+
+    def _categories_from_strip():
+        """Map current logical_colors back to VFR/MVFR/IFR/LIFR for history seed fallback."""
+        cats = []
+        n = min(len(airports), STRIP_ACTIVE_LEDS, len(logical_colors))
+        rev = {
+            (0, 255, 0): "VFR",
+            (0, 0, 255): "MVFR",
+            (255, 0, 0): "IFR",
+            (255, 0, 128): "LIFR",
+            (255, 0, 130): "LIFR",
+        }
+        for i in range(n):
+            if not airports[i] or not str(airports[i]).strip():
+                cats.append("VFR")
+                continue
+            rgb = logical_colors[i] if i < len(logical_colors) else (0, 0, 0)
+            try:
+                key = (int(rgb[0]), int(rgb[1]), int(rgb[2]))
+            except Exception:
+                key = (0, 0, 0)
+            cats.append(rev.get(key, "VFR"))
+        return cats
 
     def _dim_and_play_pack(pack):
         """Play a packed history/forecast buffer on the strip with matrix darkened."""
@@ -2849,12 +2862,19 @@ hr{border:none;border-top:1px solid #ddd;margin:24px 0}
             update_data_success()
             _show_fetch_banner(label)
             try:
-                pack.fetch_and_pack(_airports_for_pack(), _history_fetch_poll)
+                ok = pack.fetch_and_pack(_airports_for_pack(), _history_fetch_poll)
+                # If 24h API pack failed, seed from live strip colors so PAST can still play
+                if (not ok) and (pack is fc_hist) and hasattr(pack, "seed_flat"):
+                    try:
+                        if pack.seed_flat(_categories_from_strip()):
+                            print("fc_history: using live-color fallback pack")
+                            ok = True
+                    except Exception as _seed_e:
+                        print("fc_history seed fallback:", _seed_e)
+                return ok
             finally:
                 _clear_fetch_indicator()
                 update_data_success()
-
-        played = False
 
         # --- PLAY FIRST (so PAST/FUTURE is not stuck behind hourly refresh) ---
         if fc_hist is not None and fc_hist.play_pending():
@@ -2862,7 +2882,7 @@ hr{border:none;border-top:1px solid #ddd;margin:24px 0}
             # Prefer existing pack; only fetch when nothing playable
             if fc_hist.ready:
                 print("fc_history: play (packed buffer ready)")
-                played = bool(_dim_and_play_pack(fc_hist))
+                _dim_and_play_pack(fc_hist)
             else:
                 _history_busy = True
                 try:
@@ -2871,11 +2891,10 @@ hr{border:none;border-top:1px solid #ddd;margin:24px 0}
                 finally:
                     _history_busy = False
                 if fc_hist.ready:
-                    played = bool(_dim_and_play_pack(fc_hist))
+                    _dim_and_play_pack(fc_hist)
                 else:
-                    print("fc_history: still not ready after fetch — play skipped (%s)" % (
-                        getattr(fc_hist, "last_error", "") or "unknown"
-                    ))
+                    err = getattr(fc_hist, "last_error", "") or "unknown"
+                    print("fc_history: still not ready after fetch — play skipped (%s)" % err)
                     try:
                         _show_fetch_banner("NO DATA")
                     except Exception:
@@ -2887,7 +2906,7 @@ hr{border:none;border-top:1px solid #ddd;margin:24px 0}
             fc_fcst.clear_play_pending()
             if fc_fcst.ready:
                 print("fc_forecast: play (packed buffer ready)")
-                played = bool(_dim_and_play_pack(fc_fcst))
+                _dim_and_play_pack(fc_fcst)
             else:
                 _history_busy = True
                 try:
@@ -2896,7 +2915,7 @@ hr{border:none;border-top:1px solid #ddd;margin:24px 0}
                 finally:
                     _history_busy = False
                 if fc_fcst.ready:
-                    played = bool(_dim_and_play_pack(fc_fcst))
+                    _dim_and_play_pack(fc_fcst)
                 else:
                     print("fc_forecast: still not ready after fetch — play skipped (%s)" % (
                         getattr(fc_fcst, "last_error", "") or "unknown"
