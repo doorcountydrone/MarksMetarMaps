@@ -351,16 +351,20 @@ class FlightCategoryHistory:
                 if chunk_start < n:
                     time.sleep_ms(150)
             self.fetched_at = int(time.time())
-            self.ready = ok_count > 0
-            self.state = "idle" if self.ready else "error"
-            if not self.ready:
+            if ok_count > 0:
+                self.ready = True
+                self.state = "idle"
+                self.last_error = ""
+            else:
+                # Keep a previously good pack so Play can still run after a failed refresh
                 self.last_error = "No history fetched"
-            print("fc_history: packed %d slot-fills / %d airports (%d bytes)" % (
-                ok_count, n, n * BYTES_PER_AIRPORT
+                self.state = "idle" if self.ready else "error"
+            print("fc_history: packed %d slot-fills / %d airports (%d bytes) ready=%s" % (
+                ok_count, n, n * BYTES_PER_AIRPORT, self.ready
             ))
             return self.ready
         except Exception as e:
-            self.state = "error"
+            self.state = "error" if not self.ready else "idle"
             self.last_error = str(e)
             print("fc_history fetch_and_pack:", e)
             return False
