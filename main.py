@@ -56,7 +56,7 @@ CYCLE_DELAY = 10  # Seconds between full airport list cycles; loaded from config
 # ===== FIRMWARE VERSION (for OTA update check) =====
 # Device reports this string; GitHub Pages version.json "version" must be higher to offer OTA.
 # After you flash new code, this should match what you published (or stay lower until user updates).
-FIRMWARE_VERSION = "1.1.20"
+FIRMWARE_VERSION = "1.1.21"
 
 # ===== OTA / PLAY BUTTON (GPIO) =====
 # Same pin as force-AP at boot: long hold (3s) during startup = setup AP mode.
@@ -1113,10 +1113,20 @@ def _show_fetch_banner(msg):
 
 
 def _history_fetch_poll():
-    """OTA/HTTP poll + throttled fetching indicator (matrix blink or strip flash)."""
+    """Light poll during pack download — HTTP only; do not re-enter play/fetch or button actions."""
     global _fetch_progress_last_ms
-    _maybe_service_ota()
-    # Keep no-data watchdog from firing while long packs block METAR cycles
+    fn = _ota_service_hook
+    if fn is not None:
+        try:
+            fn(run_pending_history=False, allow_button_actions=False)
+        except TypeError:
+            # Older hook signature during partial OTA — avoid crashing mid-fetch
+            try:
+                fn()
+            except Exception:
+                pass
+        except Exception:
+            pass
     update_data_success()
     now = time.ticks_ms()
     if _fetch_progress_last_ms and time.ticks_diff(now, _fetch_progress_last_ms) < 2000:
@@ -2801,7 +2811,7 @@ hr{border:none;border-top:1px solid #ddd;margin:24px 0}
                 logical_colors,
                 n,
                 _history_scale,
-                poll_callback=service_ota_http_and_button,
+                poll_callback=_history_play_poll,
             )
         finally:
             _history_busy = False
@@ -2844,15 +2854,20 @@ hr{border:none;border-top:1px solid #ddd;margin:24px 0}
                 _history_busy = False
         if fc_hist is not None and fc_hist.play_pending():
             fc_hist.clear_play_pending()
-            if not fc_hist.ready:
+            if fc_hist.ready:
+                print("fc_history: play (packed buffer ready)")
+                _dim_and_play_pack(fc_hist)
+            else:
                 _history_busy = True
                 try:
                     print("fc_history: not ready — fetching before play…")
                     _do_fetch("FETCHING", fc_hist)
                 finally:
                     _history_busy = False
-            if fc_hist.ready:
-                _dim_and_play_pack(fc_hist)
+                if fc_hist.ready:
+                    _dim_and_play_pack(fc_hist)
+                else:
+                    print("fc_history: still not ready after fetch — play skipped")
         # Forecast pack
         if fc_fcst is not None and fc_fcst.refresh_pending():
             fc_fcst.clear_refresh_pending()
@@ -2864,23 +2879,37 @@ hr{border:none;border-top:1px solid #ddd;margin:24px 0}
                 _history_busy = False
         if fc_fcst is not None and fc_fcst.play_pending():
             fc_fcst.clear_play_pending()
-            if not fc_fcst.ready:
+            if fc_fcst.ready:
+                print("fc_forecast: play (packed buffer ready)")
+                _dim_and_play_pack(fc_fcst)
+            else:
                 _history_busy = True
                 try:
                     print("fc_forecast: not ready — fetching before play…")
                     _do_fetch("FETCH FCST", fc_fcst)
                 finally:
                     _history_busy = False
-            if fc_fcst.ready:
-                _dim_and_play_pack(fc_fcst)
+                if fc_fcst.ready:
+                    _dim_and_play_pack(fc_fcst)
+                else:
+                    print("fc_forecast: still not ready after fetch — play skipped")
 
-    def service_ota_http_and_button():
+    def _history_play_poll():
+        """During strip playback: keep :8080 alive; do not start another play/fetch."""
+        service_ota_http_and_button(run_pending_history=False, allow_button_actions=False)
+
+    def service_ota_http_and_button(run_pending_history=True, allow_button_actions=True):
         global update_socket, _ota_rebind_after, _ota_button_prev
         global _ota_btn_down_ms, _ota_btn_pending_hold_ms, _ota_btn_ignore_until_ms, _ota_btn_hold_hint
         global _history_trigger_prev, _history_busy, _play_banner_label
         """OTA button + port 8080 + history trigger/pending."""
         # Extra button / future PIR: short active-low pulse -> play 24h animation
-        if history_trigger is not None and fc_hist is not None and not _history_busy:
+        if (
+            allow_button_actions
+            and history_trigger is not None
+            and fc_hist is not None
+            and not _history_busy
+        ):
             try:
                 v = history_trigger.value()
                 if _history_trigger_prev == 1 and v == 0:
@@ -2918,7 +2947,8 @@ hr{border:none;border-top:1px solid #ddd;margin:24px 0}
 
             # Live hold feedback while pressed (OTA → PAST → FUTURE)
             if (
-                not _history_busy
+                allow_button_actions
+                and not _history_busy
                 and _ota_btn_down_ms
                 and btn_v == 0
             ):
@@ -2926,7 +2956,7 @@ hr{border:none;border-top:1px solid #ddd;margin:24px 0}
                     _hold_hint_for_ms(time.ticks_diff(now, _ota_btn_down_ms))
                 )
             elif _ota_btn_hold_hint and (
-                btn_v == 1 or not _ota_btn_down_ms or _ota_btn_pending_hold_ms
+                btn_v == 1 or not _ota_btn_down_ms or _ota_btn_pending_hold_ms or not allow_button_actions
             ):
                 show_button_hold_hint(None)
 
@@ -2935,7 +2965,9 @@ hr{border:none;border-top:1px solid #ddd;margin:24px 0}
                 _ota_btn_pending_hold_ms = 0
                 show_button_hold_hint(None)
                 print("Button: hold %d ms" % held_ms)
-                if held_ms < UPDATE_BUTTON_TAP_MS:
+                if not allow_button_actions or _history_busy:
+                    print("Button: ignored (busy or nested poll)")
+                elif held_ms < UPDATE_BUTTON_TAP_MS:
                     install_update = True
                 elif held_ms < UPDATE_BUTTON_PAST_MS:
                     play_past = True
@@ -3477,18 +3509,19 @@ hr{border:none;border-top:1px solid #ddd;margin:24px 0}
             except Exception as e:
                 print("OTA server handle:", e)
         # After HTTP/button poll: hourly queue + run pending history/forecast work
-        try:
-            maybe_queue_hourly_history_refresh()
-        except Exception as _hr_auto_e:
-            print("history auto-refresh:", _hr_auto_e)
-        try:
-            maybe_queue_hourly_forecast_refresh()
-        except Exception as _fr_auto_e:
-            print("forecast auto-refresh:", _fr_auto_e)
-        try:
-            service_history_pending()
-        except Exception as _shp_e:
-            print("service_history_pending:", _shp_e)
+        if run_pending_history:
+            try:
+                maybe_queue_hourly_history_refresh()
+            except Exception as _hr_auto_e:
+                print("history auto-refresh:", _hr_auto_e)
+            try:
+                maybe_queue_hourly_forecast_refresh()
+            except Exception as _fr_auto_e:
+                print("forecast auto-refresh:", _fr_auto_e)
+            try:
+                service_history_pending()
+            except Exception as _shp_e:
+                print("service_history_pending:", _shp_e)
 
     _ota_service_hook = service_ota_http_and_button
 
