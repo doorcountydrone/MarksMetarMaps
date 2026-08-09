@@ -421,9 +421,9 @@ class FlightCategoryForecast:
             idx_for[apu].append(idx)
 
         if not strip_ids:
-            self.ready = False
-            self.state = "error"
-            self.last_error = "No airports"
+            if not self.ready:
+                self.state = "error"
+                self.last_error = "No airports"
             return False
 
         stations = self._fetch_stationinfo_ids(strip_ids, poll_callback)
@@ -521,13 +521,17 @@ class FlightCategoryForecast:
         gc.collect()
 
         self.fetched_at = int(time.time())
-        self.ready = ok_count > 0
-        self.state = "idle" if self.ready else "error"
-        if not self.ready:
+        if ok_count > 0:
+            self.ready = True
+            self.state = "idle"
+            self.last_error = ""
+        else:
+            # Keep a previously good pack so Play can still run after a failed refresh
             self.last_error = "No TAFs fetched"
+            self.state = "idle" if self.ready else "error"
         print(
-            "fc_forecast: packed %d slot-fills / %d airports (%d bytes); sources=%s"
-            % (ok_count, n, n * BYTES_PER_AIRPORT, self.source_map)
+            "fc_forecast: packed %d slot-fills / %d airports (%d bytes) ready=%s; sources=%s"
+            % (ok_count, n, n * BYTES_PER_AIRPORT, self.ready, self.source_map)
         )
         return self.ready
 
