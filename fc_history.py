@@ -245,9 +245,10 @@ class FlightCategoryHistory:
             except (TypeError, ValueError):
                 pass
         self.n_airports = n
-        # Keep previous ready buffer until this fetch succeeds (play still works if refresh fails)
-        for i in range(n * BYTES_PER_AIRPORT):
-            self.buf[i] = 0
+        # Do not wipe an existing ready pack until a new fetch succeeds (avoids empty play mid-refresh)
+        if not self.ready:
+            for i in range(n * BYTES_PER_AIRPORT):
+                self.buf[i] = 0
         try:
             now = time.gmtime()
             now_day = now[2]
