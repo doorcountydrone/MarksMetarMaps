@@ -400,8 +400,9 @@ class FlightCategoryForecast:
             except (TypeError, ValueError):
                 pass
         self.n_airports = n
-        for i in range(n * BYTES_PER_AIRPORT):
-            self.buf[i] = 0
+        if not self.ready:
+            for i in range(n * BYTES_PER_AIRPORT):
+                self.buf[i] = 0
         try:
             now_epoch = int(time.time())
         except Exception:
