@@ -51,6 +51,25 @@ def _metar_obs_time(raw_line):
     return (0, 0)
 
 
+def _newest_obs_time(raw_block):
+    """Newest (day, mins) found in a raw METAR block, or (0, 0)."""
+    best_day, best_mins = 0, -1
+    if not raw_block:
+        return (0, 0)
+    for line in raw_block.split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+        d, m = _metar_obs_time(line)
+        if d <= 0:
+            continue
+        if d > best_day or (d == best_day and m >= best_mins):
+            best_day, best_mins = d, m
+    if best_mins < 0:
+        return (0, 0)
+    return (best_day, best_mins)
+
+
 def _parse_flight_category(raw_text):
     """Minimal VFR/MVFR/IFR/LIFR from raw METAR (same rules as main.py)."""
     if not raw_text or not isinstance(raw_text, str):
@@ -115,14 +134,20 @@ def _parse_flight_category(raw_text):
 
 def _hours_ago(obs_day, obs_mins, now_day, now_mins):
     """Approximate age in hours (0..~48). None if unusable."""
-    if obs_day <= 0:
+    if obs_day <= 0 or now_day <= 0:
         return None
     if obs_day == now_day:
         ago = now_mins - obs_mins
     else:
-        # Treat as previous day (handles month wrap loosely within 24h window)
+        # Previous calendar day (or month wrap: treat as yesterday within 24h window)
         ago = (now_mins + 24 * 60) - obs_mins
-        if obs_day != now_day - 1 and not (now_day == 1 and obs_day >= 28):
+        day_ok = (
+            obs_day == now_day - 1
+            or (now_day == 1 and obs_day >= 28)
+            or abs(obs_day - now_day) >= 27  # month boundary either direction
+        )
+        if not day_ok:
+            # Still accept if age looks like < ~30h (common when RTC day is wrong)
             if ago < 0 or ago > 30 * 60:
                 return None
     if ago < -30:
@@ -130,6 +155,16 @@ def _hours_ago(obs_day, obs_mins, now_day, now_mins):
     if ago < 0:
         ago = 0
     return ago / 60.0
+
+
+def _response_looks_like_metar(text):
+    if not text or not isinstance(text, str):
+        return False
+    t = text.lstrip()
+    if not t or t[:1] == "<":
+        return False
+    u = t.upper()
+    return ("METAR " in u) or ("SPECI " in u) or (len(t) > 10 and t[0].isalpha())
 
 
 class FlightCategoryHistory:
@@ -190,23 +225,45 @@ class FlightCategoryHistory:
     def refresh_pending(self):
         return self._refresh_pending
 
+    def seed_flat(self, categories):
+        """
+        Fill every hour from current category strings (VFR/MVFR/IFR/LIFR).
+        Used when the 24h API pack fails so PAST can still animate.
+        """
+        n = min(len(categories), self.max_airports)
+        if n <= 0:
+            self.last_error = "No airports to seed"
+            return False
+        self.n_airports = n
+        for i in range(n):
+            cat = categories[i] if i < len(categories) else "VFR"
+            if not cat:
+                cat = "VFR"
+            code = FC_TO_BITS.get(str(cat).upper(), 0)
+            for h in range(HOURS):
+                _set_bits(self.buf, i, h, code)
+        self.ready = True
+        self.state = "idle"
+        try:
+            self.fetched_at = int(time.time())
+        except Exception:
+            self.fetched_at = 0
+        self.last_error = "seeded from live colors"
+        print("fc_history: seeded flat pack for %d airports (API history unavailable)" % n)
+        return True
+
     def _fill_airport_from_raw_block(self, airport_idx, raw_block, now_day, now_mins):
         """Parse multi-line raw METARs into 24 hour buckets; carry-forward gaps."""
         slots = [-1] * HOURS  # -1 = empty
+        filled = 0
         if not raw_block:
             for h in range(HOURS):
                 _set_bits(self.buf, airport_idx, h, 0)
-            return
+            return 0
         for line in raw_block.split("\n"):
             line = line.strip()
             if not line:
                 continue
-            if not (line.startswith("METAR ") or line.startswith("SPECI ") or (
-                len(line) >= 4 and line[0].isalpha() and " " in line
-            )):
-                # Accept ICAO-first lines without METAR prefix
-                if len(line) < 8:
-                    continue
             obs_day, obs_mins = _metar_obs_time(line)
             ago = _hours_ago(obs_day, obs_mins, now_day, now_mins)
             if ago is None or ago > 24.5:
@@ -218,8 +275,8 @@ class FlightCategoryHistory:
                 hour = HOURS - 1
             fc = _parse_flight_category(line)
             code = FC_TO_BITS.get(fc, 0)
-            # Last obs in a bucket wins
             slots[hour] = code
+            filled += 1
         # Carry forward from oldest
         last = 0
         for h in range(HOURS):
@@ -228,13 +285,51 @@ class FlightCategoryHistory:
             else:
                 last = slots[h]
             _set_bits(self.buf, airport_idx, h, slots[h])
+        return filled
 
-    def fetch_and_pack(self, airports, poll_callback=None, limit=None, chunk_size=3):
+    def _fetch_one_airport(self, apu, hours, timeout_s):
+        """Return raw text for one ICAO, or '' on failure."""
+        url = (
+            "https://aviationweather.gov/api/data/metar?ids={}&hours={}&format=raw"
+            .format(apu, int(hours))
+        )
+        last_err = ""
+        for attempt in range(3):
+            gc.collect()
+            resp = None
+            try:
+                print("fc_history: %s hours=%d try %d" % (apu, hours, attempt + 1))
+                resp = urequests.get(url, timeout=timeout_s)
+                raw = resp.text or ""
+                try:
+                    resp.close()
+                except Exception:
+                    pass
+                resp = None
+                if not _response_looks_like_metar(raw):
+                    last_err = "bad body (%d bytes)" % len(raw)
+                    print("fc_history: %s %s" % (apu, last_err))
+                    gc.collect()
+                    time.sleep_ms(150)
+                    continue
+                return raw
+            except Exception as e:
+                last_err = str(e)
+                print("fc_history fetch %s: %s" % (apu, e))
+                if resp is not None:
+                    try:
+                        resp.close()
+                    except Exception:
+                        pass
+                gc.collect()
+                time.sleep_ms(250)
+        self.last_error = last_err or "fetch failed"
+        return ""
+
+    def fetch_and_pack(self, airports, poll_callback=None, limit=None, chunk_size=1):
         """
-        Download hours=24 METARs in small multi-airport batches; pack into self.buf.
+        Download hours=24 METARs one airport at a time (Pico RAM-safe); pack into self.buf.
         airports: list of ICAO strings (blank = skip / all VFR zeros).
-        limit: only first N slots (e.g. STRIP_ACTIVE_LEDS) — keeps fetch fast.
-        chunk_size: airports per HTTPS request (small: 24h payloads are large).
         """
         self.state = "fetching"
         self.last_error = ""
@@ -245,123 +340,104 @@ class FlightCategoryHistory:
             except (TypeError, ValueError):
                 pass
         self.n_airports = n
-        # Do not wipe an existing ready pack until a new fetch succeeds (avoids empty play mid-refresh)
+        if n <= 0:
+            self.last_error = "No airports in list"
+            self.state = "error" if not self.ready else "idle"
+            print("fc_history: no airports to fetch")
+            return False
+        # Do not wipe an existing ready pack until a new fetch succeeds
         if not self.ready:
             for i in range(n * BYTES_PER_AIRPORT):
                 self.buf[i] = 0
+
         try:
             now = time.gmtime()
-            now_day = now[2]
-            now_mins = now[3] * 60 + now[4]
+            rtc_day = now[2]
+            rtc_mins = now[3] * 60 + now[4]
         except Exception:
-            now_day = 1
-            now_mins = 12 * 60
+            rtc_day = 0
+            rtc_mins = 0
+
         ok_count = 0
-        cs = max(1, min(5, int(chunk_size) if chunk_size else 3))
+        fail_count = 0
+        # Always 1 airport per HTTPS call — 24h multi-id payloads OOM / fail on Pico W
+        _ = chunk_size  # kept for call-site compatibility
         try:
-            chunk_start = 0
-            while chunk_start < n:
+            for idx in range(n):
                 if poll_callback:
                     try:
                         poll_callback()
                     except Exception:
                         pass
-                chunk_end = min(chunk_start + cs, n)
-                # Unique non-blank IDs in this chunk (API ids=)
-                id_list = []
-                seen = {}
-                for idx in range(chunk_start, chunk_end):
-                    ap = airports[idx]
-                    if not ap or not str(ap).strip():
-                        for h in range(HOURS):
-                            _set_bits(self.buf, idx, h, 0)
-                        continue
-                    apu = str(ap).strip().upper()
-                    if apu not in seen:
-                        seen[apu] = []
-                        id_list.append(apu)
-                    seen[apu].append(idx)
-                if not id_list:
-                    chunk_start = chunk_end
+                ap = airports[idx]
+                if not ap or not str(ap).strip():
+                    for h in range(HOURS):
+                        _set_bits(self.buf, idx, h, 0)
                     continue
-                gc.collect()
-                raw_block = ""
-                ids = ",".join(id_list)
-                url = (
-                    "https://aviationweather.gov/api/data/metar?ids={}&hours=24&format=raw"
-                    .format(ids)
-                )
-                got = False
-                for attempt in range(2):
-                    try:
-                        print("fc_history: batch %d–%d (%s) try %d" % (
-                            chunk_start, chunk_end - 1, ids, attempt + 1
-                        ))
-                        resp = urequests.get(url, timeout=10)
-                        try:
-                            raw_block = resp.text or ""
-                        finally:
-                            try:
-                                resp.close()
-                            except Exception:
-                                pass
-                        got = True
-                        break
-                    except Exception as e:
-                        print("fc_history batch fetch: %s" % e)
-                        gc.collect()
-                        time.sleep_ms(200)
-                if not got:
-                    for apu, idxs in seen.items():
-                        for idx in idxs:
-                            for h in range(HOURS):
-                                _set_bits(self.buf, idx, h, 0)
-                    chunk_start = chunk_end
+                apu = str(ap).strip().upper()
+                # Prefer 24h; fall back to 12h if the larger body fails
+                raw_block = self._fetch_one_airport(apu, 24, 15)
+                if not raw_block:
+                    raw_block = self._fetch_one_airport(apu, 12, 12)
+                if not raw_block:
+                    fail_count += 1
+                    for h in range(HOURS):
+                        _set_bits(self.buf, idx, h, 0)
                     time.sleep_ms(50)
                     continue
-                # Split response by station, then pack each airport index
-                by_station = {}
+
+                # Filter lines for this station only (response is usually single-station)
+                lines = []
                 for line in raw_block.split("\n"):
                     line = line.strip()
                     if not line:
                         continue
                     parts = line.split()
                     station = None
-                    if line.startswith("METAR ") or line.startswith("SPECI "):
+                    up = line.upper()
+                    if up.startswith("METAR ") or up.startswith("SPECI "):
                         if len(parts) > 1:
                             station = parts[1].upper()
-                    elif len(parts) >= 1 and len(parts[0]) in (3, 4) and parts[0].isalnum():
+                    elif len(parts) >= 1 and len(parts[0]) in (3, 4):
                         station = parts[0].upper()
-                    if not station or station not in seen:
-                        continue
-                    if station not in by_station:
-                        by_station[station] = []
-                    by_station[station].append(line)
+                    if station is None or station == apu:
+                        lines.append(line)
+                block = "\n".join(lines)
                 del raw_block
+                del lines
                 gc.collect()
-                for apu, idxs in seen.items():
-                    block = "\n".join(by_station.get(apu, []))
-                    for idx in idxs:
-                        self._fill_airport_from_raw_block(idx, block, now_day, now_mins)
-                        if block:
-                            ok_count += 1
-                del by_station
+
+                nd, nm = _newest_obs_time(block)
+                if nd <= 0:
+                    nd, nm = rtc_day, rtc_mins
+                if nd <= 0:
+                    # Last resort: treat newest unreadable — use noon day 1
+                    nd, nm = 1, 12 * 60
+
+                filled = self._fill_airport_from_raw_block(idx, block, nd, nm)
+                if block and (filled > 0 or len(block) > 20):
+                    ok_count += 1
+                else:
+                    fail_count += 1
+                del block
                 gc.collect()
-                chunk_start = chunk_end
-                if chunk_start < n:
-                    time.sleep_ms(150)
-            self.fetched_at = int(time.time())
+                time.sleep_ms(80)
+
+            try:
+                self.fetched_at = int(time.time())
+            except Exception:
+                self.fetched_at = 0
             if ok_count > 0:
                 self.ready = True
                 self.state = "idle"
                 self.last_error = ""
             else:
-                # Keep a previously good pack so Play can still run after a failed refresh
-                self.last_error = "No history fetched"
+                self.last_error = "No history fetched (ok=0 fail=%d n=%d)" % (fail_count, n)
                 self.state = "idle" if self.ready else "error"
-            print("fc_history: packed %d slot-fills / %d airports (%d bytes) ready=%s" % (
-                ok_count, n, n * BYTES_PER_AIRPORT, self.ready
-            ))
+            print(
+                "fc_history: packed ok=%d fail=%d / %d airports ready=%s"
+                % (ok_count, fail_count, n, self.ready)
+            )
             return self.ready
         except Exception as e:
             self.state = "error" if not self.ready else "idle"
