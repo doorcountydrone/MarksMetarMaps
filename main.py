@@ -56,7 +56,7 @@ CYCLE_DELAY = 10  # Seconds between full airport list cycles; loaded from config
 # ===== FIRMWARE VERSION (for OTA update check) =====
 # Device reports this string; GitHub Pages version.json "version" must be higher to offer OTA.
 # After you flash new code, this should match what you published (or stay lower until user updates).
-FIRMWARE_VERSION = "1.1.23"
+FIRMWARE_VERSION = "1.1.24"
 
 # ===== OTA / PLAY BUTTON (GPIO) =====
 # Same pin as force-AP at boot: long hold (3s) during startup = setup AP mode.
@@ -72,10 +72,13 @@ UPDATE_BUTTON_PAST_MS = 1500  # release before this → PAST; at/after → FUTUR
 UPDATE_BUTTON_BOUNCE_MS = 40  # ignore chatter shorter than this
 UPDATE_BUTTON_HINT_ARM_MS = 180  # delay before first hold hint (avoids flash on bounce)
 
-# ===== 24h FLIGHT-CATEGORY HISTORY TRIGGER (extra button / future PIR) =====
-# Active-low to GND (internal pull-up). Short press / motion pulse = play packed 24h animation.
-# Keep separate from UPDATE_BUTTON_PIN. Set to a free GPIO (e.g. 14) when you wire a button or PIR; -1 = off (app/HTTP only).
-HISTORY_TRIGGER_PIN = -1
+# ===== 24h FLIGHT-CATEGORY HISTORY TRIGGER (PIR / extra button) =====
+# SR602 on this GPIO: active-HIGH on motion -> play PAST 24h pack only.
+# Keep separate from UPDATE_BUTTON_PIN (hold: tap=OTA, mid=PAST, long=FUTURE).
+# Set to -1 to disable (app/HTTP / hold-button only).
+HISTORY_TRIGGER_PIN = 14
+HISTORY_TRIGGER_ACTIVE_HIGH = True  # SR602 OUT high on detect; False = active-low to GND
+HISTORY_TRIGGER_COOLDOWN_MS = 8000  # ignore re-fires while PIR stays high / after queue
 # Auto-download 24h history after startup METAR passes, then again on this interval (seconds). 0 = startup only.
 HISTORY_REFRESH_INTERVAL_S = 3600
 # Same interval for TAF forecast pack refresh (0 = startup only).
@@ -101,7 +104,8 @@ _ota_btn_ignore_until_ms = 0  # post-release bounce lockout
 _ota_btn_hold_hint = None  # last live hint while held: None | "OTA" | "PAST" | "FUTURE"
 # 24h history/forecast: set True while fetch/play runs (avoids re-entrant HTTP/GPIO triggers)
 _history_busy = False
-_history_trigger_prev = 1
+_history_trigger_prev = 0  # idle level for active-high PIR (SR602)
+_history_trigger_ignore_until_ms = 0  # PIR cooldown after edge
 _history_auto_anchor = 0  # time.time() of last auto refresh request (startup / hourly)
 _forecast_auto_anchor = 0
 _fetch_progress_last_ms = 0  # throttle matrix/strip "still fetching" pulse
@@ -2409,7 +2413,6 @@ try:
     fc_fcst = None
     history_trigger = None
     # Use module-level _history_busy only (do not assign a local here — it shadows busy checks)
-    _history_trigger_prev = 1
     try:
         import fc_history as _fc_history_mod
         _hist_n = max(8, min(120, len(airports) if airports else 32))
@@ -2430,8 +2433,14 @@ try:
         fc_fcst = None
     if HISTORY_TRIGGER_PIN >= 0 and HISTORY_TRIGGER_PIN != UPDATE_BUTTON_PIN:
         try:
-            history_trigger = Pin(HISTORY_TRIGGER_PIN, Pin.IN, Pin.PULL_UP)
-            print("History trigger GPIO %d (button/PIR, active low)" % HISTORY_TRIGGER_PIN)
+            # Active-high PIR (SR602): pull-down idle low; active-low switch: pull-up idle high
+            if HISTORY_TRIGGER_ACTIVE_HIGH:
+                history_trigger = Pin(HISTORY_TRIGGER_PIN, Pin.IN, Pin.PULL_DOWN)
+                edge = "active-high"
+            else:
+                history_trigger = Pin(HISTORY_TRIGGER_PIN, Pin.IN, Pin.PULL_UP)
+                edge = "active-low"
+            print("History trigger GPIO %d (%s PIR/button -> PAST play)" % (HISTORY_TRIGGER_PIN, edge))
         except Exception as _ht_e:
             print("History trigger GPIO init failed:", _ht_e)
             history_trigger = None
@@ -2960,9 +2969,9 @@ hr{border:none;border-top:1px solid #ddd;margin:24px 0}
     def service_ota_http_and_button(run_pending_history=True, allow_button_actions=True):
         global update_socket, _ota_rebind_after, _ota_button_prev
         global _ota_btn_down_ms, _ota_btn_pending_hold_ms, _ota_btn_ignore_until_ms, _ota_btn_hold_hint
-        global _history_trigger_prev, _history_busy, _play_banner_label
+        global _history_trigger_prev, _history_trigger_ignore_until_ms, _history_busy, _play_banner_label
         """OTA button + port 8080 + history trigger/pending."""
-        # Extra button / future PIR: short active-low pulse -> play 24h animation
+        # PIR / extra trigger: edge -> play PAST 24h (not FUTURE; use hold button for that)
         if (
             allow_button_actions
             and history_trigger is not None
@@ -2970,11 +2979,23 @@ hr{border:none;border-top:1px solid #ddd;margin:24px 0}
             and not _history_busy
         ):
             try:
+                now_ms = time.ticks_ms()
                 v = history_trigger.value()
-                if _history_trigger_prev == 1 and v == 0:
-                    print("History trigger: play requested")
+                armed = not (
+                    _history_trigger_ignore_until_ms
+                    and time.ticks_diff(now_ms, _history_trigger_ignore_until_ms) < 0
+                )
+                if HISTORY_TRIGGER_ACTIVE_HIGH:
+                    edged = _history_trigger_prev == 0 and v == 1
+                else:
+                    edged = _history_trigger_prev == 1 and v == 0
+                if edged and armed:
+                    print("History trigger: PAST play requested")
                     _play_banner_label = "PAST"
                     fc_hist.request_play()
+                    _history_trigger_ignore_until_ms = time.ticks_add(
+                        now_ms, HISTORY_TRIGGER_COOLDOWN_MS
+                    )
                 _history_trigger_prev = v
             except Exception:
                 pass
