@@ -56,7 +56,7 @@ CYCLE_DELAY = 10  # Seconds between full airport list cycles; loaded from config
 # ===== FIRMWARE VERSION (for OTA update check) =====
 # Device reports this string; GitHub Pages version.json "version" must be higher to offer OTA.
 # After you flash new code, this should match what you published (or stay lower until user updates).
-FIRMWARE_VERSION = "1.1.26"
+FIRMWARE_VERSION = "1.1.27"
 
 # ===== OTA / PLAY BUTTON (GPIO) =====
 # Same pin as force-AP at boot: long hold (3s) during startup = setup AP mode.
@@ -3762,10 +3762,10 @@ hr{border:none;border-top:1px solid #ddd;margin:24px 0}
 
     _ota_service_hook = service_ota_http_and_button
 
-    def sleep_with_ota_poll(total_seconds):
+    def sleep_with_ota_poll(total_seconds, run_pending_history=True):
         remaining = float(total_seconds)
         while remaining > 0:
-            service_ota_http_and_button()
+            service_ota_http_and_button(run_pending_history=run_pending_history)
             chunk = 0.25 if remaining >= 0.25 else remaining
             time.sleep(chunk)
             remaining -= chunk
@@ -3825,28 +3825,37 @@ hr{border:none;border-top:1px solid #ddd;margin:24px 0}
         print("Startup METAR passes paused for sleep window; entering scheduler loop")
     clear_unused_strip_leds(len(airports))
 
-    # Download+pack 24h flight categories after startup METAR passes (same idea as bulk colors).
-    # Then auto-refresh every HISTORY_REFRESH_INTERVAL_S; app Play uses the latest packed buffer.
+    # Download+pack 24h history/forecast after METAR passes — but do not block sleep.
+    # If startup hit the sleep window, only queue; main loop runs the fetch after wake.
+    _defer_hist_fcst = bool(startup_sleep_hit) or sleep_applies_to_displays_now()
     if fc_hist is not None:
         fc_hist.request_refresh()
         print(
-            "fc_history: startup 24h pack queued; auto-refresh every %ds"
-            % HISTORY_REFRESH_INTERVAL_S
+            "fc_history: startup 24h pack queued; auto-refresh every %ds%s"
+            % (
+                HISTORY_REFRESH_INTERVAL_S,
+                " (deferred until wake)" if _defer_hist_fcst else "",
+            )
         )
-        try:
-            service_history_pending()
-        except Exception as _ih_e:
-            print("fc_history initial pack:", _ih_e)
+        if not _defer_hist_fcst:
+            try:
+                service_history_pending()
+            except Exception as _ih_e:
+                print("fc_history initial pack:", _ih_e)
     if fc_fcst is not None:
         fc_fcst.request_refresh()
         print(
-            "fc_forecast: startup TAF pack queued; auto-refresh every %ds"
-            % FORECAST_REFRESH_INTERVAL_S
+            "fc_forecast: startup TAF pack queued; auto-refresh every %ds%s"
+            % (
+                FORECAST_REFRESH_INTERVAL_S,
+                " (deferred until wake)" if _defer_hist_fcst else "",
+            )
         )
-        try:
-            service_history_pending()
-        except Exception as _if_e:
-            print("fc_forecast initial pack:", _if_e)
+        if not _defer_hist_fcst:
+            try:
+                service_history_pending()
+            except Exception as _if_e:
+                print("fc_forecast initial pack:", _if_e)
 
     # NTP sync once for sleep schedule (local_time() = gmtime(utc + offset))
     ntptime_synced = False
@@ -3912,7 +3921,8 @@ hr{border:none;border-top:1px solid #ddd;margin:24px 0}
                 )
             )
         _strip_dark_for_sleep = bool(in_sleep and SLEEP_LEDS)
-        service_ota_http_and_button()
+        # Keep :8080 / button alive during sleep, but do not start history/forecast packs
+        service_ota_http_and_button(run_pending_history=not in_sleep)
         if not in_sleep:
             check_ldr_and_refresh()
         if in_sleep:
@@ -3932,7 +3942,7 @@ hr{border:none;border-top:1px solid #ddd;margin:24px 0}
                         "Current time (local): %04d-%02d-%02d %02d:%02d:%02d - Display sleep: on (no next wake computed)"
                         % (t[0], t[1], t[2], t[3], t[4], t[5])
                     )
-            sleep_with_ota_poll(CYCLE_DELAY)
+            sleep_with_ota_poll(CYCLE_DELAY, run_pending_history=False)
             continue
         just_woke_from_sleep = displays_sleeping
         displays_sleeping = False
