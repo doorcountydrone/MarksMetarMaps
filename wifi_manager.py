@@ -707,6 +707,7 @@ def _normalize_config_for_json_api(config):
         'max_brightness': _gi('max_brightness', DEFAULT_MAX_BRIGHTNESS, 0, 255),
         'batch_size': _gi('batch_size', DEFAULT_BATCH_SIZE, 1, 20),
         'matrix_only': _gb('matrix_only', DEFAULT_MATRIX_ONLY),
+        'neighbor_wx_flash': _gb('neighbor_wx_flash', True),
         'matrix_scroll_category': _gb('matrix_scroll_category', DEFAULT_MATRIX_SCROLL_CATEGORY),
         'scroll_speed': _gf('scroll_speed', DEFAULT_SCROLL_SPEED, 0.03, 0.2),
         'matrix_wiring': str(config.get('matrix_wiring', DEFAULT_MATRIX_WIRING)).upper() if str(config.get('matrix_wiring', DEFAULT_MATRIX_WIRING)).upper() in VALID_MATRIX_WIRING else DEFAULT_MATRIX_WIRING,
@@ -1544,6 +1545,11 @@ def run_server(force_ap=False):
                     if 'matrix_only' in updates:
                         mo = updates['matrix_only']
                         config['matrix_only'] = mo.lower() in ('true', '1', 'yes') if isinstance(mo, str) else bool(mo)
+                    if 'neighbor_wx_flash' in updates:
+                        nwf = updates['neighbor_wx_flash']
+                        config['neighbor_wx_flash'] = (
+                            nwf.lower() in ('true', '1', 'yes', 'on') if isinstance(nwf, str) else bool(nwf)
+                        )
                     if 'matrix_scroll_category' in updates:
                         msc = updates['matrix_scroll_category']
                         config['matrix_scroll_category'] = msc.lower() in ('true', '1', 'yes', 'on') if isinstance(msc, str) else bool(msc)
