@@ -56,7 +56,7 @@ CYCLE_DELAY = 10  # Seconds between full airport list cycles; loaded from config
 # ===== FIRMWARE VERSION (for OTA update check) =====
 # Device reports this string; GitHub Pages version.json "version" must be higher to offer OTA.
 # After you flash new code, this should match what you published (or stay lower until user updates).
-FIRMWARE_VERSION = "1.1.25"
+FIRMWARE_VERSION = "1.1.26"
 
 # ===== OTA / PLAY BUTTON (GPIO) =====
 # Same pin as force-AP at boot: long hold (3s) during startup = setup AP mode.
@@ -445,6 +445,7 @@ try:
         MAX_BRIGHTNESS = max(0, min(255, config.get('max_brightness', 15)))
         _mo = config.get('matrix_only', False)
         MATRIX_ONLY = _mo.lower() in ('true', '1', 'yes') if isinstance(_mo, str) else bool(_mo)
+        NEIGHBOR_WX_FLASH = _as_bool(config.get("neighbor_wx_flash", True), default=True)
         SCROLL_MATRIX_CATEGORY = _as_bool(config.get("matrix_scroll_category", True), default=True)
         try:
             SCROLL_SPEED = max(0.03, min(0.2, float(config.get('scroll_speed', 0.08))))
@@ -477,6 +478,7 @@ try:
         print(f"Display Type: {DISPLAY_TYPE}")
         print(f"LED Matrix Brightness: {LED_MATRIX_BRIGHTNESS}")
         print(f"Matrix only (no strip weather): {MATRIX_ONLY}")
+        print(f"Neighbor WX flash (nearby rain/storm LEDs): {NEIGHBOR_WX_FLASH}")
         print(f"Matrix scroll category line: {SCROLL_MATRIX_CATEGORY}")
         off_codes = [c for c, v in WEATHER_ENABLED.items() if not v]
         if off_codes:
@@ -2690,6 +2692,7 @@ hr{border:none;border-top:1px solid #ddd;margin:24px 0}
             "max_brightness": int(cfg.get("max_brightness", 15)),
             "batch_size": int(cfg.get("batch_size", 3)),
             "matrix_only": bool(cfg.get("matrix_only", False)),
+            "neighbor_wx_flash": _as_bool(cfg.get("neighbor_wx_flash", True), default=True),
             "matrix_scroll_category": _as_bool(cfg.get("matrix_scroll_category", True), default=True),
             "scroll_speed": float(cfg.get("scroll_speed", 0.08)),
             "matrix_wiring": str(cfg.get("matrix_wiring", "SNAKE_COLUMN")),
@@ -2723,6 +2726,7 @@ hr{border:none;border-top:1px solid #ddd;margin:24px 0}
 
     def _http_apply_post_update_config(updates):
         """Merge JSON updates into wifi_config.json (same rules as wifi_manager POST /update-config)."""
+        global NEIGHBOR_WX_FLASH
         cfg = {}
         try:
             with open(CONFIG_FILE, "r") as f:
@@ -2763,6 +2767,11 @@ hr{border:none;border-top:1px solid #ddd;margin:24px 0}
         if "matrix_only" in updates:
             mo = updates["matrix_only"]
             cfg["matrix_only"] = mo.lower() in ("true", "1", "yes") if isinstance(mo, str) else bool(mo)
+        if "neighbor_wx_flash" in updates:
+            nwf = updates["neighbor_wx_flash"]
+            cfg["neighbor_wx_flash"] = (
+                nwf.lower() in ("true", "1", "yes", "on") if isinstance(nwf, str) else bool(nwf)
+            )
         if "matrix_scroll_category" in updates:
             msc = updates["matrix_scroll_category"]
             cfg["matrix_scroll_category"] = (
@@ -2850,6 +2859,10 @@ hr{border:none;border-top:1px solid #ddd;margin:24px 0}
         with open(CONFIG_FILE, "w") as f:
             json.dump(cfg, f)
         print("LAN :8080 POST /update-config saved to", CONFIG_FILE)
+        # Apply neighbor flash live (no reboot required)
+        if "neighbor_wx_flash" in updates:
+            NEIGHBOR_WX_FLASH = bool(cfg.get("neighbor_wx_flash", True))
+            print("Neighbor WX flash now:", NEIGHBOR_WX_FLASH)
 
     def _http_send_json_response(conn, success, message):
         body = json.dumps({"success": success, "message": message})
