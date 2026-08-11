@@ -56,7 +56,7 @@ CYCLE_DELAY = 10  # Seconds between full airport list cycles; loaded from config
 # ===== FIRMWARE VERSION (for OTA update check) =====
 # Device reports this string; GitHub Pages version.json "version" must be higher to offer OTA.
 # After you flash new code, this should match what you published (or stay lower until user updates).
-FIRMWARE_VERSION = "1.1.24"
+FIRMWARE_VERSION = "1.1.25"
 
 # ===== OTA / PLAY BUTTON (GPIO) =====
 # Same pin as force-AP at boot: long hold (3s) during startup = setup AP mode.
@@ -167,6 +167,12 @@ MAX_BRIGHTNESS = 15
 FLIGHT_COLOR_MAP = {"VFR": (0, 255, 0), "MVFR": (0, 0, 255), "IFR": (255, 0, 0), "LIFR": (255, 0, 128), "": (255, 255, 255)}
 # Weather tags list - defined once, used in config and weather check
 WX_TAGS = ["BR", "-RA", "RA", "+RA", "-SN", "SN", "+SN", "SHSN", "LTG", "DSNT", "WND", "FG", "FZFG", "FZFD", "CLR", "CC", "CA", "CG", "VCTS", "TS", "$", "FC", "+FC", "TORNADO"]
+# While showing airport N, also briefly flash nearby LEDs that have rain/snow/storm/lightning
+# (LED-index neighbors, not true lat/lon). Set NEIGHBOR_WX_FLASH = False to disable / revert behavior.
+NEIGHBOR_WX_FLASH = True
+NEIGHBOR_WX_RADIUS = 5   # indexes within ± this of the present airport
+NEIGHBOR_WX_MAX = 8      # cap how many neighbors flash at once
+NEIGHBOR_WX_COOLDOWN_S = 45  # same neighbor won't re-flash within this many seconds
 
 # Pixel indices built only when LED_MATRIX is used (saves RAM for OLED/NONE)
 PIXEL_INDICES = None
@@ -402,6 +408,9 @@ except Exception as e:
 
 # Floating LDR: one brightness value for whole strip, refreshed periodically
 logical_colors = [(0, 0, 0)] * NUM_LEDS
+# Per-LED interest bits from last METAR (rain=1 snow=2 ltg=4 storm=8); tiny RAM
+_wx_interest = bytearray(NUM_LEDS)
+_wx_neighbor_cool = []  # last flash time.time() per LED; grown lazily
 current_ldr_brightness = 128
 last_ldr_refresh_time = 0
 
@@ -537,6 +546,8 @@ try:
         NUM_LEDS = _phys
         led = neopixel.NeoPixel(machine.Pin(LED_PIN), NUM_LEDS)
         logical_colors = [(0, 0, 0)] * NUM_LEDS
+        _wx_interest = bytearray(NUM_LEDS)
+        _wx_neighbor_cool = [0] * NUM_LEDS
         for i in range(NUM_LEDS):
             led[i] = (0, 0, 0)
         led.write()
@@ -1788,6 +1799,124 @@ def fetch_all_metars_once(airports):
         print("Bulk METAR fetch: got {} of {} airports".format(total_got, n))
     return results
 
+# Interesting WX for neighbor flash (not mist/wind/clear/maintenance)
+_WX_RAIN = ("-RA", "RA", "+RA")
+_WX_SNOW = ("-SN", "SN", "+SN", "SHSN")
+_WX_LTG = ("LTG", "DSNT", "CC", "CA", "CG")
+_WX_STORM = ("TS", "VCTS", "FC", "+FC", "TORNADO")
+
+
+def _wx_interest_bits(raw_text):
+    """Bitfield: rain=1, snow=2, lightning=4, storm/funnel=8. Exact METAR tokens only."""
+    if not raw_text or not isinstance(raw_text, str):
+        return 0
+    bits = 0
+    for tok in raw_text.upper().split():
+        if tok in _WX_RAIN:
+            bits |= 1
+        elif tok in _WX_SNOW:
+            bits |= 2
+        elif tok in _WX_LTG:
+            bits |= 4
+        elif tok in _WX_STORM:
+            bits |= 8
+    return bits
+
+
+def update_wx_interest(index, raw_text):
+    """Cache whether this strip index has rain/snow/storm/lightning (for neighbor flash)."""
+    global _wx_interest
+    if index < 0:
+        return
+    if index >= len(_wx_interest):
+        # Strip grew after boot — extend cheaply
+        extra = index + 1 - len(_wx_interest)
+        _wx_interest = _wx_interest + bytearray(extra)
+    _wx_interest[index] = _wx_interest_bits(raw_text) & 0xFF
+
+
+def _neighbor_flash_color(combined_bits):
+    if combined_bits & 8:
+        return (255, 0, 0)      # storm / funnel
+    if combined_bits & 4:
+        return (255, 255, 0)    # lightning
+    if combined_bits & 2:
+        return (255, 255, 255)  # snow
+    if combined_bits & 1:
+        return (0, 255, 139)    # rain
+    return (255, 165, 0)
+
+
+def flash_interesting_neighbors(center_index, led_strip):
+    """
+    Brief shared flash on LED-index neighbors that have interesting WX cached.
+    Only runs when the present airport itself is interesting. Low RAM; disable with NEIGHBOR_WX_FLASH.
+    """
+    global _wx_neighbor_cool
+    if not NEIGHBOR_WX_FLASH or MATRIX_ONLY or led_strip is None:
+        return
+    if center_index < 0 or center_index >= len(_wx_interest):
+        return
+    if not _wx_interest[center_index]:
+        return
+    n = min(STRIP_ACTIVE_LEDS, len(airports), len(_wx_interest), len(logical_colors))
+    if n <= 0:
+        return
+    if len(_wx_neighbor_cool) < n:
+        _wx_neighbor_cool = list(_wx_neighbor_cool) + [0] * (n - len(_wx_neighbor_cool))
+    try:
+        now = time.time()
+    except Exception:
+        now = 0
+    idxs = []
+    bits_all = 0
+    lo = center_index - NEIGHBOR_WX_RADIUS
+    hi = center_index + NEIGHBOR_WX_RADIUS
+    if lo < 0:
+        lo = 0
+    if hi >= n:
+        hi = n - 1
+    for j in range(lo, hi + 1):
+        if j == center_index:
+            continue
+        if j >= len(airports) or not airports[j] or not str(airports[j]).strip():
+            continue
+        b = _wx_interest[j]
+        if not b:
+            continue
+        last = _wx_neighbor_cool[j] if j < len(_wx_neighbor_cool) else 0
+        if now and last and (now - last) < NEIGHBOR_WX_COOLDOWN_S:
+            continue
+        idxs.append(j)
+        bits_all |= b
+        if len(idxs) >= NEIGHBOR_WX_MAX:
+            break
+    if not idxs:
+        return
+    color = _neighbor_flash_color(bits_all)
+    saved = [logical_colors[i] for i in idxs]
+    print("Neighbor WX flash @%d -> %s bits=%d" % (center_index, idxs, bits_all))
+    try:
+        for _ in range(4):
+            for i in idxs:
+                logical_colors[i] = color
+                led_strip[i] = _scale_color(color, current_ldr_brightness)
+            led_strip.write()
+            time.sleep(0.12)
+            for i in idxs:
+                logical_colors[i] = (0, 0, 0)
+                led_strip[i] = (0, 0, 0)
+            led_strip.write()
+            time.sleep(0.12)
+    finally:
+        for k, i in enumerate(idxs):
+            logical_colors[i] = saved[k]
+            led_strip[i] = _scale_color(saved[k], current_ldr_brightness)
+            if i < len(_wx_neighbor_cool):
+                _wx_neighbor_cool[i] = now
+        led_strip.write()
+
+
 def get_weather_conditions_with_retry(raw_text, airport, led, index, min_brightness, max_brightness, weather_enabled=None):
     if index >= STRIP_ACTIVE_LEDS:
         return False
@@ -2275,6 +2404,7 @@ def process_first_pass(airport, index):
     flight_category, raw_text = get_metar_data_with_retry(airport, quick=True)
     if flight_category is not None:
         update_data_success()
+        update_wx_interest(index, raw_text)
         print(f"First pass - {airport}: {flight_category}")
         if not MATRIX_ONLY:
             set_led_color(led, flight_category, index, MIN_BRIGHTNESS, MAX_BRIGHTNESS)
@@ -2289,8 +2419,10 @@ def process_second_pass(airport, index):
     flight_category, raw_text = get_metar_data_with_retry(airport)
     if flight_category is not None:
         update_data_success()
+        update_wx_interest(index, raw_text)
         if not MATRIX_ONLY:
             get_weather_conditions_with_retry(raw_text, airport, led, index, MIN_BRIGHTNESS, MAX_BRIGHTNESS)
+            flash_interesting_neighbors(index, led)
         line1 = f"{airport}={flight_category}"
         line2 = f" {raw_text}" if raw_text is not None else "Raw Text: N/A"
         print(f"Second pass - {line1}")
@@ -2321,8 +2453,10 @@ def process_main_loop_batch(batch_airports, batch_start_index, poll_callback=Non
         if flight_category is not None:
             update_data_success()
             any_data_received = True
+            update_wx_interest(index, raw_text)
             if not MATRIX_ONLY:
                 get_weather_conditions_with_retry(raw_text, airport, led, index, MIN_BRIGHTNESS, MAX_BRIGHTNESS)
+                flash_interesting_neighbors(index, led)
             line1 = f"{airport}={flight_category}"
             line2 = f" {raw_text}" if raw_text is not None else "Raw Text: N/A"
             print(f"Main loop - {line1}")
@@ -3642,8 +3776,9 @@ hr{border:none;border-top:1px solid #ddd;margin:24px 0}
                 service_ota_http_and_button()
             any_set = False
             for index in range(n):
-                fc, _ = bulk_results[index]
+                fc, raw = bulk_results[index]
                 if fc and airports[index] and airports[index].strip():
+                    update_wx_interest(index, raw)
                     set_led_color(led, fc, index, MIN_BRIGHTNESS, MAX_BRIGHTNESS)
                     any_set = True
                 else:
