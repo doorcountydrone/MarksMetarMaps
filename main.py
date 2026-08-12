@@ -56,7 +56,7 @@ CYCLE_DELAY = 10  # Seconds between full airport list cycles; loaded from config
 # ===== FIRMWARE VERSION (for OTA update check) =====
 # Device reports this string; GitHub Pages version.json "version" must be higher to offer OTA.
 # After you flash new code, this should match what you published (or stay lower until user updates).
-FIRMWARE_VERSION = "1.1.28"
+FIRMWARE_VERSION = "1.1.29"
 
 # ===== OTA / PLAY BUTTON (GPIO) =====
 # Same pin as force-AP at boot: long hold (3s) during startup = setup AP mode.
@@ -410,6 +410,8 @@ except Exception as e:
 logical_colors = [(0, 0, 0)] * NUM_LEDS
 # Per-LED interest bits from last METAR (rain=1 snow=2 ltg=4 storm=8); tiny RAM
 _wx_interest = bytearray(NUM_LEDS)
+# Per-LED WX_TAGS bitfield (bit i = WX_TAGS[i] present) for full neighbor animations
+_wx_cond_flags = [0] * NUM_LEDS
 _wx_neighbor_cool = []  # last flash time.time() per LED; grown lazily
 current_ldr_brightness = 128
 last_ldr_refresh_time = 0
@@ -549,6 +551,7 @@ try:
         led = neopixel.NeoPixel(machine.Pin(LED_PIN), NUM_LEDS)
         logical_colors = [(0, 0, 0)] * NUM_LEDS
         _wx_interest = bytearray(NUM_LEDS)
+        _wx_cond_flags = [0] * NUM_LEDS
         _wx_neighbor_cool = [0] * NUM_LEDS
         for i in range(NUM_LEDS):
             led[i] = (0, 0, 0)
@@ -1825,38 +1828,56 @@ def _wx_interest_bits(raw_text):
     return bits
 
 
+def _wx_cond_bitfield(raw_text):
+    """Bit i set when WX_TAGS[i] is an exact METAR token."""
+    if not raw_text or not isinstance(raw_text, str):
+        return 0
+    toks = raw_text.upper().split()
+    flags = 0
+    for i, tag in enumerate(WX_TAGS):
+        if tag in toks:
+            flags |= 1 << i
+    return flags
+
+
 def update_wx_interest(index, raw_text):
-    """Cache whether this strip index has rain/snow/storm/lightning (for neighbor flash)."""
-    global _wx_interest
+    """Cache interest bits + full WX tag flags for neighbor cluster animations."""
+    global _wx_interest, _wx_cond_flags
     if index < 0:
         return
     if index >= len(_wx_interest):
-        # Strip grew after boot — extend cheaply
         extra = index + 1 - len(_wx_interest)
         _wx_interest = _wx_interest + bytearray(extra)
+    while len(_wx_cond_flags) <= index:
+        _wx_cond_flags.append(0)
     _wx_interest[index] = _wx_interest_bits(raw_text) & 0xFF
+    _wx_cond_flags[index] = _wx_cond_bitfield(raw_text)
 
 
-def _neighbor_flash_color(combined_bits):
-    if combined_bits & 8:
-        return (255, 0, 0)      # storm / funnel
-    if combined_bits & 4:
-        return (255, 255, 0)    # lightning
-    if combined_bits & 2:
-        return (255, 255, 255)  # snow
-    if combined_bits & 1:
-        return (0, 255, 139)    # rain
-    return (255, 165, 0)
+def _flash_indices(led_strip, idxs, color, on_s, off_s, times):
+    """Run the same on/off flash pattern on many LEDs together."""
+    if not idxs:
+        return
+    for _ in range(times):
+        for i in idxs:
+            logical_colors[i] = color
+            led_strip[i] = _scale_color(color, current_ldr_brightness)
+        led_strip.write()
+        time.sleep(on_s)
+        for i in idxs:
+            logical_colors[i] = (0, 0, 0)
+            led_strip[i] = (0, 0, 0)
+        led_strip.write()
+        time.sleep(off_s)
 
 
 def flash_interesting_neighbors(center_index, led_strip):
     """
-    Flash the whole nearby *cluster* of rain/snow/storm/lightning airports once.
-    Grows contiguous interesting LEDs left/right of the present airport (within RADIUS).
-    Cooldown is on the whole cluster (including center) so walking the strip does not
-    reduce to flashing only the previous LED.
+    Flash the contiguous nearby weather cluster using the *same* animations as the
+    present airport (rain/snow/lightning/storm patterns), in parallel per condition.
+    Center is skipped here (it already ran get_weather_conditions_with_retry).
     """
-    global _wx_neighbor_cool
+    global _wx_neighbor_cool, _wx_cond_flags
     if not NEIGHBOR_WX_FLASH or MATRIX_ONLY or led_strip is None:
         return
     if center_index < 0 or center_index >= len(_wx_interest):
@@ -1868,11 +1889,12 @@ def flash_interesting_neighbors(center_index, led_strip):
         return
     if len(_wx_neighbor_cool) < n:
         _wx_neighbor_cool = list(_wx_neighbor_cool) + [0] * (n - len(_wx_neighbor_cool))
+    while len(_wx_cond_flags) < n:
+        _wx_cond_flags.append(0)
     try:
         now = time.time()
     except Exception:
         now = 0
-    # Already shown this airport as part of a recent cluster flash
     if now and center_index < len(_wx_neighbor_cool):
         last_c = _wx_neighbor_cool[center_index]
         if last_c and (now - last_c) < NEIGHBOR_WX_COOLDOWN_S:
@@ -1885,7 +1907,6 @@ def flash_interesting_neighbors(center_index, led_strip):
             return False
         return bool(_wx_interest[j])
 
-    # Grow contiguous interesting cluster from center (± RADIUS)
     lo = center_index
     while lo > 0 and (center_index - (lo - 1)) <= NEIGHBOR_WX_RADIUS and _slot_ok(lo - 1):
         lo -= 1
@@ -1893,38 +1914,120 @@ def flash_interesting_neighbors(center_index, led_strip):
     while hi + 1 < n and ((hi + 1) - center_index) <= NEIGHBOR_WX_RADIUS and _slot_ok(hi + 1):
         hi += 1
 
+    # Neighbors only — present airport already played full effects
     idxs = []
-    bits_all = 0
     for j in range(lo, hi + 1):
+        if j == center_index:
+            continue
         if not _slot_ok(j):
             continue
         idxs.append(j)
-        bits_all |= _wx_interest[j]
         if len(idxs) >= NEIGHBOR_WX_MAX:
             break
-    # Need at least one neighbor besides the present airport
-    if len(idxs) < 2:
+    if not idxs:
         return
 
-    color = _neighbor_flash_color(bits_all)
+    we = WEATHER_ENABLED
+    print("Neighbor WX full anim @%d -> %s" % (center_index, idxs))
+
+    def group(bit, code):
+        if not we.get(code, True):
+            return []
+        out = []
+        for j in idxs:
+            if j < len(_wx_cond_flags) and (_wx_cond_flags[j] & (1 << bit)):
+                out.append(j)
+        return out
+
     saved = [logical_colors[i] for i in idxs]
-    print("Neighbor WX cluster @%d -> %s bits=%d" % (center_index, idxs, bits_all))
     try:
-        for _ in range(5):
-            for i in idxs:
-                logical_colors[i] = color
-                led_strip[i] = _scale_color(color, current_ldr_brightness)
-            led_strip.write()
-            time.sleep(0.14)
-            for i in idxs:
-                logical_colors[i] = (0, 0, 0)
-                led_strip[i] = (0, 0, 0)
-            led_strip.write()
-            time.sleep(0.14)
+        # Same order / timings as get_weather_conditions_with_retry (interesting tags)
+        g = group(0, "BR")
+        if g:
+            _flash_indices(led_strip, g, (0, 255, 240), 0.1, 0.1, 12)
+        g = group(1, "-RA")
+        if g:
+            _flash_indices(led_strip, g, (0, 255, 139), 0.5, 0.5, 6)
+        g = group(2, "RA")
+        if g:
+            _flash_indices(led_strip, g, (0, 255, 139), 1.2, 0.5, 5)
+        g = group(3, "+RA")
+        if g:
+            _flash_indices(led_strip, g, (0, 255, 139), 2.2, 0.5, 4)
+        g = group(4, "-SN")
+        if g:
+            _flash_indices(led_strip, g, (255, 255, 255), 0.3, 0.5, 6)
+        g = group(5, "SN")
+        if g:
+            _flash_indices(led_strip, g, (255, 255, 255), 1.2, 0.5, 5)
+        g = group(6, "+SN")
+        if g:
+            _flash_indices(led_strip, g, (255, 255, 255), 2.2, 0.5, 4)
+        g = group(7, "SHSN")
+        if g:
+            _flash_indices(led_strip, g, (255, 255, 255), 1.2, 0.5, 5)
+        g = []
+        if we.get("LTG", True) or we.get("DSNT", True):
+            for j in idxs:
+                f = _wx_cond_flags[j] if j < len(_wx_cond_flags) else 0
+                if (we.get("LTG", True) and (f & (1 << 8))) or (we.get("DSNT", True) and (f & (1 << 9))):
+                    g.append(j)
+        if g:
+            _flash_indices(led_strip, g, (255, 255, 0), 0.09, 0.02, 35)
+        g = []
+        for j in idxs:
+            f = _wx_cond_flags[j] if j < len(_wx_cond_flags) else 0
+            if ((we.get("CC", True) and (f & (1 << 15)))
+                    or (we.get("CA", True) and (f & (1 << 16)))
+                    or (we.get("CG", True) and (f & (1 << 17)))
+                    or (we.get("VCTS", True) and (f & (1 << 18)))):
+                g.append(j)
+        if g:
+            _flash_indices(led_strip, g, (255, 255, 255), 0.09, 0.02, 35)
+        g = []
+        for j in idxs:
+            f = _wx_cond_flags[j] if j < len(_wx_cond_flags) else 0
+            if ((we.get("TS", True) and (f & (1 << 19)))
+                    or (we.get("FC", True) and (f & (1 << 21)))):
+                g.append(j)
+        if g:
+            _flash_indices(led_strip, g, (255, 0, 0), 0.05, 0.5, 5)
+        g = []
+        for j in idxs:
+            f = _wx_cond_flags[j] if j < len(_wx_cond_flags) else 0
+            if ((we.get("FC", True) and (f & (1 << 21)))
+                    or (we.get("+FC", True) and (f & (1 << 22)))
+                    or (we.get("TORNADO", True) and (f & (1 << 23)))):
+                g.append(j)
+        if g:
+            # Same red↔blue pulse family as present (simplified multi-LED steps)
+            for _flash in range(15):
+                for step in range(0, 201, 10):
+                    t = step / 200.0
+                    current_color = (
+                        int(255 * (1.0 - t)),
+                        0,
+                        int(255 * t),
+                    )
+                    for i in g:
+                        logical_colors[i] = current_color
+                        led_strip[i] = _scale_color(current_color, current_ldr_brightness)
+                    led_strip.write()
+                    time.sleep(0.01)
+                for i in g:
+                    logical_colors[i] = (0, 0, 0)
+                    led_strip[i] = (0, 0, 0)
+                led_strip.write()
+                time.sleep(0.1)
     finally:
         for k, i in enumerate(idxs):
             logical_colors[i] = saved[k]
             led_strip[i] = _scale_color(saved[k], current_ldr_brightness)
+        # Cool whole cluster including center so strip walk does not repeat
+        cool_set = list(idxs)
+        if center_index not in cool_set:
+            cool_set.append(center_index)
+        for i in cool_set:
             if i < len(_wx_neighbor_cool):
                 _wx_neighbor_cool[i] = now
         led_strip.write()
