@@ -56,7 +56,7 @@ CYCLE_DELAY = 10  # Seconds between full airport list cycles; loaded from config
 # ===== FIRMWARE VERSION (for OTA update check) =====
 # Device reports this string; GitHub Pages version.json "version" must be higher to offer OTA.
 # After you flash new code, this should match what you published (or stay lower until user updates).
-FIRMWARE_VERSION = "1.1.32"
+FIRMWARE_VERSION = "1.1.33"
 
 # ===== OTA / PLAY BUTTON (GPIO) =====
 # Same pin as force-AP at boot: long hold (3s) during startup = setup AP mode.
@@ -3136,7 +3136,7 @@ hr{border:none;border-top:1px solid #ddd;margin:24px 0}
             update_data_success()
             _show_fetch_banner(label)
             try:
-                ok = pack.fetch_and_pack(_airports_for_pack(), _history_fetch_poll)
+                ok = pack.fetch_and_pack(_airports_for_pack(), _history_fetch_poll, chunk_size=3)
                 # If 24h API pack failed, seed from live strip colors so PAST can still play
                 if (not ok) and (pack is fc_hist) and hasattr(pack, "seed_flat"):
                     try:
