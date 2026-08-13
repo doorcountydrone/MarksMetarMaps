@@ -287,18 +287,18 @@ class FlightCategoryHistory:
             _set_bits(self.buf, airport_idx, h, slots[h])
         return filled
 
-    def _fetch_one_airport(self, apu, hours, timeout_s):
-        """Return raw text for one ICAO, or '' on failure."""
+    def _fetch_ids(self, ids_csv, hours, timeout_s):
+        """Return raw METAR text for one or more comma-separated ICAOs, or ''."""
         url = (
             "https://aviationweather.gov/api/data/metar?ids={}&hours={}&format=raw"
-            .format(apu, int(hours))
+            .format(ids_csv, int(hours))
         )
         last_err = ""
         for attempt in range(3):
             gc.collect()
             resp = None
             try:
-                print("fc_history: %s hours=%d try %d" % (apu, hours, attempt + 1))
+                print("fc_history: %s hours=%d try %d" % (ids_csv, hours, attempt + 1))
                 resp = urequests.get(url, timeout=timeout_s)
                 raw = resp.text or ""
                 try:
@@ -308,14 +308,14 @@ class FlightCategoryHistory:
                 resp = None
                 if not _response_looks_like_metar(raw):
                     last_err = "bad body (%d bytes)" % len(raw)
-                    print("fc_history: %s %s" % (apu, last_err))
+                    print("fc_history: %s %s" % (ids_csv, last_err))
                     gc.collect()
                     time.sleep_ms(150)
                     continue
                 return raw
             except Exception as e:
                 last_err = str(e)
-                print("fc_history fetch %s: %s" % (apu, e))
+                print("fc_history fetch %s: %s" % (ids_csv, e))
                 if resp is not None:
                     try:
                         resp.close()
@@ -326,9 +326,82 @@ class FlightCategoryHistory:
         self.last_error = last_err or "fetch failed"
         return ""
 
-    def fetch_and_pack(self, airports, poll_callback=None, limit=None, chunk_size=1):
+    def _fetch_one_airport(self, apu, hours, timeout_s):
+        """Return raw text for one ICAO, or '' on failure."""
+        return self._fetch_ids(apu, hours, timeout_s)
+
+    def _station_from_line(self, line):
+        if not line:
+            return None
+        parts = line.split()
+        up = line.upper()
+        if up.startswith("METAR ") or up.startswith("SPECI "):
+            if len(parts) > 1:
+                return parts[1].upper()
+        elif len(parts) >= 1 and len(parts[0]) in (3, 4):
+            return parts[0].upper()
+        return None
+
+    def _split_raw_by_station(self, raw, wanted):
+        """Map uppercase ICAO -> raw block for stations in wanted (set/list)."""
+        want = {}
+        for apu in wanted:
+            want[apu] = []
+        if not raw:
+            return {}
+        for line in raw.split("\n"):
+            line = line.strip()
+            if not line:
+                continue
+            st = self._station_from_line(line)
+            if st and st in want:
+                want[st].append(line)
+        out = {}
+        for apu, lines in want.items():
+            if lines:
+                out[apu] = "\n".join(lines)
+        return out
+
+    def _pack_idx_from_block(self, idx, block, rtc_day, rtc_mins):
+        """Fill one airport slot from a raw block. Returns True if useful data packed."""
+        nd, nm = _newest_obs_time(block)
+        if nd <= 0:
+            nd, nm = rtc_day, rtc_mins
+        if nd <= 0:
+            nd, nm = 1, 12 * 60
+        filled = self._fill_airport_from_raw_block(idx, block, nd, nm)
+        return bool(block) and (filled > 0 or len(block) > 20)
+
+    def _fetch_and_pack_one(self, idx, apu, rtc_day, rtc_mins):
+        """Single-airport fetch with 24h then 12h fallback. Returns True on success."""
+        raw_block = self._fetch_one_airport(apu, 24, 15)
+        if not raw_block:
+            raw_block = self._fetch_one_airport(apu, 12, 12)
+        if not raw_block:
+            for h in range(HOURS):
+                _set_bits(self.buf, idx, h, 0)
+            return False
+        lines = []
+        for line in raw_block.split("\n"):
+            line = line.strip()
+            if not line:
+                continue
+            st = self._station_from_line(line)
+            if st is None or st == apu:
+                lines.append(line)
+        block = "\n".join(lines)
+        del raw_block
+        del lines
+        gc.collect()
+        ok = self._pack_idx_from_block(idx, block, rtc_day, rtc_mins)
+        del block
+        gc.collect()
+        return ok
+
+    def fetch_and_pack(self, airports, poll_callback=None, limit=None, chunk_size=3):
         """
-        Download hours=24 METARs one airport at a time (Pico RAM-safe); pack into self.buf.
+        Download hours=24 METARs in small multi-id chunks (default 3); pack into self.buf.
+        Falls back to one airport per call if a chunk fails (Pico RAM-safe).
         airports: list of ICAO strings (blank = skip / all VFR zeros).
         """
         self.state = "fetching"
@@ -358,69 +431,97 @@ class FlightCategoryHistory:
             rtc_day = 0
             rtc_mins = 0
 
+        try:
+            cs = int(chunk_size) if chunk_size is not None else 3
+        except (TypeError, ValueError):
+            cs = 3
+        cs = max(1, min(5, cs))
+
+        # Build work list of (idx, ICAO); blank slots -> VFR zeros
+        work = []
+        for idx in range(n):
+            ap = airports[idx]
+            if not ap or not str(ap).strip():
+                for h in range(HOURS):
+                    _set_bits(self.buf, idx, h, 0)
+                continue
+            work.append((idx, str(ap).strip().upper()))
+
         ok_count = 0
         fail_count = 0
-        # Always 1 airport per HTTPS call — 24h multi-id payloads OOM / fail on Pico W
-        _ = chunk_size  # kept for call-site compatibility
+        print("fc_history: fetching %d airports chunk_size=%d" % (len(work), cs))
         try:
-            for idx in range(n):
+            i = 0
+            while i < len(work):
                 if poll_callback:
                     try:
                         poll_callback()
                     except Exception:
                         pass
-                ap = airports[idx]
-                if not ap or not str(ap).strip():
-                    for h in range(HOURS):
-                        _set_bits(self.buf, idx, h, 0)
-                    continue
-                apu = str(ap).strip().upper()
-                # Prefer 24h; fall back to 12h if the larger body fails
-                raw_block = self._fetch_one_airport(apu, 24, 15)
-                if not raw_block:
-                    raw_block = self._fetch_one_airport(apu, 12, 12)
-                if not raw_block:
-                    fail_count += 1
-                    for h in range(HOURS):
-                        _set_bits(self.buf, idx, h, 0)
-                    time.sleep_ms(50)
-                    continue
+                chunk = work[i : i + cs]
+                ids_csv = ",".join(apu for _, apu in chunk)
+                raw = self._fetch_ids(ids_csv, 24, 18 if len(chunk) > 1 else 15)
+                if not raw:
+                    raw = self._fetch_ids(ids_csv, 12, 14 if len(chunk) > 1 else 12)
 
-                # Filter lines for this station only (response is usually single-station)
-                lines = []
-                for line in raw_block.split("\n"):
-                    line = line.strip()
-                    if not line:
-                        continue
-                    parts = line.split()
-                    station = None
-                    up = line.upper()
-                    if up.startswith("METAR ") or up.startswith("SPECI "):
-                        if len(parts) > 1:
-                            station = parts[1].upper()
-                    elif len(parts) >= 1 and len(parts[0]) in (3, 4):
-                        station = parts[0].upper()
-                    if station is None or station == apu:
-                        lines.append(line)
-                block = "\n".join(lines)
-                del raw_block
-                del lines
-                gc.collect()
-
-                nd, nm = _newest_obs_time(block)
-                if nd <= 0:
-                    nd, nm = rtc_day, rtc_mins
-                if nd <= 0:
-                    # Last resort: treat newest unreadable — use noon day 1
-                    nd, nm = 1, 12 * 60
-
-                filled = self._fill_airport_from_raw_block(idx, block, nd, nm)
-                if block and (filled > 0 or len(block) > 20):
-                    ok_count += 1
+                if raw and len(chunk) > 1:
+                    wanted = [apu for _, apu in chunk]
+                    by_st = self._split_raw_by_station(raw, wanted)
+                    del raw
+                    gc.collect()
+                    missing = []
+                    for idx, apu in chunk:
+                        block = by_st.get(apu, "")
+                        if block and self._pack_idx_from_block(idx, block, rtc_day, rtc_mins):
+                            ok_count += 1
+                        else:
+                            missing.append((idx, apu))
+                        if block:
+                            del block
+                    del by_st
+                    gc.collect()
+                    for idx, apu in missing:
+                        if poll_callback:
+                            try:
+                                poll_callback()
+                            except Exception:
+                                pass
+                        if self._fetch_and_pack_one(idx, apu, rtc_day, rtc_mins):
+                            ok_count += 1
+                        else:
+                            fail_count += 1
+                        time.sleep_ms(50)
+                elif raw and len(chunk) == 1:
+                    idx, apu = chunk[0]
+                    by_st = self._split_raw_by_station(raw, [apu])
+                    del raw
+                    gc.collect()
+                    block = by_st.get(apu, "")
+                    if block and self._pack_idx_from_block(idx, block, rtc_day, rtc_mins):
+                        ok_count += 1
+                    else:
+                        fail_count += 1
+                        for h in range(HOURS):
+                            _set_bits(self.buf, idx, h, 0)
+                    del by_st
+                    gc.collect()
                 else:
-                    fail_count += 1
-                del block
-                gc.collect()
+                    # Chunk failed entirely — fall back one-at-a-time
+                    if len(chunk) > 1:
+                        print("fc_history: chunk failed, fallback singles: %s" % ids_csv)
+                    for idx, apu in chunk:
+                        if poll_callback:
+                            try:
+                                poll_callback()
+                            except Exception:
+                                pass
+                        if self._fetch_and_pack_one(idx, apu, rtc_day, rtc_mins):
+                            ok_count += 1
+                        else:
+                            fail_count += 1
+                        time.sleep_ms(50)
+
+                i += cs
                 time.sleep_ms(80)
 
             try:
