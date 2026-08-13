@@ -180,7 +180,7 @@ def _periods_to_hourly(fcsts, now_epoch):
 class FlightCategoryForecast:
     """Packed next-24h TAF category timeline for the strip."""
 
-    def __init__(self, max_airports=120):
+    def __init__(self, max_airports=130):
         self.max_airports = max_airports
         self.buf = bytearray(max_airports * BYTES_PER_AIRPORT)
         self.n_airports = 0
