@@ -170,7 +170,7 @@ def _response_looks_like_metar(text):
 class FlightCategoryHistory:
     """Packed 24h category timeline for the strip."""
 
-    def __init__(self, max_airports=120):
+    def __init__(self, max_airports=130):
         self.max_airports = max_airports
         self.buf = bytearray(max_airports * BYTES_PER_AIRPORT)
         self.n_airports = 0
