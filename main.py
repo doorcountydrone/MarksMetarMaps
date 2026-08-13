@@ -56,7 +56,7 @@ CYCLE_DELAY = 10  # Seconds between full airport list cycles; loaded from config
 # ===== FIRMWARE VERSION (for OTA update check) =====
 # Device reports this string; GitHub Pages version.json "version" must be higher to offer OTA.
 # After you flash new code, this should match what you published (or stay lower until user updates).
-FIRMWARE_VERSION = "1.1.30"
+FIRMWARE_VERSION = "1.1.31"
 
 # ===== OTA / PLAY BUTTON (GPIO) =====
 # Same pin as force-AP at boot: long hold (3s) during startup = setup AP mode.
@@ -2165,21 +2165,24 @@ def get_weather_conditions_with_retry(raw_text, airport, led, index, min_brightn
                                 led[index] = (0, 0, 0)
                                 led.write()
                                 time.sleep(.5)
-                        def fade_to_white(target_brightness, fade_time):
-                            # Ramp gray level up to white (was wrongly fading 10 -> 0)
-                            start_brightness = 10
+                        def fade_to_white(fade_time):
+                            # Ramp gray -> white; scale peak with max_brightness like CLR
+                            start_gray = 10
                             denom = max(1, fade_time - 1)
                             for step in range(fade_time):
                                 t = step / denom
-                                new_brightness = int(start_brightness + (target_brightness - start_brightness) * t)
-                                new_brightness = max(0, min(255, new_brightness))
-                                yield (new_brightness, new_brightness, new_brightness)
+                                g = int(start_gray + (255 - start_gray) * t)
+                                g = max(0, min(255, g))
+                                # End at app max (CLR-bright); start from LDR so fog builds up
+                                brightness = int((1.0 - t) * current_ldr_brightness + t * max_brightness)
+                                brightness = max(brightness, int(t * (max_brightness * 0.5)))
+                                yield (g, g, g), brightness
                         if weather_enabled.get("FG", True) and any(conditions_present[11:12]):
                             for flash_count in range(1):
                                 fade_time = 10
-                                for faded_color in fade_to_white(255, fade_time):
+                                for faded_color, brightness in fade_to_white(fade_time):
                                     logical_colors[index] = faded_color
-                                    led[index] = _scale_color(faded_color, current_ldr_brightness)
+                                    led[index] = _scale_color(faded_color, int(brightness))
                                     led.write()
                                     time.sleep(.4)
                                 logical_colors[index] = (0, 0, 0)
