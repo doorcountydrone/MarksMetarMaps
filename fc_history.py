@@ -398,9 +398,9 @@ class FlightCategoryHistory:
         gc.collect()
         return ok
 
-    def fetch_and_pack(self, airports, poll_callback=None, limit=None, chunk_size=3):
+    def fetch_and_pack(self, airports, poll_callback=None, limit=None, chunk_size=5):
         """
-        Download hours=24 METARs in small multi-id chunks (default 3); pack into self.buf.
+        Download hours=24 METARs in small multi-id chunks (default 5); pack into self.buf.
         Falls back to one airport per call if a chunk fails (Pico RAM-safe).
         airports: list of ICAO strings (blank = skip / all VFR zeros).
         """
@@ -432,10 +432,10 @@ class FlightCategoryHistory:
             rtc_mins = 0
 
         try:
-            cs = int(chunk_size) if chunk_size is not None else 3
+            cs = int(chunk_size) if chunk_size is not None else 5
         except (TypeError, ValueError):
-            cs = 3
-        cs = max(1, min(5, cs))
+            cs = 5
+        cs = max(1, min(8, cs))
 
         # Build work list of (idx, ICAO); blank slots -> VFR zeros
         work = []
