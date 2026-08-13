@@ -242,7 +242,7 @@ class FlightCategoryForecast:
         out = {}
         if not id_list:
             return out
-        cs = 2  # keep responses small on Pico heap
+        cs = 3  # small multi-id stationinfo batches
         i = 0
         while i < len(id_list):
             if poll_callback:
@@ -346,8 +346,17 @@ class FlightCategoryForecast:
         return out
 
     def _fetch_one_taf_fcsts(self, icao, poll_callback=None):
-        """Fetch a single station TAF (JSON). One ID keeps heap use predictable."""
-        url = "https://aviationweather.gov/api/data/taf?ids=%s&format=json" % icao
+        """Fetch a single station TAF (JSON)."""
+        by_id = self._fetch_tafs_chunk([icao], poll_callback)
+        return by_id.get(icao)
+
+    def _fetch_tafs_chunk(self, icaos, poll_callback=None):
+        """Fetch up to a few TAFs in one request. Returns dict icao -> fcsts list."""
+        out = {}
+        if not icaos:
+            return out
+        ids = ",".join(icaos)
+        url = "https://aviationweather.gov/api/data/taf?ids=%s&format=json" % ids
         data = None
         for attempt in range(2):
             if poll_callback:
@@ -356,40 +365,38 @@ class FlightCategoryForecast:
                 except Exception:
                     pass
             try:
-                print("fc_forecast: taf %s try %d" % (icao, attempt + 1))
+                print("fc_forecast: taf %s try %d" % (ids, attempt + 1))
                 gc.collect()
-                data = _http_get_json(url, timeout=15)
+                data = _http_get_json(url, timeout=18 if len(icaos) > 1 else 15)
                 if data is not None:
                     break
             except Exception as e:
                 print("fc_forecast taf fetch:", e)
                 gc.collect()
                 time.sleep_ms(250)
-        fcsts = None
+        want = {}
+        for icao in icaos:
+            want[icao] = True
         if isinstance(data, list):
             for taf in data:
                 if not isinstance(taf, dict):
                     continue
                 tid = str(taf.get("icaoId") or "").upper()
-                if tid == icao and isinstance(taf.get("fcsts"), list):
-                    fcsts = taf.get("fcsts")
-                    break
-            if fcsts is None and data:
-                taf0 = data[0]
-                if isinstance(taf0, dict) and isinstance(taf0.get("fcsts"), list):
-                    fcsts = taf0.get("fcsts")
-        elif isinstance(data, dict) and isinstance(data.get("fcsts"), list):
-            fcsts = data.get("fcsts")
+                if tid in want and isinstance(taf.get("fcsts"), list):
+                    out[tid] = taf.get("fcsts")
+        elif isinstance(data, dict) and len(icaos) == 1:
+            if isinstance(data.get("fcsts"), list):
+                out[icaos[0]] = data.get("fcsts")
         del data
         gc.collect()
-        return fcsts
+        return out
 
     def _pack_slots_for_indices(self, idxs, slots):
         for idx in idxs:
             for h in range(HOURS):
                 _set_bits(self.buf, idx, h, slots[h])
 
-    def fetch_and_pack(self, airports, poll_callback=None, limit=None):
+    def fetch_and_pack(self, airports, poll_callback=None, limit=None, chunk_size=3):
         self.state = "fetching"
         self.last_error = ""
         self.source_map = {}
@@ -500,19 +507,54 @@ class FlightCategoryForecast:
                 source_idxs[src] = []
             source_idxs[src].extend(idx_for.get(apu, []))
 
+        try:
+            cs = int(chunk_size) if chunk_size is not None else 3
+        except (TypeError, ValueError):
+            cs = 3
+        cs = max(1, min(5, cs))
+
+        src_list = list(source_idxs.keys())
         ok_count = 0
-        for src, idxs in source_idxs.items():
-            fcsts = self._fetch_one_taf_fcsts(src, poll_callback)
-            if not fcsts:
-                print("fc_forecast: no TAF body for %s" % src)
-                continue
-            slots = _periods_to_hourly(fcsts, now_epoch)
-            del fcsts
+        print("fc_forecast: fetching %d TAF sources chunk_size=%d" % (len(src_list), cs))
+        si = 0
+        while si < len(src_list):
+            chunk_srcs = src_list[si : si + cs]
+            by_id = self._fetch_tafs_chunk(chunk_srcs, poll_callback)
+            missing = []
+            for src in chunk_srcs:
+                fcsts = by_id.get(src)
+                if not fcsts:
+                    missing.append(src)
+                    continue
+                slots = _periods_to_hourly(fcsts, now_epoch)
+                idxs = source_idxs.get(src, [])
+                self._pack_slots_for_indices(idxs, slots)
+                ok_count += len(idxs)
+                del slots
+                gc.collect()
+            del by_id
             gc.collect()
-            self._pack_slots_for_indices(idxs, slots)
-            ok_count += len(idxs)
-            del slots
-            gc.collect()
+            # Fallback singles for any missing from the multi-id response
+            for src in missing:
+                if poll_callback:
+                    try:
+                        poll_callback()
+                    except Exception:
+                        pass
+                fcsts = self._fetch_one_taf_fcsts(src, poll_callback)
+                if not fcsts:
+                    print("fc_forecast: no TAF body for %s" % src)
+                    continue
+                slots = _periods_to_hourly(fcsts, now_epoch)
+                del fcsts
+                gc.collect()
+                idxs = source_idxs.get(src, [])
+                self._pack_slots_for_indices(idxs, slots)
+                ok_count += len(idxs)
+                del slots
+                gc.collect()
+                time.sleep_ms(80)
+            si += cs
             time.sleep_ms(80)
 
         del source_idxs
