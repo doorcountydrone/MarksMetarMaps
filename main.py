@@ -56,7 +56,7 @@ CYCLE_DELAY = 10  # Seconds between full airport list cycles; loaded from config
 # ===== FIRMWARE VERSION (for OTA update check) =====
 # Device reports this string; GitHub Pages version.json "version" must be higher to offer OTA.
 # After you flash new code, this should match what you published (or stay lower until user updates).
-FIRMWARE_VERSION = "1.1.31"
+FIRMWARE_VERSION = "1.1.32"
 
 # ===== OTA / PLAY BUTTON (GPIO) =====
 # Same pin as force-AP at boot: long hold (3s) during startup = setup AP mode.
@@ -2669,7 +2669,7 @@ try:
     # Use module-level _history_busy only (do not assign a local here — it shadows busy checks)
     try:
         import fc_history as _fc_history_mod
-        _hist_n = max(8, min(120, len(airports) if airports else 32))
+        _hist_n = max(8, min(130, len(airports) if airports else 32))
         fc_hist = _fc_history_mod.FlightCategoryHistory(max_airports=_hist_n)
         fc_hist.loops = HISTORY_REPLAY_LOOPS
         print("fc_history: ready (max_airports=%d, %d bytes buf)" % (_hist_n, _hist_n * 6))
@@ -2678,7 +2678,7 @@ try:
         fc_hist = None
     try:
         import fc_forecast as _fc_forecast_mod
-        _fcst_n = max(8, min(120, len(airports) if airports else 32))
+        _fcst_n = max(8, min(130, len(airports) if airports else 32))
         fc_fcst = _fc_forecast_mod.FlightCategoryForecast(max_airports=_fcst_n)
         fc_fcst.loops = HISTORY_REPLAY_LOOPS
         print("fc_forecast: ready (max_airports=%d, %d bytes buf)" % (_fcst_n, _fcst_n * 6))
@@ -3057,7 +3057,7 @@ hr{border:none;border-top:1px solid #ddd;margin:24px 0}
 
     def _airports_for_pack():
         """Airport list for history/forecast pack: active strip only, trailing blanks trimmed."""
-        n = min(len(airports), STRIP_ACTIVE_LEDS, 120)
+        n = min(len(airports), STRIP_ACTIVE_LEDS, 130)
         while n > 0 and (not airports[n - 1] or not str(airports[n - 1]).strip()):
             n -= 1
         out = airports[:n] if n > 0 else []
