@@ -242,7 +242,7 @@ class FlightCategoryForecast:
         out = {}
         if not id_list:
             return out
-        cs = 3  # small multi-id stationinfo batches
+        cs = 5  # multi-id stationinfo batches
         i = 0
         while i < len(id_list):
             if poll_callback:
@@ -396,7 +396,7 @@ class FlightCategoryForecast:
             for h in range(HOURS):
                 _set_bits(self.buf, idx, h, slots[h])
 
-    def fetch_and_pack(self, airports, poll_callback=None, limit=None, chunk_size=3):
+    def fetch_and_pack(self, airports, poll_callback=None, limit=None, chunk_size=5):
         self.state = "fetching"
         self.last_error = ""
         self.source_map = {}
@@ -508,10 +508,10 @@ class FlightCategoryForecast:
             source_idxs[src].extend(idx_for.get(apu, []))
 
         try:
-            cs = int(chunk_size) if chunk_size is not None else 3
+            cs = int(chunk_size) if chunk_size is not None else 5
         except (TypeError, ValueError):
-            cs = 3
-        cs = max(1, min(5, cs))
+            cs = 5
+        cs = max(1, min(8, cs))
 
         src_list = list(source_idxs.keys())
         ok_count = 0
