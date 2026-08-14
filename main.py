@@ -56,7 +56,7 @@ CYCLE_DELAY = 10  # Seconds between full airport list cycles; loaded from config
 # ===== FIRMWARE VERSION (for OTA update check) =====
 # Device reports this string; GitHub Pages version.json "version" must be higher to offer OTA.
 # After you flash new code, this should match what you published (or stay lower until user updates).
-FIRMWARE_VERSION = "1.1.35"
+FIRMWARE_VERSION = "1.1.36"
 
 # ===== OTA / PLAY BUTTON (GPIO) =====
 # Same pin as force-AP at boot: long hold (3s) during startup = setup AP mode.
@@ -2603,8 +2603,17 @@ try:
             update_info = version_info
             print("OTA: New version available", version_info.get("version"))
             msg_color = apply_auto_brightness((255, 140, 0))
+            # Keep OTA notice brief — a long scroll delayed METAR and could leave
+            # WiFi/SSL cold so flight-category fetch looked broken afterward.
             if led_matrix is not None and DISPLAY_TYPE == "LED_MATRIX":
-                scroll_single_text_ultra_smooth("NEW UPDATE AVAILABLE PRESS BUTTON TO INSTALL", msg_color)
+                try:
+                    show_static_matrix_text("OTA AVAIL", msg_color, hold_s=2.5)
+                except Exception as ex:
+                    print("OTA matrix banner error:", ex)
+                    try:
+                        scroll_single_text_ultra_smooth("OTA AVAILABLE", msg_color)
+                    except Exception:
+                        pass
             elif DISPLAY_TYPE == "OLED" and oled is not None:
                 try:
                     oled.fill(0)
@@ -2620,21 +2629,21 @@ try:
                         oled.text("UPDATE AVAIL", 0, 0, 1)
                         oled.text("BTN or :8080", 0, 16, 1)
                     oled.show()
-                    print("OTA: OLED — update available (6s)")
-                    time.sleep(6)
+                    print("OTA: OLED — update available (2.5s)")
+                    time.sleep(2.5)
                     oled.fill(0)
                     oled.show()
                 except Exception as ex:
                     print("OTA OLED banner error:", ex)
             elif DISPLAY_TYPE == "NONE":
-                # Strip-only: same amber as matrix scroll — full strip 10s so update is visible
+                # Strip-only: same amber as matrix — brief so METAR can start quickly
                 try:
                     for i in range(NUM_LEDS):
                         logical_colors[i] = (255, 140, 0)
                         led[i] = msg_color
                     led.write()
-                    print("OTA: strip-only — update color on all LEDs 10s (install: button or :8080)")
-                    time.sleep(10)
+                    print("OTA: strip-only — update color 2.5s (install: button or :8080)")
+                    time.sleep(2.5)
                     for i in range(NUM_LEDS):
                         logical_colors[i] = (0, 0, 0)
                         led[i] = (0, 0, 0)
@@ -2646,6 +2655,15 @@ try:
         print(e)
     except Exception as e:
         print("OTA check error:", e)
+    gc.collect()
+    # OTA HTTPS + banner can leave STA idle / heap fragmented; reconnect before METARs
+    try:
+        if ensure_wifi_connected():
+            print("OTA done — WiFi OK, starting flight-category METAR fetch…")
+        else:
+            print("OTA done — WiFi not connected; METAR fetch may fail until reconnect")
+    except Exception as _wifi_e:
+        print("OTA done — WiFi check error:", _wifi_e)
     gc.collect()
 
     # OTA HTTP on :8080 — bind NOW so browser/app work during long first/second passes (not only after).
