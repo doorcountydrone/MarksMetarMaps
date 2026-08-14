@@ -56,7 +56,7 @@ CYCLE_DELAY = 10  # Seconds between full airport list cycles; loaded from config
 # ===== FIRMWARE VERSION (for OTA update check) =====
 # Device reports this string; GitHub Pages version.json "version" must be higher to offer OTA.
 # After you flash new code, this should match what you published (or stay lower until user updates).
-FIRMWARE_VERSION = "1.1.37"
+FIRMWARE_VERSION = "1.1.38"
 
 # ===== OTA / PLAY BUTTON (GPIO) =====
 # Same pin as force-AP at boot: long hold (3s) during startup = setup AP mode.
@@ -2611,15 +2611,15 @@ try:
             update_info = version_info
             print("OTA: New version available", version_info.get("version"))
             msg_color = apply_auto_brightness((255, 140, 0))
-            # Keep OTA notice brief — a long scroll delayed METAR and could leave
-            # WiFi/SSL cold so flight-category fetch looked broken afterward.
+            # Brief banner then CLEAR matrix — leaving static text looked like a hang.
             if led_matrix is not None and DISPLAY_TYPE == "LED_MATRIX":
                 try:
-                    show_static_matrix_text("OTA AVAIL", msg_color, hold_s=2.5)
+                    show_play_mode_banner("OTA", hold_s=1.5)
                 except Exception as ex:
                     print("OTA matrix banner error:", ex)
                     try:
-                        scroll_single_text_ultra_smooth("OTA AVAILABLE", msg_color)
+                        led_matrix.fill((0, 0, 0))
+                        led_matrix.write()
                     except Exception:
                         pass
             elif DISPLAY_TYPE == "OLED" and oled is not None:
