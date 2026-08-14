@@ -56,7 +56,7 @@ CYCLE_DELAY = 10  # Seconds between full airport list cycles; loaded from config
 # ===== FIRMWARE VERSION (for OTA update check) =====
 # Device reports this string; GitHub Pages version.json "version" must be higher to offer OTA.
 # After you flash new code, this should match what you published (or stay lower until user updates).
-FIRMWARE_VERSION = "1.1.34"
+FIRMWARE_VERSION = "1.1.35"
 
 # ===== OTA / PLAY BUTTON (GPIO) =====
 # Same pin as force-AP at boot: long hold (3s) during startup = setup AP mode.
@@ -2835,6 +2835,8 @@ hr{border:none;border-top:1px solid #ddd;margin:24px 0}
             "weekend_on_weekday": int(cfg.get("weekend_on_weekday", 0)),
             "weekend_on_hour": int(cfg.get("weekend_on_hour", 6)),
             "weekend_on_minute": int(cfg.get("weekend_on_minute", 0)),
+            "firmware_version": FIRMWARE_VERSION,
+            "update_available": bool(update_available),
         }
         return json.dumps(out)
 
