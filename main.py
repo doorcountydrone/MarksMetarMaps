@@ -56,7 +56,7 @@ CYCLE_DELAY = 10  # Seconds between full airport list cycles; loaded from config
 # ===== FIRMWARE VERSION (for OTA update check) =====
 # Device reports this string; GitHub Pages version.json "version" must be higher to offer OTA.
 # After you flash new code, this should match what you published (or stay lower until user updates).
-FIRMWARE_VERSION = "1.1.38"
+FIRMWARE_VERSION = "1.1.39"
 
 # ===== OTA / PLAY BUTTON (GPIO) =====
 # Same pin as force-AP at boot: long hold (3s) during startup = setup AP mode.
@@ -1734,9 +1734,10 @@ BULK_SSL_EXTRA_TRIES = 2  # fewer than live single-airport path — keep startup
 BULK_SSL_RETRY_DELAY = 2
 
 
-def fetch_all_metars_once(airports):
+def fetch_all_metars_once(airports, on_chunk=None):
     """Fetch METARs for all airports in chunked requests. Returns list of (flight_category, raw_text) per index.
-    Failed chunks are skipped (holes filled later); never aborts the whole bulk on one bad chunk."""
+    Failed chunks are skipped (holes filled later); never aborts the whole bulk on one bad chunk.
+    on_chunk(results, chunk_start, chunk_end) optional — paint LEDs as each chunk arrives."""
     n = min(len(airports), 480)
     if n == 0:
         return []
@@ -1795,6 +1796,11 @@ def fetch_all_metars_once(airports):
                     time.sleep(BULK_SSL_RETRY_DELAY)
                 else:
                     break
+        if chunk_ok and on_chunk is not None:
+            try:
+                on_chunk(results, chunk_start, chunk_end)
+            except Exception as _oc_e:
+                print("Bulk METAR on_chunk:", _oc_e)
         if not chunk_ok:
             failed_chunks += 1
             print("Bulk METAR: skipping failed chunk {}–{}; continuing".format(chunk_start, chunk_end - 1))
@@ -3919,22 +3925,45 @@ hr{border:none;border-top:1px solid #ddd;margin:24px 0}
     current_ldr_brightness = map_ldr_to_brightness(read_ldr_value(), MIN_BRIGHTNESS, MAX_BRIGHTNESS)
     last_ldr_refresh_time = time.time()
     bulk_ok = False
+
+    def _paint_bulk_chunk(results, start, end):
+        """Light LEDs as each bulk METAR chunk arrives (map fills progressively)."""
+        if MATRIX_ONLY or led is None:
+            return
+        n = min(len(airports), len(results), STRIP_ACTIVE_LEDS)
+        a = max(0, min(int(start), n))
+        b = max(a, min(int(end), n))
+        any_set = False
+        for index in range(a, b):
+            fc, raw = results[index]
+            if fc and airports[index] and str(airports[index]).strip():
+                update_wx_interest(index, raw)
+                set_led_color(led, fc, index, MIN_BRIGHTNESS, MAX_BRIGHTNESS)
+                any_set = True
+        if any_set:
+            led.write()
+            update_data_success()
+            print("Bulk METAR: lit LEDs %d–%d" % (a, b - 1))
+
     if not MATRIX_ONLY:
         print("Startup: bulk METAR fetch for flight categories…")
-        bulk_results = fetch_all_metars_once(airports)
+        # Do not service history during bulk — packs wait until after second pass
+        bulk_results = fetch_all_metars_once(airports, on_chunk=_paint_bulk_chunk)
         if bulk_results:
             n = min(len(airports), len(bulk_results), STRIP_ACTIVE_LEDS)
-            # Gap-fill holes only (failed/missing from bulk) — quick path
             for index in range(n):
                 if (bulk_results[index][0] is None or bulk_results[index][1] is None) and airports[index] and airports[index].strip():
                     fc, raw = get_metar_data_with_retry(airports[index], quick=True)
                     if fc is not None:
                         bulk_results[index] = (fc, raw or bulk_results[index][1])
+                        update_wx_interest(index, raw)
+                        set_led_color(led, fc, index, MIN_BRIGHTNESS, MAX_BRIGHTNESS)
                         update_data_success()
+                        led.write()
                     gc.collect()
                     time.sleep(0.02)
                 if (index & 7) == 0:
-                    service_ota_http_and_button()
+                    service_ota_http_and_button(run_pending_history=False)
             any_set = False
             for index in range(n):
                 fc, raw = bulk_results[index]
@@ -3950,7 +3979,7 @@ hr{border:none;border-top:1px solid #ddd;margin:24px 0}
                 update_data_success()
                 bulk_ok = True
                 print("All airport LEDs set from bulk fetch (displaying 1s)")
-                sleep_with_ota_poll(1)
+                sleep_with_ota_poll(1, run_pending_history=False)
             clear_unused_strip_leds(len(airports))
     startup_sleep_hit = False
     if not bulk_ok:
@@ -3959,25 +3988,21 @@ hr{border:none;border-top:1px solid #ddd;margin:24px 0}
                 airports,
                 process_first_pass,
                 description="First pass",
-                poll_callback=service_ota_http_and_button,
+                poll_callback=lambda: service_ota_http_and_button(run_pending_history=False),
             )
-    # Skip full WX second-pass tour when bulk already lit the strip — with ~120 airports
-    # that tour (5s+ animations each) can take tens of minutes. Main loop still plays effects.
-    if not startup_sleep_hit and not bulk_ok:
+    # Always run second-pass WX tour (unless sleep), then history/forecast packs after that.
+    if not startup_sleep_hit:
         startup_sleep_hit = process_airports_in_batches(
             airports,
             process_second_pass,
             description="Second pass",
-            poll_callback=service_ota_http_and_button,
+            poll_callback=lambda: service_ota_http_and_button(run_pending_history=False),
         )
-    elif bulk_ok and not startup_sleep_hit:
-        print("Startup: strip lit via bulk — skipping second-pass WX tour (effects in main loop)")
     if startup_sleep_hit:
         print("Startup METAR passes paused for sleep window; entering scheduler loop")
     clear_unused_strip_leds(len(airports))
 
-    # Queue history/forecast packs; do not block here — main loop services them so the map
-    # stays responsive after categories are shown (120 airports = many minutes of pack fetch).
+    # Past/future packs ONLY after second pass (or after sleep defer) — not as soon as strip lights.
     _defer_hist_fcst = bool(startup_sleep_hit) or sleep_applies_to_displays_now()
     if fc_hist is not None:
         fc_hist.request_refresh()
@@ -3985,18 +4010,28 @@ hr{border:none;border-top:1px solid #ddd;margin:24px 0}
             "fc_history: startup 24h pack queued; auto-refresh every %ds%s"
             % (
                 HISTORY_REFRESH_INTERVAL_S,
-                " (deferred until wake)" if _defer_hist_fcst else " (background in main loop)",
+                " (deferred until wake)" if _defer_hist_fcst else " (after second pass)",
             )
         )
+        if not _defer_hist_fcst:
+            try:
+                service_history_pending()
+            except Exception as _ih_e:
+                print("fc_history initial pack:", _ih_e)
     if fc_fcst is not None:
         fc_fcst.request_refresh()
         print(
             "fc_forecast: startup TAF pack queued; auto-refresh every %ds%s"
             % (
                 FORECAST_REFRESH_INTERVAL_S,
-                " (deferred until wake)" if _defer_hist_fcst else " (background in main loop)",
+                " (deferred until wake)" if _defer_hist_fcst else " (after second pass)",
             )
         )
+        if not _defer_hist_fcst:
+            try:
+                service_history_pending()
+            except Exception as _if_e:
+                print("fc_forecast initial pack:", _if_e)
 
     # NTP sync once for sleep schedule (local_time() = gmtime(utc + offset))
     ntptime_synced = False
