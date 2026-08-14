@@ -56,7 +56,7 @@ CYCLE_DELAY = 10  # Seconds between full airport list cycles; loaded from config
 # ===== FIRMWARE VERSION (for OTA update check) =====
 # Device reports this string; GitHub Pages version.json "version" must be higher to offer OTA.
 # After you flash new code, this should match what you published (or stay lower until user updates).
-FIRMWARE_VERSION = "1.1.36"
+FIRMWARE_VERSION = "1.1.37"
 
 # ===== OTA / PLAY BUTTON (GPIO) =====
 # Same pin as force-AP at boot: long hold (3s) during startup = setup AP mode.
@@ -1730,11 +1730,13 @@ def get_metar_data_with_retry(airport, quick=False):
     return None, None
 
 BULK_CHUNK_SIZE = 20  # airports per request; smaller = more reliable full response
+BULK_SSL_EXTRA_TRIES = 2  # fewer than live single-airport path — keep startup fast
+BULK_SSL_RETRY_DELAY = 2
+
 
 def fetch_all_metars_once(airports):
-    """Fetch METARs for all airports in chunked requests. Returns list of (flight_category, raw_text) per index, or None on failure.
-    Uses order=ids so response order matches our list."""
-    # Fetch METARs for all list entries (matrix scroll may need airports past strip active count).
+    """Fetch METARs for all airports in chunked requests. Returns list of (flight_category, raw_text) per index.
+    Failed chunks are skipped (holes filled later); never aborts the whole bulk on one bad chunk."""
     n = min(len(airports), 480)
     if n == 0:
         return []
@@ -1742,6 +1744,7 @@ def fetch_all_metars_once(airports):
     chunk_start = 0
     total_got = 0
     total_requested = 0
+    failed_chunks = 0
     while chunk_start < n:
         chunk_end = min(chunk_start + BULK_CHUNK_SIZE, n)
         chunk_airports = [airports[i].strip() for i in range(chunk_start, chunk_end) if airports[i] and airports[i].strip()]
@@ -1751,7 +1754,7 @@ def fetch_all_metars_once(airports):
             continue
         ids = ",".join(chunk_airports)
         chunk_ok = False
-        for ssl_attempt in range(SSL_EOF_MAX_EXTRA_TRIES + 1):  # extra tries on SSL EOF (hotspot/cellular)
+        for ssl_attempt in range(BULK_SSL_EXTRA_TRIES + 1):
             try:
                 gc.collect()
                 url = "https://aviationweather.gov/api/data/metar?ids={}&hours=1&format=raw&order=ids".format(ids)
@@ -1787,19 +1790,24 @@ def fetch_all_metars_once(airports):
             except Exception as e:
                 print("Bulk METAR chunk failed ({}–{}): {}".format(chunk_start, chunk_end, e))
                 gc.collect()
-                if _is_ssl_eof(e) and ssl_attempt < SSL_EOF_MAX_EXTRA_TRIES:
-                    print("SSL closed (hotspot/cellular), chunk retry {} in {}s...".format(ssl_attempt + 1, SSL_EOF_RETRY_DELAY))
-                    time.sleep(SSL_EOF_RETRY_DELAY)
+                if _is_ssl_eof(e) and ssl_attempt < BULK_SSL_EXTRA_TRIES:
+                    print("SSL closed (hotspot/cellular), chunk retry {} in {}s...".format(ssl_attempt + 1, BULK_SSL_RETRY_DELAY))
+                    time.sleep(BULK_SSL_RETRY_DELAY)
                 else:
-                    return None
+                    break
         if not chunk_ok:
-            return None
+            failed_chunks += 1
+            print("Bulk METAR: skipping failed chunk {}–{}; continuing".format(chunk_start, chunk_end - 1))
         chunk_start = chunk_end
         if chunk_start < n:
-            time.sleep(0.5)
+            time.sleep(0.15)
     missing = total_requested - total_got
-    if missing > 0:
-        print("Bulk METAR fetch: got {} of {} requested ({} slots). {} missing from API for this chunk; will fetch individually.".format(total_got, total_requested, n, missing))
+    if missing > 0 or failed_chunks:
+        print(
+            "Bulk METAR fetch: got {} of {} requested ({} slots), failed_chunks={}, missing={}; gap-fill individually.".format(
+                total_got, total_requested, n, failed_chunks, missing
+            )
+        )
     else:
         print("Bulk METAR fetch: got {} of {} airports".format(total_got, n))
     return results
@@ -3912,19 +3920,21 @@ hr{border:none;border-top:1px solid #ddd;margin:24px 0}
     last_ldr_refresh_time = time.time()
     bulk_ok = False
     if not MATRIX_ONLY:
+        print("Startup: bulk METAR fetch for flight categories…")
         bulk_results = fetch_all_metars_once(airports)
         if bulk_results:
             n = min(len(airports), len(bulk_results), STRIP_ACTIVE_LEDS)
+            # Gap-fill holes only (failed/missing from bulk) — quick path
             for index in range(n):
                 if (bulk_results[index][0] is None or bulk_results[index][1] is None) and airports[index] and airports[index].strip():
-                    # Same quick path as process_first_pass: no SSL backoff / no extra sleep — bulk already tried these
                     fc, raw = get_metar_data_with_retry(airports[index], quick=True)
                     if fc is not None:
                         bulk_results[index] = (fc, raw or bulk_results[index][1])
                         update_data_success()
                     gc.collect()
-                    time.sleep(0.05)
-                service_ota_http_and_button()
+                    time.sleep(0.02)
+                if (index & 7) == 0:
+                    service_ota_http_and_button()
             any_set = False
             for index in range(n):
                 fc, raw = bulk_results[index]
@@ -3939,9 +3949,8 @@ hr{border:none;border-top:1px solid #ddd;margin:24px 0}
             if any_set:
                 update_data_success()
                 bulk_ok = True
-                print("All airport LEDs set from bulk fetch (displaying 3s)")
-                sleep_with_ota_poll(3)
-            # Always clear pixels past airport count (bulk only updates 0..n-1; tail kept startup gray)
+                print("All airport LEDs set from bulk fetch (displaying 1s)")
+                sleep_with_ota_poll(1)
             clear_unused_strip_leds(len(airports))
     startup_sleep_hit = False
     if not bulk_ok:
@@ -3952,19 +3961,23 @@ hr{border:none;border-top:1px solid #ddd;margin:24px 0}
                 description="First pass",
                 poll_callback=service_ota_http_and_button,
             )
-    if not startup_sleep_hit:
+    # Skip full WX second-pass tour when bulk already lit the strip — with ~120 airports
+    # that tour (5s+ animations each) can take tens of minutes. Main loop still plays effects.
+    if not startup_sleep_hit and not bulk_ok:
         startup_sleep_hit = process_airports_in_batches(
             airports,
             process_second_pass,
             description="Second pass",
             poll_callback=service_ota_http_and_button,
         )
+    elif bulk_ok and not startup_sleep_hit:
+        print("Startup: strip lit via bulk — skipping second-pass WX tour (effects in main loop)")
     if startup_sleep_hit:
         print("Startup METAR passes paused for sleep window; entering scheduler loop")
     clear_unused_strip_leds(len(airports))
 
-    # Download+pack 24h history/forecast after METAR passes — but do not block sleep.
-    # If startup hit the sleep window, only queue; main loop runs the fetch after wake.
+    # Queue history/forecast packs; do not block here — main loop services them so the map
+    # stays responsive after categories are shown (120 airports = many minutes of pack fetch).
     _defer_hist_fcst = bool(startup_sleep_hit) or sleep_applies_to_displays_now()
     if fc_hist is not None:
         fc_hist.request_refresh()
@@ -3972,28 +3985,18 @@ hr{border:none;border-top:1px solid #ddd;margin:24px 0}
             "fc_history: startup 24h pack queued; auto-refresh every %ds%s"
             % (
                 HISTORY_REFRESH_INTERVAL_S,
-                " (deferred until wake)" if _defer_hist_fcst else "",
+                " (deferred until wake)" if _defer_hist_fcst else " (background in main loop)",
             )
         )
-        if not _defer_hist_fcst:
-            try:
-                service_history_pending()
-            except Exception as _ih_e:
-                print("fc_history initial pack:", _ih_e)
     if fc_fcst is not None:
         fc_fcst.request_refresh()
         print(
             "fc_forecast: startup TAF pack queued; auto-refresh every %ds%s"
             % (
                 FORECAST_REFRESH_INTERVAL_S,
-                " (deferred until wake)" if _defer_hist_fcst else "",
+                " (deferred until wake)" if _defer_hist_fcst else " (background in main loop)",
             )
         )
-        if not _defer_hist_fcst:
-            try:
-                service_history_pending()
-            except Exception as _if_e:
-                print("fc_forecast initial pack:", _if_e)
 
     # NTP sync once for sleep schedule (local_time() = gmtime(utc + offset))
     ntptime_synced = False
