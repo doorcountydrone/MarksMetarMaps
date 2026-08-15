@@ -56,7 +56,7 @@ CYCLE_DELAY = 10  # Seconds between full airport list cycles; loaded from config
 # ===== FIRMWARE VERSION (for OTA update check) =====
 # Device reports this string; GitHub Pages version.json "version" must be higher to offer OTA.
 # After you flash new code, this should match what you published (or stay lower until user updates).
-FIRMWARE_VERSION = "1.1.41"
+FIRMWARE_VERSION = "1.1.42"
 
 # ===== OTA / PLAY BUTTON (GPIO) =====
 # Same pin as force-AP at boot: long hold (3s) during startup = setup AP mode.
@@ -2629,7 +2629,7 @@ try:
         except Exception:
             update_button = None
 
-    # Version check moved to after :8080 + service_ota are ready (no matrix banner — it locked boots)
+    # Version check + scroll run after :8080 + service_ota are ready (below)
 
     fc_hist = None
     fc_fcst = None
@@ -3858,8 +3858,7 @@ hr{border:none;border-top:1px solid #ddd;margin:24px 0}
             time.sleep(chunk)
             remaining -= chunk
 
-    # OTA version check AFTER :8080 + button service exist.
-    # No matrix text / no long wait — that caused lockups. Tap button anytime to install.
+    # OTA version check AFTER :8080 + button service exist (scroll can poll install via hook).
     print("OTA: checking for newer firmware...")
     try:
         import updater
@@ -3869,7 +3868,54 @@ hr{border:none;border-top:1px solid #ddd;margin:24px 0}
             update_available = True
             update_info = version_info
             print("OTA: New version available", version_info.get("version"))
-            print("OTA: Tap button or http://<pico-ip>:8080 Install to update (continuing boot)")
+            print("OTA: Tap button or http://<pico-ip>:8080 to install")
+            msg_color = apply_auto_brightness((255, 140, 0))
+            if led_matrix is not None and DISPLAY_TYPE == "LED_MATRIX":
+                try:
+                    # Classic scroll — hook is live so tap during scroll can still start install
+                    scroll_single_text_ultra_smooth(
+                        "UPDATE AVAILABLE PRESS BUTTON TO INSTALL", msg_color
+                    )
+                except Exception as ex:
+                    print("OTA matrix scroll error:", ex)
+                try:
+                    led_matrix.fill((0, 0, 0))
+                    led_matrix.write()
+                except Exception:
+                    pass
+            elif DISPLAY_TYPE == "OLED" and oled is not None:
+                try:
+                    oled.fill(0)
+                    if fonts_available:
+                        wu = writer.Writer(oled, sans18)
+                        wu.set_textpos(0, 0)
+                        wu.printstring("UPDATE")
+                        wu.set_textpos(0, 20)
+                        wu.printstring("AVAILABLE")
+                        wu.set_textpos(0, 40)
+                        wu.printstring("BTN / :8080")
+                    else:
+                        oled.text("UPDATE AVAIL", 0, 0, 1)
+                        oled.text("BTN or :8080", 0, 16, 1)
+                    oled.show()
+                    sleep_with_ota_poll(4, run_pending_history=False)
+                    oled.fill(0)
+                    oled.show()
+                except Exception as ex:
+                    print("OTA OLED banner error:", ex)
+            elif DISPLAY_TYPE == "NONE" and led is not None and not MATRIX_ONLY:
+                try:
+                    for i in range(NUM_LEDS):
+                        logical_colors[i] = (255, 140, 0)
+                        led[i] = msg_color
+                    led.write()
+                    sleep_with_ota_poll(3, run_pending_history=False)
+                    for i in range(NUM_LEDS):
+                        logical_colors[i] = (0, 0, 0)
+                        led[i] = (0, 0, 0)
+                    led.write()
+                except Exception as ex:
+                    print("OTA strip banner error:", ex)
         else:
             print("OTA: device firmware current (or check unreachable)")
     except SyntaxError as e:
