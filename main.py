@@ -56,7 +56,7 @@ CYCLE_DELAY = 10  # Seconds between full airport list cycles; loaded from config
 # ===== FIRMWARE VERSION (for OTA update check) =====
 # Device reports this string; GitHub Pages version.json "version" must be higher to offer OTA.
 # After you flash new code, this should match what you published (or stay lower until user updates).
-FIRMWARE_VERSION = "1.1.40"
+FIRMWARE_VERSION = "1.1.41"
 
 # ===== OTA / PLAY BUTTON (GPIO) =====
 # Same pin as force-AP at boot: long hold (3s) during startup = setup AP mode.
@@ -3858,7 +3858,8 @@ hr{border:none;border-top:1px solid #ddd;margin:24px 0}
             time.sleep(chunk)
             remaining -= chunk
 
-    # OTA version check AFTER :8080 + button service exist — no matrix banner (that locked boots).
+    # OTA version check AFTER :8080 + button service exist.
+    # No matrix text / no long wait — that caused lockups. Tap button anytime to install.
     print("OTA: checking for newer firmware...")
     try:
         import updater
@@ -3868,30 +3869,7 @@ hr{border:none;border-top:1px solid #ddd;margin:24px 0}
             update_available = True
             update_info = version_info
             print("OTA: New version available", version_info.get("version"))
-            print("OTA: Tap button or open http://<pico-ip>:8080 within 8s to install")
-            try:
-                if led is not None and not MATRIX_ONLY:
-                    c = apply_auto_brightness((255, 140, 0))
-                    for i in range(min(8, NUM_LEDS)):
-                        led[i] = c
-                    led.write()
-            except Exception:
-                pass
-            # Poll button/HTTP so Install works before long METAR/history work
-            sleep_with_ota_poll(8, run_pending_history=False)
-            try:
-                if led is not None and not MATRIX_ONLY:
-                    for i in range(min(8, NUM_LEDS)):
-                        led[i] = (0, 0, 0)
-                    led.write()
-            except Exception:
-                pass
-            try:
-                if led_matrix is not None:
-                    led_matrix.fill((0, 0, 0))
-                    led_matrix.write()
-            except Exception:
-                pass
+            print("OTA: Tap button or http://<pico-ip>:8080 Install to update (continuing boot)")
         else:
             print("OTA: device firmware current (or check unreachable)")
     except SyntaxError as e:
@@ -3929,9 +3907,11 @@ hr{border:none;border-top:1px solid #ddd;margin:24px 0}
             update_data_success()
             print("Bulk METAR: lit LEDs %d–%d" % (a, b - 1))
 
+    def _poll_ota_no_hist():
+        service_ota_http_and_button(run_pending_history=False)
+
     if not MATRIX_ONLY:
         print("Startup: bulk METAR fetch for flight categories…")
-        # Do not service history during bulk — packs wait until after second pass
         bulk_results = fetch_all_metars_once(airports, on_chunk=_paint_bulk_chunk)
         if bulk_results:
             n = min(len(airports), len(bulk_results), STRIP_ACTIVE_LEDS)
@@ -3947,7 +3927,7 @@ hr{border:none;border-top:1px solid #ddd;margin:24px 0}
                     gc.collect()
                     time.sleep(0.02)
                 if (index & 7) == 0:
-                    service_ota_http_and_button(run_pending_history=False)
+                    _poll_ota_no_hist()
             any_set = False
             for index in range(n):
                 fc, raw = bulk_results[index]
@@ -3972,21 +3952,24 @@ hr{border:none;border-top:1px solid #ddd;margin:24px 0}
                 airports,
                 process_first_pass,
                 description="First pass",
-                poll_callback=lambda: service_ota_http_and_button(run_pending_history=False),
+                poll_callback=_poll_ota_no_hist,
             )
-    # Always run second-pass WX tour (unless sleep), then history/forecast packs after that.
-    if not startup_sleep_hit:
+    # Second pass = per-airport WX animations. With ~120 airports that takes very long.
+    # When bulk already lit the strip, skip it; main loop still does weather effects.
+    if not startup_sleep_hit and not bulk_ok:
         startup_sleep_hit = process_airports_in_batches(
             airports,
             process_second_pass,
             description="Second pass",
-            poll_callback=lambda: service_ota_http_and_button(run_pending_history=False),
+            poll_callback=_poll_ota_no_hist,
         )
+    elif bulk_ok and not startup_sleep_hit:
+        print("Startup: strip lit via bulk — skipping long second-pass WX tour")
     if startup_sleep_hit:
         print("Startup METAR passes paused for sleep window; entering scheduler loop")
     clear_unused_strip_leds(len(airports))
 
-    # Past/future packs ONLY after second pass (or after sleep defer) — not as soon as strip lights.
+    # Past/future after METAR startup work (after second pass if it ran; else after bulk)
     _defer_hist_fcst = bool(startup_sleep_hit) or sleep_applies_to_displays_now()
     if fc_hist is not None:
         fc_hist.request_refresh()
@@ -3994,7 +3977,7 @@ hr{border:none;border-top:1px solid #ddd;margin:24px 0}
             "fc_history: startup 24h pack queued; auto-refresh every %ds%s"
             % (
                 HISTORY_REFRESH_INTERVAL_S,
-                " (deferred until wake)" if _defer_hist_fcst else " (after second pass)",
+                " (deferred until wake)" if _defer_hist_fcst else "",
             )
         )
         if not _defer_hist_fcst:
@@ -4008,7 +3991,7 @@ hr{border:none;border-top:1px solid #ddd;margin:24px 0}
             "fc_forecast: startup TAF pack queued; auto-refresh every %ds%s"
             % (
                 FORECAST_REFRESH_INTERVAL_S,
-                " (deferred until wake)" if _defer_hist_fcst else " (after second pass)",
+                " (deferred until wake)" if _defer_hist_fcst else "",
             )
         )
         if not _defer_hist_fcst:
