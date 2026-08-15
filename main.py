@@ -56,7 +56,7 @@ CYCLE_DELAY = 10  # Seconds between full airport list cycles; loaded from config
 # ===== FIRMWARE VERSION (for OTA update check) =====
 # Device reports this string; GitHub Pages version.json "version" must be higher to offer OTA.
 # After you flash new code, this should match what you published (or stay lower until user updates).
-FIRMWARE_VERSION = "1.1.39"
+FIRMWARE_VERSION = "1.1.40"
 
 # ===== OTA / PLAY BUTTON (GPIO) =====
 # Same pin as force-AP at boot: long hold (3s) during startup = setup AP mode.
@@ -2606,81 +2606,15 @@ def process_main_loop_batch(batch_airports, batch_start_index, poll_callback=Non
     return any_data_received, sleep_hit
 
 try:
-    # OTA: check before long METAR batches so serial shows result within seconds of WiFi
-    print("OTA: checking GitHub Pages for newer firmware...")
+    # Clear leftover matrix text from older firmwares (stuck "OTA AV" / "OTA AVAIL")
     try:
-        import updater
-        gc.collect()
-        has_update, version_info = updater.check_for_new_version(FIRMWARE_VERSION)
-        if has_update and version_info:
-            update_available = True
-            update_info = version_info
-            print("OTA: New version available", version_info.get("version"))
-            msg_color = apply_auto_brightness((255, 140, 0))
-            # Brief banner then CLEAR matrix — leaving static text looked like a hang.
-            if led_matrix is not None and DISPLAY_TYPE == "LED_MATRIX":
-                try:
-                    show_play_mode_banner("OTA", hold_s=1.5)
-                except Exception as ex:
-                    print("OTA matrix banner error:", ex)
-                    try:
-                        led_matrix.fill((0, 0, 0))
-                        led_matrix.write()
-                    except Exception:
-                        pass
-            elif DISPLAY_TYPE == "OLED" and oled is not None:
-                try:
-                    oled.fill(0)
-                    if fonts_available:
-                        wu = writer.Writer(oled, sans18)
-                        wu.set_textpos(0, 0)
-                        wu.printstring("UPDATE")
-                        wu.set_textpos(0, 20)
-                        wu.printstring("AVAILABLE")
-                        wu.set_textpos(0, 40)
-                        wu.printstring("BTN / :8080")
-                    else:
-                        oled.text("UPDATE AVAIL", 0, 0, 1)
-                        oled.text("BTN or :8080", 0, 16, 1)
-                    oled.show()
-                    print("OTA: OLED — update available (2.5s)")
-                    time.sleep(2.5)
-                    oled.fill(0)
-                    oled.show()
-                except Exception as ex:
-                    print("OTA OLED banner error:", ex)
-            elif DISPLAY_TYPE == "NONE":
-                # Strip-only: same amber as matrix — brief so METAR can start quickly
-                try:
-                    for i in range(NUM_LEDS):
-                        logical_colors[i] = (255, 140, 0)
-                        led[i] = msg_color
-                    led.write()
-                    print("OTA: strip-only — update color 2.5s (install: button or :8080)")
-                    time.sleep(2.5)
-                    for i in range(NUM_LEDS):
-                        logical_colors[i] = (0, 0, 0)
-                        led[i] = (0, 0, 0)
-                    led.write()
-                except Exception as ex:
-                    print("OTA strip banner error:", ex)
-    except SyntaxError as e:
-        print("OTA check error: invalid syntax in updater.py — re-copy pico/updater.py to the Pico.")
-        print(e)
-    except Exception as e:
-        print("OTA check error:", e)
-    gc.collect()
-    # OTA HTTPS + banner can leave STA idle / heap fragmented; reconnect before METARs
-    try:
-        if ensure_wifi_connected():
-            print("OTA done — WiFi OK, starting flight-category METAR fetch…")
-        else:
-            print("OTA done — WiFi not connected; METAR fetch may fail until reconnect")
-    except Exception as _wifi_e:
-        print("OTA done — WiFi check error:", _wifi_e)
-    gc.collect()
+        if led_matrix is not None:
+            led_matrix.fill((0, 0, 0))
+            led_matrix.write()
+    except Exception:
+        pass
 
-    # OTA HTTP on :8080 — bind NOW so browser/app work during long first/second passes (not only after).
+    # Button IRQ first — must work before any long OTA/METAR work
     update_button = None
     if UPDATE_BUTTON_PIN >= 0:
         try:
@@ -2694,6 +2628,8 @@ try:
                 print("OTA GPIO IRQ (button still polled):", irq_e)
         except Exception:
             update_button = None
+
+    # Version check moved to after :8080 + service_ota are ready (no matrix banner — it locked boots)
 
     fc_hist = None
     fc_fcst = None
@@ -3921,6 +3857,54 @@ hr{border:none;border-top:1px solid #ddd;margin:24px 0}
             chunk = 0.25 if remaining >= 0.25 else remaining
             time.sleep(chunk)
             remaining -= chunk
+
+    # OTA version check AFTER :8080 + button service exist — no matrix banner (that locked boots).
+    print("OTA: checking for newer firmware...")
+    try:
+        import updater
+        gc.collect()
+        has_update, version_info = updater.check_for_new_version(FIRMWARE_VERSION)
+        if has_update and version_info:
+            update_available = True
+            update_info = version_info
+            print("OTA: New version available", version_info.get("version"))
+            print("OTA: Tap button or open http://<pico-ip>:8080 within 8s to install")
+            try:
+                if led is not None and not MATRIX_ONLY:
+                    c = apply_auto_brightness((255, 140, 0))
+                    for i in range(min(8, NUM_LEDS)):
+                        led[i] = c
+                    led.write()
+            except Exception:
+                pass
+            # Poll button/HTTP so Install works before long METAR/history work
+            sleep_with_ota_poll(8, run_pending_history=False)
+            try:
+                if led is not None and not MATRIX_ONLY:
+                    for i in range(min(8, NUM_LEDS)):
+                        led[i] = (0, 0, 0)
+                    led.write()
+            except Exception:
+                pass
+            try:
+                if led_matrix is not None:
+                    led_matrix.fill((0, 0, 0))
+                    led_matrix.write()
+            except Exception:
+                pass
+        else:
+            print("OTA: device firmware current (or check unreachable)")
+    except SyntaxError as e:
+        print("OTA check error: invalid syntax in updater.py — re-copy pico/updater.py to the Pico.")
+        print(e)
+    except Exception as e:
+        print("OTA check error:", e)
+    gc.collect()
+    try:
+        ensure_wifi_connected()
+    except Exception:
+        pass
+    gc.collect()
 
     current_ldr_brightness = map_ldr_to_brightness(read_ldr_value(), MIN_BRIGHTNESS, MAX_BRIGHTNESS)
     last_ldr_refresh_time = time.time()
