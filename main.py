@@ -56,7 +56,7 @@ CYCLE_DELAY = 10  # Seconds between full airport list cycles; loaded from config
 # ===== FIRMWARE VERSION (for OTA update check) =====
 # Device reports this string; GitHub Pages version.json "version" must be higher to offer OTA.
 # After you flash new code, this should match what you published (or stay lower until user updates).
-FIRMWARE_VERSION = "1.1.43"
+FIRMWARE_VERSION = "1.1.34"
 
 # ===== OTA / PLAY BUTTON (GPIO) =====
 # Same pin as force-AP at boot: long hold (3s) during startup = setup AP mode.
@@ -1730,14 +1730,11 @@ def get_metar_data_with_retry(airport, quick=False):
     return None, None
 
 BULK_CHUNK_SIZE = 20  # airports per request; smaller = more reliable full response
-BULK_SSL_EXTRA_TRIES = 2  # fewer than live single-airport path — keep startup fast
-BULK_SSL_RETRY_DELAY = 2
 
-
-def fetch_all_metars_once(airports, on_chunk=None):
-    """Fetch METARs for all airports in chunked requests. Returns list of (flight_category, raw_text) per index.
-    Failed chunks are skipped (holes filled later); never aborts the whole bulk on one bad chunk.
-    on_chunk(results, chunk_start, chunk_end) optional — paint LEDs as each chunk arrives."""
+def fetch_all_metars_once(airports):
+    """Fetch METARs for all airports in chunked requests. Returns list of (flight_category, raw_text) per index, or None on failure.
+    Uses order=ids so response order matches our list."""
+    # Fetch METARs for all list entries (matrix scroll may need airports past strip active count).
     n = min(len(airports), 480)
     if n == 0:
         return []
@@ -1745,7 +1742,6 @@ def fetch_all_metars_once(airports, on_chunk=None):
     chunk_start = 0
     total_got = 0
     total_requested = 0
-    failed_chunks = 0
     while chunk_start < n:
         chunk_end = min(chunk_start + BULK_CHUNK_SIZE, n)
         chunk_airports = [airports[i].strip() for i in range(chunk_start, chunk_end) if airports[i] and airports[i].strip()]
@@ -1755,7 +1751,7 @@ def fetch_all_metars_once(airports, on_chunk=None):
             continue
         ids = ",".join(chunk_airports)
         chunk_ok = False
-        for ssl_attempt in range(BULK_SSL_EXTRA_TRIES + 1):
+        for ssl_attempt in range(SSL_EOF_MAX_EXTRA_TRIES + 1):  # extra tries on SSL EOF (hotspot/cellular)
             try:
                 gc.collect()
                 url = "https://aviationweather.gov/api/data/metar?ids={}&hours=1&format=raw&order=ids".format(ids)
@@ -1791,29 +1787,19 @@ def fetch_all_metars_once(airports, on_chunk=None):
             except Exception as e:
                 print("Bulk METAR chunk failed ({}–{}): {}".format(chunk_start, chunk_end, e))
                 gc.collect()
-                if _is_ssl_eof(e) and ssl_attempt < BULK_SSL_EXTRA_TRIES:
-                    print("SSL closed (hotspot/cellular), chunk retry {} in {}s...".format(ssl_attempt + 1, BULK_SSL_RETRY_DELAY))
-                    time.sleep(BULK_SSL_RETRY_DELAY)
+                if _is_ssl_eof(e) and ssl_attempt < SSL_EOF_MAX_EXTRA_TRIES:
+                    print("SSL closed (hotspot/cellular), chunk retry {} in {}s...".format(ssl_attempt + 1, SSL_EOF_RETRY_DELAY))
+                    time.sleep(SSL_EOF_RETRY_DELAY)
                 else:
-                    break
-        if chunk_ok and on_chunk is not None:
-            try:
-                on_chunk(results, chunk_start, chunk_end)
-            except Exception as _oc_e:
-                print("Bulk METAR on_chunk:", _oc_e)
+                    return None
         if not chunk_ok:
-            failed_chunks += 1
-            print("Bulk METAR: skipping failed chunk {}–{}; continuing".format(chunk_start, chunk_end - 1))
+            return None
         chunk_start = chunk_end
         if chunk_start < n:
-            time.sleep(0.15)
+            time.sleep(0.5)
     missing = total_requested - total_got
-    if missing > 0 or failed_chunks:
-        print(
-            "Bulk METAR fetch: got {} of {} requested ({} slots), failed_chunks={}, missing={}; gap-fill individually.".format(
-                total_got, total_requested, n, failed_chunks, missing
-            )
-        )
+    if missing > 0:
+        print("Bulk METAR fetch: got {} of {} requested ({} slots). {} missing from API for this chunk; will fetch individually.".format(total_got, total_requested, n, missing))
     else:
         print("Bulk METAR fetch: got {} of {} airports".format(total_got, n))
     return results
@@ -2606,15 +2592,63 @@ def process_main_loop_batch(batch_airports, batch_start_index, poll_callback=Non
     return any_data_received, sleep_hit
 
 try:
-    # Clear leftover matrix text from older firmwares (stuck "OTA AV" / "OTA AVAIL")
+    # OTA: check before long METAR batches so serial shows result within seconds of WiFi
+    print("OTA: checking GitHub Pages for newer firmware...")
     try:
-        if led_matrix is not None:
-            led_matrix.fill((0, 0, 0))
-            led_matrix.write()
-    except Exception:
-        pass
+        import updater
+        gc.collect()
+        has_update, version_info = updater.check_for_new_version(FIRMWARE_VERSION)
+        if has_update and version_info:
+            update_available = True
+            update_info = version_info
+            print("OTA: New version available", version_info.get("version"))
+            msg_color = apply_auto_brightness((255, 140, 0))
+            if led_matrix is not None and DISPLAY_TYPE == "LED_MATRIX":
+                scroll_single_text_ultra_smooth("NEW UPDATE AVAILABLE PRESS BUTTON TO INSTALL", msg_color)
+            elif DISPLAY_TYPE == "OLED" and oled is not None:
+                try:
+                    oled.fill(0)
+                    if fonts_available:
+                        wu = writer.Writer(oled, sans18)
+                        wu.set_textpos(0, 0)
+                        wu.printstring("UPDATE")
+                        wu.set_textpos(0, 20)
+                        wu.printstring("AVAILABLE")
+                        wu.set_textpos(0, 40)
+                        wu.printstring("BTN / :8080")
+                    else:
+                        oled.text("UPDATE AVAIL", 0, 0, 1)
+                        oled.text("BTN or :8080", 0, 16, 1)
+                    oled.show()
+                    print("OTA: OLED — update available (6s)")
+                    time.sleep(6)
+                    oled.fill(0)
+                    oled.show()
+                except Exception as ex:
+                    print("OTA OLED banner error:", ex)
+            elif DISPLAY_TYPE == "NONE":
+                # Strip-only: same amber as matrix scroll — full strip 10s so update is visible
+                try:
+                    for i in range(NUM_LEDS):
+                        logical_colors[i] = (255, 140, 0)
+                        led[i] = msg_color
+                    led.write()
+                    print("OTA: strip-only — update color on all LEDs 10s (install: button or :8080)")
+                    time.sleep(10)
+                    for i in range(NUM_LEDS):
+                        logical_colors[i] = (0, 0, 0)
+                        led[i] = (0, 0, 0)
+                    led.write()
+                except Exception as ex:
+                    print("OTA strip banner error:", ex)
+    except SyntaxError as e:
+        print("OTA check error: invalid syntax in updater.py — re-copy pico/updater.py to the Pico.")
+        print(e)
+    except Exception as e:
+        print("OTA check error:", e)
+    gc.collect()
 
-    # Button IRQ first — must work before any long OTA/METAR work
+    # OTA HTTP on :8080 — bind NOW so browser/app work during long first/second passes (not only after).
     update_button = None
     if UPDATE_BUTTON_PIN >= 0:
         try:
@@ -2628,8 +2662,6 @@ try:
                 print("OTA GPIO IRQ (button still polled):", irq_e)
         except Exception:
             update_button = None
-
-    # Version check + scroll run after :8080 + service_ota are ready (below)
 
     fc_hist = None
     fc_fcst = None
@@ -2803,8 +2835,6 @@ hr{border:none;border-top:1px solid #ddd;margin:24px 0}
             "weekend_on_weekday": int(cfg.get("weekend_on_weekday", 0)),
             "weekend_on_hour": int(cfg.get("weekend_on_hour", 6)),
             "weekend_on_minute": int(cfg.get("weekend_on_minute", 0)),
-            "firmware_version": FIRMWARE_VERSION,
-            "update_available": bool(update_available),
         }
         return json.dumps(out)
 
@@ -3858,122 +3888,23 @@ hr{border:none;border-top:1px solid #ddd;margin:24px 0}
             time.sleep(chunk)
             remaining -= chunk
 
-    # OTA version check AFTER :8080 + button service exist (scroll can poll install via hook).
-    print("OTA: checking for newer firmware...")
-    try:
-        import updater
-        gc.collect()
-        has_update, version_info = updater.check_for_new_version(FIRMWARE_VERSION)
-        if has_update and version_info:
-            update_available = True
-            update_info = version_info
-            print("OTA: New version available", version_info.get("version"))
-            print("OTA: Tap button or http://<pico-ip>:8080 to install")
-            msg_color = apply_auto_brightness((255, 140, 0))
-            if led_matrix is not None and DISPLAY_TYPE == "LED_MATRIX":
-                try:
-                    # Classic scroll — hook is live so tap during scroll can still start install
-                    scroll_single_text_ultra_smooth(
-                        "UPDATE AVAILABLE PRESS BUTTON TO INSTALL", msg_color
-                    )
-                except Exception as ex:
-                    print("OTA matrix scroll error:", ex)
-                try:
-                    led_matrix.fill((0, 0, 0))
-                    led_matrix.write()
-                except Exception:
-                    pass
-            elif DISPLAY_TYPE == "OLED" and oled is not None:
-                try:
-                    oled.fill(0)
-                    if fonts_available:
-                        wu = writer.Writer(oled, sans18)
-                        wu.set_textpos(0, 0)
-                        wu.printstring("UPDATE")
-                        wu.set_textpos(0, 20)
-                        wu.printstring("AVAILABLE")
-                        wu.set_textpos(0, 40)
-                        wu.printstring("BTN / :8080")
-                    else:
-                        oled.text("UPDATE AVAIL", 0, 0, 1)
-                        oled.text("BTN or :8080", 0, 16, 1)
-                    oled.show()
-                    sleep_with_ota_poll(4, run_pending_history=False)
-                    oled.fill(0)
-                    oled.show()
-                except Exception as ex:
-                    print("OTA OLED banner error:", ex)
-            elif DISPLAY_TYPE == "NONE" and led is not None and not MATRIX_ONLY:
-                try:
-                    for i in range(NUM_LEDS):
-                        logical_colors[i] = (255, 140, 0)
-                        led[i] = msg_color
-                    led.write()
-                    sleep_with_ota_poll(3, run_pending_history=False)
-                    for i in range(NUM_LEDS):
-                        logical_colors[i] = (0, 0, 0)
-                        led[i] = (0, 0, 0)
-                    led.write()
-                except Exception as ex:
-                    print("OTA strip banner error:", ex)
-        else:
-            print("OTA: device firmware current (or check unreachable)")
-    except SyntaxError as e:
-        print("OTA check error: invalid syntax in updater.py — re-copy pico/updater.py to the Pico.")
-        print(e)
-    except Exception as e:
-        print("OTA check error:", e)
-    gc.collect()
-    try:
-        ensure_wifi_connected()
-    except Exception:
-        pass
-    gc.collect()
-
     current_ldr_brightness = map_ldr_to_brightness(read_ldr_value(), MIN_BRIGHTNESS, MAX_BRIGHTNESS)
     last_ldr_refresh_time = time.time()
     bulk_ok = False
-
-    def _paint_bulk_chunk(results, start, end):
-        """Light LEDs as each bulk METAR chunk arrives (map fills progressively)."""
-        if MATRIX_ONLY or led is None:
-            return
-        n = min(len(airports), len(results), STRIP_ACTIVE_LEDS)
-        a = max(0, min(int(start), n))
-        b = max(a, min(int(end), n))
-        any_set = False
-        for index in range(a, b):
-            fc, raw = results[index]
-            if fc and airports[index] and str(airports[index]).strip():
-                update_wx_interest(index, raw)
-                set_led_color(led, fc, index, MIN_BRIGHTNESS, MAX_BRIGHTNESS)
-                any_set = True
-        if any_set:
-            led.write()
-            update_data_success()
-            print("Bulk METAR: lit LEDs %d–%d" % (a, b - 1))
-
-    def _poll_ota_no_hist():
-        service_ota_http_and_button(run_pending_history=False)
-
     if not MATRIX_ONLY:
-        print("Startup: bulk METAR fetch for flight categories…")
-        bulk_results = fetch_all_metars_once(airports, on_chunk=_paint_bulk_chunk)
+        bulk_results = fetch_all_metars_once(airports)
         if bulk_results:
             n = min(len(airports), len(bulk_results), STRIP_ACTIVE_LEDS)
             for index in range(n):
                 if (bulk_results[index][0] is None or bulk_results[index][1] is None) and airports[index] and airports[index].strip():
+                    # Same quick path as process_first_pass: no SSL backoff / no extra sleep — bulk already tried these
                     fc, raw = get_metar_data_with_retry(airports[index], quick=True)
                     if fc is not None:
                         bulk_results[index] = (fc, raw or bulk_results[index][1])
-                        update_wx_interest(index, raw)
-                        set_led_color(led, fc, index, MIN_BRIGHTNESS, MAX_BRIGHTNESS)
                         update_data_success()
-                        led.write()
                     gc.collect()
-                    time.sleep(0.02)
-                if (index & 7) == 0:
-                    _poll_ota_no_hist()
+                    time.sleep(0.05)
+                service_ota_http_and_button()
             any_set = False
             for index in range(n):
                 fc, raw = bulk_results[index]
@@ -3988,8 +3919,9 @@ hr{border:none;border-top:1px solid #ddd;margin:24px 0}
             if any_set:
                 update_data_success()
                 bulk_ok = True
-                print("All airport LEDs set from bulk fetch (displaying 1s)")
-                sleep_with_ota_poll(1, run_pending_history=False)
+                print("All airport LEDs set from bulk fetch (displaying 3s)")
+                sleep_with_ota_poll(3)
+            # Always clear pixels past airport count (bulk only updates 0..n-1; tail kept startup gray)
             clear_unused_strip_leds(len(airports))
     startup_sleep_hit = False
     if not bulk_ok:
@@ -3998,26 +3930,26 @@ hr{border:none;border-top:1px solid #ddd;margin:24px 0}
                 airports,
                 process_first_pass,
                 description="First pass",
-                poll_callback=_poll_ota_no_hist,
+                poll_callback=service_ota_http_and_button,
             )
-    # Always run second-pass WX tour (unless sleep). Past/future packs wait until after this.
     if not startup_sleep_hit:
         startup_sleep_hit = process_airports_in_batches(
             airports,
             process_second_pass,
             description="Second pass",
-            poll_callback=_poll_ota_no_hist,
+            poll_callback=service_ota_http_and_button,
         )
     if startup_sleep_hit:
         print("Startup METAR passes paused for sleep window; entering scheduler loop")
     clear_unused_strip_leds(len(airports))
 
-    # Past/future ONLY after second pass (or deferred until wake) — not after bulk/first pass
+    # Download+pack 24h history/forecast after METAR passes — but do not block sleep.
+    # If startup hit the sleep window, only queue; main loop runs the fetch after wake.
     _defer_hist_fcst = bool(startup_sleep_hit) or sleep_applies_to_displays_now()
     if fc_hist is not None:
         fc_hist.request_refresh()
         print(
-            "fc_history: startup 24h pack after second pass; auto-refresh every %ds%s"
+            "fc_history: startup 24h pack queued; auto-refresh every %ds%s"
             % (
                 HISTORY_REFRESH_INTERVAL_S,
                 " (deferred until wake)" if _defer_hist_fcst else "",
@@ -4031,7 +3963,7 @@ hr{border:none;border-top:1px solid #ddd;margin:24px 0}
     if fc_fcst is not None:
         fc_fcst.request_refresh()
         print(
-            "fc_forecast: startup TAF pack after second pass; auto-refresh every %ds%s"
+            "fc_forecast: startup TAF pack queued; auto-refresh every %ds%s"
             % (
                 FORECAST_REFRESH_INTERVAL_S,
                 " (deferred until wake)" if _defer_hist_fcst else "",
