@@ -56,7 +56,7 @@ CYCLE_DELAY = 10  # Seconds between full airport list cycles; loaded from config
 # ===== FIRMWARE VERSION (for OTA update check) =====
 # Device reports this string; GitHub Pages version.json "version" must be higher to offer OTA.
 # After you flash new code, this should match what you published (or stay lower until user updates).
-FIRMWARE_VERSION = "1.1.44"
+FIRMWARE_VERSION = "1.1.45"
 
 # ===== OTA / PLAY BUTTON (GPIO) =====
 # Same pin as force-AP at boot: long hold (3s) during startup = setup AP mode.
@@ -1733,7 +1733,7 @@ BULK_CHUNK_SIZE = 20  # airports per request; smaller = more reliable full respo
 
 def fetch_all_metars_once(airports):
     """Fetch METARs for all airports in chunked requests. Returns list of (flight_category, raw_text) per index, or None on failure.
-    Uses order=ids so response order matches our list."""
+    Each report is matched to an airport by the station id in the METAR line."""
     # Fetch METARs for all list entries (matrix scroll may need airports past strip active count).
     n = min(len(airports), 480)
     if n == 0:
@@ -1754,7 +1754,7 @@ def fetch_all_metars_once(airports):
         for ssl_attempt in range(SSL_EOF_MAX_EXTRA_TRIES + 1):  # extra tries on SSL EOF (hotspot/cellular)
             try:
                 gc.collect()
-                url = "https://aviationweather.gov/api/data/metar?ids={}&hours=1&format=raw&order=ids".format(ids)
+                url = "https://aviationweather.gov/api/data/metar?ids={}&hours=1&format=raw".format(ids)
                 response = urequests.get(url, timeout=12)
                 data = response.text
                 response.close()
