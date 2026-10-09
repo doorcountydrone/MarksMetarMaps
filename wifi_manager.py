@@ -5,6 +5,7 @@ import json
 import machine
 import neopixel
 import gc
+import os
 
 try:
     import urequests as requests
@@ -782,6 +783,48 @@ def test_wifi_connection(ssid, password):
         sta_if.active(False)
         return False, None
 
+# Shared look with Great Lakes Lighthouses (navy / cream / amber)
+_PAGE_CSS = (
+    "body{font-family:Arial,sans-serif;background:#0B1F3A;color:#F4EBD0;margin:0;padding:16px;"
+    "line-height:1.45;max-width:560px;margin-left:auto;margin-right:auto}"
+    "h1{font-size:1.3rem;color:#E8A838;margin:0 0 12px}"
+    "h2{font-size:1.05rem;color:#E8A838;margin-top:18px}"
+    "a{color:#E8A838}"
+    ".nav{display:flex;flex-wrap:wrap;gap:10px;margin:0 0 16px;padding-bottom:12px;border-bottom:1px solid #16324F}"
+    ".nav a{color:#F4EBD0;text-decoration:none;font-size:.9rem}"
+    ".nav a:hover{color:#E8A838}"
+    ".config-section,.card,.info-box,.success-box{background:#16324F;padding:16px;margin:14px 0;"
+    "border-radius:10px;text-align:left}"
+    ".section-title{font-size:1rem;color:#E8A838;margin-bottom:12px;font-weight:bold}"
+    ".form-group{margin-bottom:14px}"
+    "label{display:block;margin-bottom:5px;font-weight:bold;color:#F4EBD0;font-size:.9rem}"
+    "input,select,textarea{width:100%;box-sizing:border-box;padding:10px;margin-top:4px;"
+    "border-radius:6px;border:0;font-size:16px;background:#0B1F3A;color:#F4EBD0}"
+    "input[type=checkbox],input[type=range]{width:auto}"
+    ".note{font-size:.8rem;color:#A8B5C4;margin-top:6px}"
+    ".btn,button{margin-top:12px;width:100%;padding:12px;background:#E8A838;border:0;"
+    "border-radius:8px;font-weight:bold;color:#0B1F3A;font-size:16px;cursor:pointer}"
+    ".btn-secondary{background:#16324F;color:#F4EBD0;border:1px solid #E8A838}"
+    ".row{display:flex;justify-content:space-between;align-items:center;padding:8px 0;"
+    "border-bottom:1px solid #0B1F3A}"
+    "#msg,.status{color:#E8A838;font-size:.9rem;min-height:1.2em;margin-top:10px;font-weight:bold}"
+    ".info-box p{margin:8px 0}"
+    ".error-box{background:#5a2030;border:1px solid #E8A838;color:#F4EBD0;padding:15px;"
+    "border-radius:8px;margin:20px auto;max-width:400px}"
+    ".card h3{color:#E8A838;margin-top:0;font-size:1.05rem}"
+)
+
+def _page_nav():
+    return (
+        '<div class="nav">'
+        '<a href="/">Setup</a>'
+        '<a href="/page/airports">Airports</a>'
+        '<a href="/page/weather">Weather</a>'
+        '<a href="/page/help">Help</a>'
+        '<a href="/page/update">Update</a>'
+        "</div>"
+    )
+
 # Generate HTML for setup page (same options as app)
 def get_html_setup_page():
     html = """<!DOCTYPE html>
@@ -790,25 +833,7 @@ def get_html_setup_page():
         <meta charset="utf-8">
         <title>MetarMap Setup</title>
         <meta name="viewport" content="width=device-width, initial-scale=1">
-        <style>
-            body { font-family: Arial; margin: 0; padding: 20px; text-align: center; }
-            h1 { color: #0066cc; margin-bottom: 30px; }
-            .config-section { background: #f5f5f5; padding: 20px; margin: 20px 0; border-radius: 5px; max-width: 420px; margin-left: auto; margin-right: auto; text-align: left; }
-            .section-title { font-size: 18px; color: #0066cc; margin-bottom: 15px; font-weight: bold; }
-            .form-group { margin-bottom: 20px; }
-            label { display: block; margin-bottom: 5px; font-weight: bold; color: #333; }
-            input, select { width: 100%; padding: 10px; font-size: 16px; border: 1px solid #ddd; border-radius: 4px; box-sizing: border-box; }
-            .range-container { display: flex; align-items: center; gap: 15px; }
-            .range-container input[type="range"] { flex: 1; }
-            .range-value { min-width: 50px; font-weight: bold; color: #0066cc; }
-            .note { font-size: 12px; color: #666; margin-top: 5px; }
-            input[type=checkbox] { width: auto; }
-            .btn { background: #0066cc; color: white; border: none; cursor: pointer; padding: 12px 20px; font-size: 16px; border-radius: 5px; margin: 5px; }
-            .btn:hover { background: #0052a3; }
-            .btn-secondary { background: #5a6268; }
-            .btn-secondary:hover { background: #545b62; }
-            .info-box { background: #e7f3ff; border: 1px solid #b6d4fe; color: #0c5460; padding: 15px; border-radius: 5px; margin: 20px auto; max-width: 420px; text-align: left; }
-        </style>
+        <style>""" + _PAGE_CSS + """</style>
         <script>
             function toggleMatrix() {
                 var d = document.getElementById('display_type').value;
@@ -907,11 +932,12 @@ def get_html_setup_page():
     </head>
     <body>
         <h1>MetarMap Setup</h1>
+        """ + _page_nav() + """
         <div class="info-box">
-            <p><strong>MetarMap setup Wi-Fi (connect your phone here):</strong> SSID <strong>""" + AP_SSID + """</strong> &mdash; password <strong>""" + AP_PASSWORD + """</strong> (defaults in this firmware; edit <code>wifi_manager.py</code> if you changed them).</p>
-            <p><strong>Same settings as the app.</strong> The fields below are your <em>home router</em> Wi-Fi for the Pico to join, not the AP password above. Leave WiFi blank to update display/brightness (device reboots to apply). Fill WiFi + tap Save &amp; Restart to set network and reboot.</p>
-            <p><strong>IP:</strong> 192.168.4.1 &nbsp;|&nbsp; <a href="/">Setup</a> &nbsp; <a href="/page/airports">Airports</a> &nbsp; <a href="/page/weather">Weather</a> &nbsp; <a href="/page/help">Help</a> &nbsp; <a href="/page/update">Update</a></p>
-        <p id="config_load_msg" class="note" style="color:#a00;margin-top:8px"></p>
+            <p><strong>MetarMap setup Wi-Fi (connect your phone here):</strong> SSID <strong>""" + AP_SSID + """</strong> &mdash; password <strong>""" + AP_PASSWORD + """</strong>.</p>
+            <p><strong>Same settings as the app.</strong> The fields below are your <em>home router</em> Wi-Fi for the Pico to join, not the AP password above. Leave WiFi blank to update display/brightness. Fill WiFi + tap Save &amp; Restart to set network and reboot.</p>
+            <p><strong>IP:</strong> 192.168.4.1 &nbsp;|&nbsp; After home Wi-Fi, use the Android app <strong>Find MetarMap</strong> button to locate the Pico.</p>
+        <p id="config_load_msg" class="note" style="color:#E8A838;margin-top:8px"></p>
         </div>
         <form action="/configure" method="post" novalidate>
             <div class="config-section">
@@ -1075,7 +1101,7 @@ def get_html_setup_page():
             </div>
             <button type="submit" class="btn">Save &amp; Restart</button>
         </form>
-        <p style="margin-top:20px;font-size:14px;color:#666">Leave WiFi blank and tap Save &amp; Restart to apply display settings only (device will reboot to apply).</p>
+        <p class="note" style="margin-top:20px">Leave WiFi blank and tap Save &amp; Restart to apply display settings only (device will reboot to apply).</p>
     </body>
     </html>
     """
@@ -1113,27 +1139,7 @@ def get_html_success_page(ssid, display_type, led_matrix_brightness, led_matrix_
         <meta charset="utf-8">
         <title>MetarMap Setup Complete</title>
         <meta name="viewport" content="width=device-width, initial-scale=1">
-        <style>
-            body { font-family: Arial; margin: 0; padding: 20px; text-align: center; }
-            h1 { color: #0066cc; }
-            .success-box {
-                background: #f5f5f5;
-                padding: 20px;
-                margin: 20px auto;
-                max-width: 400px;
-                border-radius: 5px;
-                text-align: left;
-            }
-            .note {
-                background-color: #fff3cd;
-                border: 1px solid #ffeeba;
-                color: #856404;
-                padding: 10px;
-                margin: 20px auto;
-                max-width: 400px;
-                border-radius: 4px;
-            }
-        </style>
+        <style>""" + _PAGE_CSS + """</style>
     </head>
     <body>
         <h1>MetarMap Setup</h1>
@@ -1143,12 +1149,12 @@ def get_html_success_page(ssid, display_type, led_matrix_brightness, led_matrix_
             <p>WiFi Network: <strong>""" + ssid + """</strong></p>
             """ + display_info + """
         </div>
-        <div class="note">
+        <div class="card">
             <p><strong>Important:</strong></p>
             <p>You will be disconnected from the MetarMap-Setup network.</p>
-            <p>Please reconnect to your WiFi network: <strong>""" + ssid + """</strong></p>
+            <p>Reconnect to your WiFi network: <strong>""" + ssid + """</strong>, then use the app <strong>Find MetarMap</strong> button.</p>
         </div>
-        <p>The device will restart in 10 seconds...</p>
+        <p class="note">The device will restart in 10 seconds...</p>
     </body>
     </html>
     """
@@ -1156,179 +1162,154 @@ def get_html_success_page(ssid, display_type, led_matrix_brightness, led_matrix_
 
 # Page shown after display-only save (optionally rebooting)
 def get_html_display_saved_page(success, message):
-    color = "green" if success else "#dc3545"
-    html = """<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>MetarMap</title></head><body style="font-family:Arial;text-align:center;padding:20px;">
-    <h2 style="color:""" + color + """">""" + ("Settings saved" if success else "Error") + """</h2>
-    <p>""" + message + """</p>
-    <p><a href="/" style="color:#0066cc">Back to setup</a></p>
-    </body></html>"""
+    html = (
+        '<!DOCTYPE html><html><head><meta charset="utf-8">'
+        '<meta name="viewport" content="width=device-width, initial-scale=1">'
+        "<title>MetarMap</title><style>" + _PAGE_CSS + "</style></head><body>"
+        "<h1>" + ("Settings saved" if success else "Error") + "</h1>"
+        "<p>" + message + "</p>"
+        '<p><a href="/">Back to setup</a></p>'
+        "</body></html>"
+    )
     return html
 
 # Airports page: list + fetch/save (same as app Airports tab)
 def get_html_airports_page():
-    html = """<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>MetarMap Airports</title>
-    <style>body{font-family:Arial;margin:0;padding:20px;max-width:500px;margin:0 auto;} h1{color:#0066cc;}
-    .nav{margin-bottom:20px;} .nav a{margin-right:15px;color:#0066cc;}
-    label{display:block;margin-bottom:5px;font-weight:bold;} textarea{width:100%;height:200px;padding:10px;box-sizing:border-box;}
-    .btn{background:#0066cc;color:white;border:none;padding:12px 20px;cursor:pointer;margin:5px 5px 5px 0;} .btn:hover{background:#0052a3;}
-    .note{font-size:12px;color:#666;margin-top:5px;} #msg{margin-top:10px;font-weight:bold;}
-    </style></head><body>
-    <h1>Airports</h1>
-    <div class="nav"><a href="/">Setup</a> <a href="/page/airports">Airports</a> <a href="/page/weather">Weather</a> <a href="/page/help">Help</a> <a href="/page/update">Update</a></div>
-    <p class="note">One airport code per line (3-4 letters/digits, e.g. KORD, LAX, 0A0). Order = LED order. Use empty line or SKIP for a blank slot.</p>
-    <button type="button" class="btn" onclick="fetchList()">Fetch from MetarMap</button>
-    <form id="f" onsubmit="return saveList(event)">
-      <label for="list">Airport list</label>
-      <textarea id="list" name="list" placeholder="Fetch or type one code per line"></textarea>
-      <button type="submit" class="btn">Save to MetarMap</button>
-    </form>
-    <div id="msg"></div>
-    <script>
-      function fetchList(){ var m=document.getElementById('msg'); m.textContent='Loading...';
-        fetch('/airports').then(function(r){return r.text();}).then(function(t){
-          document.getElementById('list').value=t.trim();
-          m.textContent='Loaded.';
-        }).catch(function(){ m.textContent='Fetch failed. Connect to MetarMap WiFi.'; });
-      }
-      function saveList(e){ e.preventDefault();
-        var m=document.getElementById('msg'); m.textContent='Saving...';
-        var body=document.getElementById('list').value.replace(/\\r/g,'').trim();
-        fetch('/airports',{method:'POST',body:body,headers:{'Content-Type':'text/plain'}}).then(function(r){return r.json();}).then(function(j){
-          if(j.success){ m.textContent='Saved. Rebooting...'; fetch('/reboot',{method:'POST'}).catch(function(){}); }
-          else m.textContent=j.message || 'Failed';
-        }).catch(function(){ m.textContent='Save failed. Connect to MetarMap WiFi.'; });
-        return false;
-      }
-    </script>
-    </body></html>"""
+    html = (
+        '<!DOCTYPE html><html><head><meta charset="utf-8">'
+        '<meta name="viewport" content="width=device-width, initial-scale=1">'
+        "<title>MetarMap Airports</title><style>" + _PAGE_CSS +
+        "textarea{height:220px}</style></head><body>"
+        "<h1>Airports</h1>" + _page_nav() +
+        '<p class="note">One airport code per line (3-4 letters/digits, e.g. KORD, LAX, 0A0). '
+        "Order = LED order. Use empty line or SKIP for a blank slot.</p>"
+        '<button type="button" class="btn" onclick="fetchList()">Fetch from MetarMap</button>'
+        '<form id="f" onsubmit="return saveList(event)">'
+        '<label for="list">Airport list</label>'
+        '<textarea id="list" name="list" placeholder="Fetch or type one code per line"></textarea>'
+        '<button type="submit" class="btn">Save to MetarMap</button>'
+        "</form><div id=\"msg\"></div><script>"
+        "function fetchList(){ var m=document.getElementById('msg'); m.textContent='Loading...';"
+        "fetch('/airports').then(function(r){return r.text();}).then(function(t){"
+        "document.getElementById('list').value=t.trim(); m.textContent='Loaded.';"
+        "}).catch(function(){ m.textContent='Fetch failed. Connect to MetarMap WiFi.'; });}"
+        "function saveList(e){ e.preventDefault();"
+        "var m=document.getElementById('msg'); m.textContent='Saving...';"
+        "var body=document.getElementById('list').value.replace(/\\r/g,'').trim();"
+        "fetch('/airports',{method:'POST',body:body,headers:{'Content-Type':'text/plain'}})"
+        ".then(function(r){return r.json();}).then(function(j){"
+        "if(j.success){ m.textContent='Saved. Rebooting...'; fetch('/reboot',{method:'POST'}).catch(function(){}); }"
+        "else m.textContent=j.message || 'Failed';"
+        "}).catch(function(){ m.textContent='Save failed. Connect to MetarMap WiFi.'; });"
+        "return false;}"
+        "</script></body></html>"
+    )
     return html
 
 # Weather page: toggles per code (same as app Weather tab)
 def get_html_weather_page():
     codes_js = json.dumps(WX_TAGS)
-    html = """<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>MetarMap Weather</title>
-    <style>body{font-family:Arial;margin:0;padding:20px;max-width:500px;margin:0 auto;} h1{color:#0066cc;}
-    .nav{margin-bottom:20px;} .nav a{margin-right:15px;color:#0066cc;}
-    .row{display:flex;justify-content:space-between;align-items:center;padding:8px 0;border-bottom:1px solid #eee;}
-    .btn{background:#0066cc;color:white;border:none;padding:12px 20px;cursor:pointer;margin-top:15px;} .btn:hover{background:#0052a3;}
-    #msg{margin-top:10px;font-weight:bold;} .note{font-size:12px;color:#666;}
-    </style></head><body>
-    <h1>Weather conditions</h1>
-    <div class="nav"><a href="/">Setup</a> <a href="/page/airports">Airports</a> <a href="/page/weather">Weather</a> <a href="/page/help">Help</a> <a href="/page/update">Update</a></div>
-    <p class="note">ON = this condition can light the LEDs. OFF = effect disabled.</p>
-    <div id="toggles"></div>
-    <button type="button" class="btn" onclick="saveWeather()">Save</button>
-    <div id="msg"></div>
-    <script>
-      var WX_TAGS = """ + codes_js + """;
-      function load(){
-        fetch('/config').then(function(r){return r.json();}).then(function(c){
-          var we = c.weather_enabled || {};
-          var html = '';
-          WX_TAGS.forEach(function(code){
-            var checked = we[code] !== false ? 'checked' : '';
-            html += '<div class="row"><label>'+code+'</label><input type="checkbox" id="w_'+code+'" '+checked+'></div>';
-          });
-          document.getElementById('toggles').innerHTML = html;
-        }).catch(function(){ document.getElementById('toggles').innerHTML = '<p>Load failed. Connect to MetarMap WiFi.</p>'; });
-      }
-      function saveWeather(){
-        var we = {}; WX_TAGS.forEach(function(c){ we[c] = document.getElementById('w_'+c).checked; });
-        document.getElementById('msg').textContent = 'Saving...';
-        fetch('/update-config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({weather_enabled:we,reboot:true})})
-          .then(function(r){return r.json();}).then(function(j){
-            document.getElementById('msg').textContent = j.success ? 'Saved. Rebooting...' : (j.message || 'Failed');
-          }).catch(function(){ document.getElementById('msg').textContent = 'Save failed.'; });
-      }
-      load();
-    </script>
-    </body></html>"""
+    html = (
+        '<!DOCTYPE html><html><head><meta charset="utf-8">'
+        '<meta name="viewport" content="width=device-width, initial-scale=1">'
+        "<title>MetarMap Weather</title><style>" + _PAGE_CSS + "</style></head><body>"
+        "<h1>Weather conditions</h1>" + _page_nav() +
+        '<p class="note">ON = this condition can light the LEDs. OFF = effect disabled.</p>'
+        '<div id="toggles"></div>'
+        '<button type="button" class="btn" onclick="saveWeather()">Save</button>'
+        '<div id="msg"></div><script>'
+        "var WX_TAGS = " + codes_js + ";"
+        "function load(){"
+        "fetch('/config').then(function(r){return r.json();}).then(function(c){"
+        "var we = c.weather_enabled || {}; var html = '';"
+        "WX_TAGS.forEach(function(code){"
+        "var checked = we[code] !== false ? 'checked' : '';"
+        "html += '<div class=\"row\"><label>'+code+'</label>"
+        "<input type=\"checkbox\" id=\"w_'+code+'\" '+checked+'></div>';"
+        "});"
+        "document.getElementById('toggles').innerHTML = html;"
+        "}).catch(function(){ document.getElementById('toggles').innerHTML = "
+        "'<p>Load failed. Connect to MetarMap WiFi.</p>'; });}"
+        "function saveWeather(){"
+        "var we = {}; WX_TAGS.forEach(function(c){ we[c] = document.getElementById('w_'+c).checked; });"
+        "document.getElementById('msg').textContent = 'Saving...';"
+        "fetch('/update-config',{method:'POST',headers:{'Content-Type':'application/json'},"
+        "body:JSON.stringify({weather_enabled:we,reboot:true})})"
+        ".then(function(r){return r.json();}).then(function(j){"
+        "document.getElementById('msg').textContent = j.success ? 'Saved. Rebooting...' : (j.message || 'Failed');"
+        "}).catch(function(){ document.getElementById('msg').textContent = 'Save failed.'; });}"
+        "load();</script></body></html>"
+    )
     return html
 
 # Help page: same content as app Help tab
 def get_html_help_page():
-    html = """<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>MetarMap Help</title>
-    <style>body{font-family:Arial;margin:0;padding:20px;max-width:600px;margin:0 auto;line-height:1.5;}
-    h1{color:#000;} h2{color:#0066cc;font-size:1.1em;margin-top:20px;} .nav{margin-bottom:20px;} .nav a{margin-right:15px;color:#0066cc;}
-    .card{background:#f5f5f5;padding:15px;margin:12px 0;border-radius:8px;} .card h3{color:#0066cc;margin-top:0;}
-    ul{margin:8px 0;padding-left:20px;} p{margin:8px 0;}
-    </style></head><body>
-    <h1>Help &amp; Instructions</h1>
-    <div class="nav"><a href="/">Setup</a> <a href="/page/airports">Airports</a> <a href="/page/weather">Weather</a> <a href="/page/help">Help</a> <a href="/page/update">Update</a></div>
-    <div class="card"><h3>Quick start</h3>
-    <p>1. Join MetarMap setup Wi-Fi: SSID <strong>""" + AP_SSID + """</strong>, password <strong>""" + AP_PASSWORD + """</strong> (unless you changed AP in firmware).<br>2. Setup: enter your <em>home router</em> name and password (not the AP password), then Save &amp; Restart (or leave blank to only change display).<br>3. Airports: add codes (e.g. KORD, LAX), Save to MetarMap.<br>Done.</p></div>
-    <div class="card"><h3>What is a MetarMap?</h3>
-    <p>MetarMap is a hardware project with a Raspberry Pi Pico W. It fetches real-time aviation weather (METAR), shows flight categories (VFR/MVFR/IFR/LIFR) and weather on an LED strip and optional matrix/OLED. On startup it shows all airports' flight categories at once for a few seconds, then cycles with weather effects.</p></div>
-    <div class="card"><h3>Setup (WiFi / display)</h3>
-    <p><strong>Router vs AP:</strong> The WiFi fields on Setup are your <em>router</em> credentials so the Pico can reach the internet, not the password for joining <strong>""" + AP_SSID + """</strong> on your phone (default AP password: <strong>""" + AP_PASSWORD + """</strong>).</p>
-    <p>Leave WiFi blank to update display/brightness (device reboots to apply). Fill WiFi to set network and restart. Display type, matrix layout, min/max brightness (use same for no LDR), batch size, cycle delay, scroll speed, &quot;Strip: flight colors only&quot; = matrix only.</p></div>
-    <div class="card"><h3>Firmware updates (manual)</h3>
-    <p>After boot, MetarMap <em>checks</em> online whether a newer firmware exists; it does <strong>not</strong> install by itself. Use <strong>Update</strong> &rarr; Install, open <code>http://&lt;pico-ip&gt;:8080</code> on your home network, or the Android app&apos;s install button when you want to upgrade.</p></div>
-    <div class="card"><h3>Airports</h3>
-    <p>One code per line. Order = LED order. Fetch from MetarMap loads current list; Save to MetarMap writes your list. Use empty line or SKIP for blank slot. 3-4 letters or digits (e.g. KORD, 0A0).</p></div>
-    <div class="card"><h3>Weather</h3>
-    <p>Each code toggles whether that condition lights the LEDs. ON = effect enabled, OFF = disabled. Save sends to device and reboots to apply.</p></div>
-    <div class="card"><h3>Weather codes &amp; LED effects</h3>
-    <p>Rain: BR, -RA, RA, +RA (cyan flashes). Snow: -SN, SN, +SN, SHSN (white). Lightning: LTG, DSNT (yellow); CC, CA, CG, VCTS (white). Wind: WND (yellow). Fog: FG, FZFG, FZFD (fades). Clear: CLR (white to green). Storms: TS, $, FC, +FC, TORNADO (red/blue).</p></div>
-    <div class="card"><h3>Troubleshooting</h3>
-    <p><b>App / browser:</b> Connect to MetarMap WiFi (192.168.4.1). Save fails if not on that network.</p>
-    <p><b>Stuck in setup after power fail:</b> If home Wi‑Fi credentials are already saved and nobody is using the setup network, MetarMap reboots after about 8 minutes to try joining the router again.</p>
-    <p><b>Mobile data / hotspot:</b> Using cellular often causes SSL errors; use Wi-Fi when possible.</p>
-    <p><b>NO DATA AFTER 180 SEC:</b> Check WiFi and internet. Device shows a warning then auto-reboots (~30s later). Power-cycle router if it repeats.</p>
-    <p><b>Some airports never show data:</b> API may not have that station; try removing or replacing the code.</p>
-    <p><b>Matrix text wrong:</b> Try a different Matrix layout in Setup.</p></div>
-    </body></html>"""
+    html = (
+        '<!DOCTYPE html><html><head><meta charset="utf-8">'
+        '<meta name="viewport" content="width=device-width, initial-scale=1">'
+        "<title>MetarMap Help</title><style>" + _PAGE_CSS + "</style></head><body>"
+        "<h1>Help &amp; Instructions</h1>" + _page_nav() +
+        '<div class="card"><h3>Quick start</h3>'
+        "<p>1. Join MetarMap setup Wi-Fi: SSID <strong>" + AP_SSID +
+        "</strong>, password <strong>" + AP_PASSWORD + "</strong>.</p>"
+        "<p>2. Setup: enter your <em>home router</em> name and password (not the AP password), "
+        "then Save &amp; Restart.</p>"
+        "<p>3. Put the phone back on home Wi-Fi and tap <strong>Find MetarMap</strong> in the Android app.</p>"
+        "<p>4. Airports: add codes (e.g. KORD, LAX), Save to MetarMap. Done.</p></div>"
+        '<div class="card"><h3>What is a MetarMap?</h3>'
+        "<p>MetarMap is a Raspberry Pi Pico W project that fetches aviation weather (METAR) and shows "
+        "flight categories (VFR/MVFR/IFR/LIFR) on an LED strip, with optional matrix or OLED.</p></div>"
+        '<div class="card"><h3>Find MetarMap (app)</h3>'
+        "<p>On MetarMap-Setup or home Wi-Fi, tap <strong>Find MetarMap</strong>. It looks for "
+        "<code>/status</code> on this Wi-Fi and fills in the address. You can still type 192.168.4.1 "
+        "(setup) or the home-network IP.</p></div>"
+        '<div class="card"><h3>Setup (WiFi / display)</h3>'
+        "<p>The WiFi fields are your <em>router</em> credentials so the Pico can reach the internet, "
+        "not the password for joining <strong>" + AP_SSID + "</strong>.</p></div>"
+        '<div class="card"><h3>Firmware updates</h3>'
+        "<p>MetarMap checks online for a newer version but does <strong>not</strong> install by itself. "
+        "Use Update, <code>http://&lt;pico-ip&gt;:8080</code>, or the app install button.</p></div>"
+        '<div class="card"><h3>Airports</h3>'
+        "<p>One code per line. Order = LED order. Empty line or SKIP = blank slot.</p></div>"
+        '<div class="card"><h3>Weather</h3>'
+        "<p>Each code toggles whether that condition lights the LEDs. Save reboots to apply.</p></div>"
+        '<div class="card"><h3>Troubleshooting</h3>'
+        "<p><b>Can't connect:</b> Join MetarMap-Setup (password " + AP_PASSWORD +
+        ") and use 192.168.4.1, or Find MetarMap on home Wi-Fi.</p>"
+        "<p><b>Stuck in setup after power fail:</b> With saved home credentials and nobody on the setup "
+        "network, MetarMap reboots after about 8 minutes to rejoin the router.</p>"
+        "<p><b>NO DATA AFTER 180 SEC:</b> Check WiFi and internet.</p></div>"
+        "</body></html>"
+    )
     return html
 
 def get_html_update_page():
-    html = """<!DOCTYPE html>
-    <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>MetarMap Update</title>
-    <style>body{font-family:Arial;margin:12px;} .nav{margin-bottom:12px;} a{margin-right:8px;}
-    .card{background:#f5f5f5;padding:12px;margin:8px 0;border-radius:6px;}
-    button{background:#0d6efd;color:#fff;border:none;padding:10px 16px;border-radius:6px;font-size:16px;}
-    </style></head><body>
-    <h1>MetarMap firmware update</h1>
-    <div class="nav"><a href="/">Setup</a> <a href="/page/airports">Airports</a> <a href="/page/weather">Weather</a> <a href="/page/help">Help</a> <a href="/page/update">Update</a></div>
-    <div class="card">
-    <p><b>Not automatic:</b> Updates are only <em>detected</em> at boot; nothing installs until you start it (this button, <code>:8080</code> on your LAN, or the app).</p>
-    <p><b>When MetarMap is connected to your WiFi</b> (after Save &amp; Reboot), open <code>http://&lt;pico-ip&gt;:8080</code> in a browser or use the app&apos;s &quot;Install firmware update&quot; button. The device must have internet to download.</p>
-    <p>From this page (AP mode): try Install update below. It only works if the Pico has internet access.</p>
-    <form method="post" action="/start-update"><button type="submit">Install update now</button></form>
-    </div>
-    </body></html>"""
+    html = (
+        '<!DOCTYPE html><html><head><meta charset="utf-8">'
+        '<meta name="viewport" content="width=device-width, initial-scale=1">'
+        "<title>MetarMap Update</title><style>" + _PAGE_CSS + "</style></head><body>"
+        "<h1>MetarMap firmware update</h1>" + _page_nav() +
+        '<div class="card">'
+        "<p><b>Not automatic:</b> Updates are only detected at boot; nothing installs until you start it.</p>"
+        "<p>When MetarMap is on home Wi-Fi, open <code>http://&lt;pico-ip&gt;:8080</code> or use the app. "
+        "The device must have internet to download.</p>"
+        "<p>From this page (AP mode): Install only works if the Pico already has internet.</p>"
+        '<form method="post" action="/start-update"><button type="submit">Install update now</button></form>'
+        "</div></body></html>"
+    )
     return html
 
 # Generate HTML for error page
 def get_html_error_page(message):
-    html = """<!DOCTYPE html>
-    <html>
-    <head>
-        <meta charset="utf-8">
-        <title>MetarMap Setup Error</title>
-        <meta name="viewport" content="width=device-width, initial-scale=1">
-        <style>
-            body { font-family: Arial; margin: 0; padding: 20px; text-align: center; }
-            h1 { color: #dc3545; }
-            .error-box {
-                background: #f8d7da;
-                border: 1px solid #f5c6cb;
-                color: #721c24;
-                padding: 15px;
-                border-radius: 5px;
-                margin: 20px auto;
-                max-width: 400px;
-            }
-        </style>
-    </head>
-    <body>
-        <h1>Setup Error</h1>
-        <div class="error-box">
-            <p>""" + message + """</p>
-        </div>
-        <p><a href="/">Go back to setup page</a></p>
-    </body>
-    </html>
-    """
+    html = (
+        '<!DOCTYPE html><html><head><meta charset="utf-8">'
+        '<meta name="viewport" content="width=device-width, initial-scale=1">'
+        "<title>MetarMap Setup Error</title><style>" + _PAGE_CSS + "</style></head><body>"
+        "<h1>Setup Error</h1>"
+        '<div class="error-box"><p>' + message + "</p></div>"
+        '<p><a href="/">Go back to setup page</a></p>'
+        "</body></html>"
+    )
     return html
 
 def run_server(force_ap=False):
@@ -1733,7 +1714,25 @@ def run_server(force_ap=False):
                         machine.reset()
                 # conn already closed in both branches
             elif first_line.startswith("GET ") and "/status" in first_line:
-                send_json_response(conn, True, 'MetarMap is online')
+                _nl = NUM_LEDS
+                try:
+                    if CONFIG_FILE in os.listdir():
+                        with open(CONFIG_FILE, "r") as _cf:
+                            _cfg = json.load(_cf)
+                        _nl = int(_cfg.get("num_leds", NUM_LEDS))
+                except Exception:
+                    pass
+                _body = json.dumps({
+                    "ok": True,
+                    "name": "MarksMetarMap",
+                    "mode": "setup",
+                    "version": "",
+                    "num_leds": _nl,
+                }).encode("utf-8")
+                conn.send("HTTP/1.1 200 OK\r\n")
+                conn.send("Content-Type: application/json; charset=utf-8\r\n")
+                conn.send("Content-Length: %d\r\n\r\n" % len(_body))
+                conn.sendall(_body)
                 conn.close()
             elif first_line.startswith("POST ") and "/reboot" in first_line:
                 send_json_response(conn, True, 'Rebooting')

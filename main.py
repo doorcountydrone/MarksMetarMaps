@@ -11,7 +11,7 @@ import ssd1306
 import framebuf
 import os  # Added missing import
 
-machine.freq(230_000_000)
+machine.freq(250_000_000)
 
 # Import brightness settings from wifi_manager
 try:
@@ -56,7 +56,7 @@ CYCLE_DELAY = 10  # Seconds between full airport list cycles; loaded from config
 # ===== FIRMWARE VERSION (for OTA update check) =====
 # Device reports this string; GitHub Pages version.json "version" must be higher to offer OTA.
 # After you flash new code, this should match what you published (or stay lower until user updates).
-FIRMWARE_VERSION = "1.1.45"
+FIRMWARE_VERSION = "1.1.46"
 
 # ===== OTA / PLAY BUTTON (GPIO) =====
 # Same pin as force-AP at boot: long hold (3s) during startup = setup AP mode.
@@ -2701,18 +2701,19 @@ try:
 
     UPDATE_PAGE_HTML = """<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>MetarMap Update</title>
 <style>
-body{font-family:Arial,sans-serif;max-width:420px;margin:24px auto;padding:0 16px;line-height:1.4}
-h1{font-size:1.4rem;margin:0 0 12px}
-h2{font-size:1.1rem;margin:28px 0 8px}
-.nav{margin-bottom:16px}.nav a{margin-right:12px;color:#0066cc}
-p{margin:8px 0;color:#333}
-button{display:block;width:100%;padding:12px 16px;margin:8px 0;font-size:16px;border:none;border-radius:8px;cursor:pointer}
-.btn-update{background:#0d6efd;color:#fff}
+body{font-family:Arial,sans-serif;background:#0B1F3A;color:#F4EBD0;max-width:480px;margin:0 auto;padding:16px;line-height:1.45}
+h1{font-size:1.3rem;color:#E8A838;margin:0 0 12px}
+h2{font-size:1.05rem;color:#E8A838;margin:24px 0 8px}
+.nav{display:flex;flex-wrap:wrap;gap:10px;margin:0 0 16px;padding-bottom:12px;border-bottom:1px solid #16324F}
+.nav a{color:#F4EBD0;text-decoration:none;font-size:.9rem}
+p{margin:8px 0;color:#F4EBD0}
+button{display:block;width:100%;padding:12px 16px;margin:8px 0;font-size:16px;border:none;border-radius:8px;cursor:pointer;font-weight:bold}
+.btn-update{background:#E8A838;color:#0B1F3A}
 .btn-play{background:#198754;color:#fff}
-.btn-forecast{background:#0dcaf0;color:#000}
-.btn-refresh{background:#6c757d;color:#fff}
-small{color:#666}
-hr{border:none;border-top:1px solid #ddd;margin:24px 0}
+.btn-forecast{background:#0dcaf0;color:#0B1F3A}
+.btn-refresh{background:#16324F;color:#F4EBD0;border:1px solid #E8A838}
+small{color:#A8B5C4}
+hr{border:none;border-top:1px solid #16324F;margin:24px 0}
 </style></head><body>
 <h1>MetarMap</h1>
 <div class="nav"><a href="/">Setup</a> <a href="/page/airports">Airports</a> <a href="/page/weather">Weather</a> <a href="/page/help">Help</a> <a href="/page/update">Update</a></div>
@@ -3393,6 +3394,32 @@ hr{border:none;border-top:1px solid #ddd;margin:24px 0}
                 except Exception as _recv_ex:
                     print("OTA HTTP body read:", _recv_ex)
                 first = req.split("\n")[0].strip() if req else ""
+                if first.startswith("GET ") and "/status" in first:
+                    try:
+                        _st = {
+                            "ok": True,
+                            "name": "MarksMetarMap",
+                            "mode": "run",
+                            "version": FIRMWARE_VERSION,
+                            "num_leds": int(STRIP_ACTIVE_LEDS),
+                        }
+                        _st_b = json.dumps(_st).encode("utf-8")
+                        conn.send(
+                            b"HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nConnection: close\r\n"
+                        )
+                        conn.send(("Content-Length: %d\r\n\r\n" % len(_st_b)).encode("ascii"))
+                        conn.sendall(_st_b)
+                    except Exception as _st_ex:
+                        print("OTA GET /status error:", _st_ex)
+                        try:
+                            conn.send(b"HTTP/1.1 500\r\nConnection: close\r\n\r\n")
+                        except Exception:
+                            pass
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+                    return
                 if first.startswith("GET ") and "/config" in first:
                     try:
                         _cfg_body = _http_wifi_config_json_body()
