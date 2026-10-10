@@ -56,7 +56,7 @@ CYCLE_DELAY = 10  # Seconds between full airport list cycles; loaded from config
 # ===== FIRMWARE VERSION (for OTA update check) =====
 # Device reports this string; GitHub Pages version.json "version" must be higher to offer OTA.
 # After you flash new code, this should match what you published (or stay lower until user updates).
-FIRMWARE_VERSION = "1.1.46"
+FIRMWARE_VERSION = "1.1.47"
 
 # ===== OTA / PLAY BUTTON (GPIO) =====
 # Same pin as force-AP at boot: long hold (3s) during startup = setup AP mode.
@@ -102,6 +102,53 @@ _ota_btn_down_ms = 0  # ticks when press started; 0 = not held
 _ota_btn_pending_hold_ms = 0  # completed hold duration for service to act on
 _ota_btn_ignore_until_ms = 0  # post-release bounce lockout
 _ota_btn_hold_hint = None  # last live hint while held: None | "OTA" | "PAST" | "FUTURE"
+# App/HTML config pause: skip METAR/history/forecast and poll :8080 tightly for a short window.
+CONFIG_PAUSE_DEFAULT_S = 120
+CONFIG_PAUSE_MAX_S = 300
+_config_pause_until = 0.0
+_config_pause_last_log = 0.0
+
+
+def config_pause_remaining():
+    """Seconds left in config pause (0 if inactive/expired)."""
+    global _config_pause_until
+    if _config_pause_until <= 0:
+        return 0
+    rem = int(_config_pause_until - time.time())
+    if rem <= 0:
+        _config_pause_until = 0.0
+        return 0
+    return rem
+
+
+def config_pause_active():
+    return config_pause_remaining() > 0
+
+
+def set_config_pause(seconds=None, clear=False):
+    """Arm or clear config pause. Returns remaining seconds after change."""
+    global _config_pause_until
+    if clear:
+        was = config_pause_remaining()
+        _config_pause_until = 0.0
+        if was:
+            print("Config pause cleared")
+        return 0
+    if seconds is None:
+        seconds = CONFIG_PAUSE_DEFAULT_S
+    try:
+        seconds = int(seconds)
+    except Exception:
+        seconds = CONFIG_PAUSE_DEFAULT_S
+    seconds = max(1, min(CONFIG_PAUSE_MAX_S, seconds))
+    _config_pause_until = time.time() + seconds
+    print("Config pause: %ds (HTTP only; weather resumes after)" % seconds)
+    return seconds
+
+
+def touch_config_pause(seconds=None):
+    """Renew config pause (used when app/HTML hits config endpoints)."""
+    return set_config_pause(seconds=seconds, clear=False)
 # 24h history/forecast: set True while fetch/play runs (avoids re-entrant HTTP/GPIO triggers)
 _history_busy = False
 _history_trigger_prev = 0  # idle level for active-high PIR (SR602)
@@ -2477,6 +2524,9 @@ def process_airports_in_batches(airports, process_function, batch_size=BATCH_SIZ
         if sleep_applies_to_displays_now():
             print(f"{description} paused: entered sleep window during batch processing")
             return True
+        if config_pause_active():
+            print(f"{description} paused: config pause (app/HTML setup)")
+            return True
         batch_start = batch_num * batch_size
         batch_end = min(batch_start + batch_size, total_airports)
         batch_airports = airports[batch_start:batch_end]
@@ -2485,6 +2535,9 @@ def process_airports_in_batches(airports, process_function, batch_size=BATCH_SIZ
         for i_in_batch, airport in enumerate(batch_airports):
             if sleep_applies_to_displays_now():
                 print(f"{description} paused: entered sleep window mid-batch")
+                return True
+            if config_pause_active():
+                print(f"{description} paused: config pause mid-batch")
                 return True
             index = batch_start + i_in_batch
             if index >= NUM_LEDS:
@@ -2504,6 +2557,9 @@ def process_airports_in_batches(airports, process_function, batch_size=BATCH_SIZ
                 while rem > 0:
                     if sleep_applies_to_displays_now():
                         print(f"{description} paused: entered sleep window during batch delay")
+                        return True
+                    if config_pause_active():
+                        print(f"{description} paused: config pause during batch delay")
                         return True
                     poll_callback()
                     ch = 0.25 if rem >= 0.25 else rem
@@ -2562,8 +2618,12 @@ def process_main_loop_batch(batch_airports, batch_start_index, poll_callback=Non
         if sleep_applies_to_displays_now():
             sleep_hit = True
             break
+        if config_pause_active():
+            break
         if poll_callback is not None:
             poll_callback()
+        if config_pause_active():
+            break
         index = batch_start_index + i_in_batch
         if index >= NUM_LEDS:
             continue
@@ -2589,6 +2649,8 @@ def process_main_loop_batch(batch_airports, batch_start_index, poll_callback=Non
             print(f"No data for {airport}")
         if poll_callback is not None:
             poll_callback()
+        if config_pause_active():
+            break
     return any_data_received, sleep_hit
 
 try:
@@ -2717,6 +2779,7 @@ hr{border:none;border-top:1px solid #16324F;margin:24px 0}
 </style></head><body>
 <h1>MetarMap</h1>
 <div class="nav"><a href="/">Setup</a> <a href="/page/airports">Airports</a> <a href="/page/weather">Weather</a> <a href="/page/help">Help</a> <a href="/page/update">Update</a></div>
+<script>try{fetch('/config-pause',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});}catch(e){}</script>
 <p>Firmware is <strong>not</strong> installed automatically; the device only checks at boot. Use this page when you want to download and install.</p>
 <form method="post" action="/start-update"><button class="btn-update" type="submit">Install update</button></form>
 <p><small>Device will reboot and apply after download.</small></p>
@@ -3394,14 +3457,82 @@ hr{border:none;border-top:1px solid #16324F;margin:24px 0}
                 except Exception as _recv_ex:
                     print("OTA HTTP body read:", _recv_ex)
                 first = req.split("\n")[0].strip() if req else ""
+                # Config pause API — must be checked before "/config" (substring match).
+                if "/config-pause" in first and (
+                    first.startswith("GET ") or first.startswith("POST ")
+                ):
+                    try:
+                        clear = False
+                        seconds = None
+                        if first.startswith("POST "):
+                            bs = req.find("\r\n\r\n") + 4
+                            body_raw = req[bs:].strip() if bs >= 4 else ""
+                            if body_raw:
+                                try:
+                                    body = json.loads(body_raw)
+                                    if isinstance(body, dict):
+                                        if body.get("clear") in (True, 1, "1", "true", "True", "yes"):
+                                            clear = True
+                                        if "seconds" in body:
+                                            seconds = body.get("seconds")
+                                except Exception:
+                                    pass
+                        else:
+                            # GET /config-pause?seconds=120 or ?clear=1
+                            try:
+                                path = first.split(" ")[1] if " " in first else ""
+                                q = path.split("?", 1)[1] if "?" in path else ""
+                                for part in q.split("&"):
+                                    if part.startswith("seconds="):
+                                        seconds = part.split("=", 1)[1]
+                                    elif part.startswith("clear=") and part.split("=", 1)[1] in (
+                                        "1",
+                                        "true",
+                                        "yes",
+                                    ):
+                                        clear = True
+                            except Exception:
+                                pass
+                        if clear:
+                            rem = set_config_pause(clear=True)
+                        elif seconds is not None or first.startswith("POST "):
+                            rem = set_config_pause(seconds=seconds)
+                        else:
+                            # Plain GET: status only (do not arm)
+                            rem = config_pause_remaining()
+                        _cp = {
+                            "ok": True,
+                            "active": rem > 0,
+                            "remaining": rem,
+                            "default_seconds": CONFIG_PAUSE_DEFAULT_S,
+                        }
+                        _cp_b = json.dumps(_cp).encode("utf-8")
+                        conn.send(
+                            b"HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nConnection: close\r\n"
+                        )
+                        conn.send(("Content-Length: %d\r\n\r\n" % len(_cp_b)).encode("ascii"))
+                        conn.sendall(_cp_b)
+                    except Exception as _cp_ex:
+                        print("OTA /config-pause error:", _cp_ex)
+                        try:
+                            conn.send(b"HTTP/1.1 500\r\nConnection: close\r\n\r\n")
+                        except Exception:
+                            pass
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+                    return
                 if first.startswith("GET ") and "/status" in first:
                     try:
+                        touch_config_pause()
                         _st = {
                             "ok": True,
                             "name": "MarksMetarMap",
                             "mode": "run",
                             "version": FIRMWARE_VERSION,
                             "num_leds": int(STRIP_ACTIVE_LEDS),
+                            "config_pause": config_pause_remaining(),
                         }
                         _st_b = json.dumps(_st).encode("utf-8")
                         conn.send(
@@ -3422,6 +3553,7 @@ hr{border:none;border-top:1px solid #16324F;margin:24px 0}
                     return
                 if first.startswith("GET ") and "/config" in first:
                     try:
+                        touch_config_pause()
                         _cfg_body = _http_wifi_config_json_body()
                         _cfg_b = _cfg_body.encode("utf-8")
                         conn.send(
@@ -3639,6 +3771,7 @@ hr{border:none;border-top:1px solid #16324F;margin:24px 0}
                     return
                 if first.startswith("POST ") and "/update-config" in first:
                     try:
+                        touch_config_pause()
                         bs = req.find("\r\n\r\n") + 4
                         body_raw = req[bs:].strip() if bs >= 4 else "{}"
                         updates = json.loads(body_raw) if body_raw else {}
@@ -3706,6 +3839,7 @@ hr{border:none;border-top:1px solid #16324F;margin:24px 0}
                 # Browser pages (same as AP wifi_manager UI) on LAN :8080
                 if first.startswith("GET ") and "/page/airports" in first:
                     try:
+                        touch_config_pause()
                         import wifi_manager as _wm
                         _http_send_html(conn, _wm.get_html_airports_page())
                     except Exception as _pg_e:
@@ -3721,6 +3855,7 @@ hr{border:none;border-top:1px solid #16324F;margin:24px 0}
                     return
                 if first.startswith("GET ") and "/page/weather" in first:
                     try:
+                        touch_config_pause()
                         import wifi_manager as _wm
                         _http_send_html(conn, _wm.get_html_weather_page())
                     except Exception as _pg_e:
@@ -3736,6 +3871,7 @@ hr{border:none;border-top:1px solid #16324F;margin:24px 0}
                     return
                 if first.startswith("GET ") and "/page/help" in first:
                     try:
+                        touch_config_pause()
                         import wifi_manager as _wm
                         _http_send_html(conn, _wm.get_html_help_page())
                     except Exception as _pg_e:
@@ -3751,6 +3887,7 @@ hr{border:none;border-top:1px solid #16324F;margin:24px 0}
                     return
                 if first.startswith("GET ") and "/page/update" in first:
                     try:
+                        touch_config_pause()
                         _http_send_html(conn, UPDATE_PAGE_HTML)
                     except Exception as _pg_e:
                         print("GET /page/update:", _pg_e)
@@ -3761,6 +3898,7 @@ hr{border:none;border-top:1px solid #16324F;margin:24px 0}
                     return
                 if first.startswith("GET ") and "/airports" in first:
                     try:
+                        touch_config_pause()
                         with open(AIRPORT_FILE, "r") as f:
                             content = f.read()
                         b = content.encode("utf-8")
@@ -3778,6 +3916,7 @@ hr{border:none;border-top:1px solid #16324F;margin:24px 0}
                     return
                 if first.startswith("POST ") and "/airports" in first:
                     try:
+                        touch_config_pause()
                         bs = req.find("\r\n\r\n") + 4
                         body = req[bs:].strip() if bs >= 4 else ""
                         lines = [line.strip().upper() for line in body.replace("\r", "").split("\n")]
@@ -3811,6 +3950,7 @@ hr{border:none;border-top:1px solid #16324F;margin:24px 0}
                 if first.startswith("POST ") and "/configure" in first:
                     # Browser Setup form (same as AP) — save display and/or WiFi, then reboot
                     try:
+                        touch_config_pause()
                         import wifi_manager as _wm
                         parsed = _wm.parse_request_data(req)
                         (
@@ -3868,6 +4008,7 @@ hr{border:none;border-top:1px solid #16324F;margin:24px 0}
                 # Default GET / → Setup page (AP-style UI on LAN)
                 if first.startswith("GET "):
                     try:
+                        touch_config_pause()
                         import wifi_manager as _wm
                         _http_send_html(conn, _wm.get_html_setup_page())
                     except Exception as _home_e:
@@ -3891,7 +4032,7 @@ hr{border:none;border-top:1px solid #16324F;margin:24px 0}
             except Exception as e:
                 print("OTA server handle:", e)
         # After HTTP/button poll: hourly queue + run pending history/forecast work
-        if run_pending_history:
+        if run_pending_history and not config_pause_active():
             try:
                 maybe_queue_hourly_history_refresh()
             except Exception as _hr_auto_e:
@@ -3910,7 +4051,11 @@ hr{border:none;border-top:1px solid #16324F;margin:24px 0}
     def sleep_with_ota_poll(total_seconds, run_pending_history=True):
         remaining = float(total_seconds)
         while remaining > 0:
-            service_ota_http_and_button(run_pending_history=run_pending_history)
+            if config_pause_active():
+                return
+            service_ota_http_and_button(
+                run_pending_history=run_pending_history and not config_pause_active()
+            )
             chunk = 0.25 if remaining >= 0.25 else remaining
             time.sleep(chunk)
             remaining -= chunk
@@ -4066,6 +4211,16 @@ hr{border:none;border-top:1px solid #16324F;margin:24px 0}
                 )
             )
         _strip_dark_for_sleep = bool(in_sleep and SLEEP_LEDS)
+        # App/HTML setup: skip METAR/history and poll :8080 tightly so Save/pages feel snappy.
+        if config_pause_active() and not in_sleep:
+            rem = config_pause_remaining()
+            now_p = time.time()
+            if now_p - _config_pause_last_log >= 30:
+                _config_pause_last_log = now_p
+                print("Config pause active: %ds left (HTTP only)" % rem)
+            service_ota_http_and_button(run_pending_history=False)
+            time.sleep(0.05)
+            continue
         # Keep :8080 / button alive during sleep, but do not start history/forecast packs
         service_ota_http_and_button(run_pending_history=not in_sleep)
         if not in_sleep:
@@ -4148,6 +4303,9 @@ hr{border:none;border-top:1px solid #16324F;margin:24px 0}
         total_airports = len(airports)
         num_batches = (total_airports + BATCH_SIZE - 1) // BATCH_SIZE
         for batch_num in range(num_batches):
+            if config_pause_active():
+                print("Main loop batch paused: config pause")
+                break
             service_ota_http_and_button()
             batch_start = batch_num * BATCH_SIZE
             batch_end = min(batch_start + BATCH_SIZE, total_airports)
@@ -4161,10 +4319,16 @@ hr{border:none;border-top:1px solid #16324F;margin:24px 0}
             if batch_sleep_hit:
                 print("Main loop batch paused: entered sleep window")
                 break
+            if config_pause_active():
+                print("Main loop batch paused: config pause")
+                break
             print(f"Free memory after batch: {gc.mem_free()} bytes")
             if batch_num < num_batches - 1:
                 print(f"Waiting {BATCH_DELAY} seconds before next batch...")
                 sleep_with_ota_poll(BATCH_DELAY)
+            if config_pause_active():
+                print("Main loop batch paused: config pause")
+                break
         if sleep_applies_to_displays_now():
             clear_displays_for_sleep()
             displays_sleeping = True

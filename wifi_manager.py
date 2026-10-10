@@ -815,6 +815,7 @@ _PAGE_CSS = (
 )
 
 def _page_nav():
+    # Ping /config-pause so LAN :8080 prioritizes HTTP while you use these pages.
     return (
         '<div class="nav">'
         '<a href="/">Setup</a>'
@@ -823,6 +824,8 @@ def _page_nav():
         '<a href="/page/help">Help</a>'
         '<a href="/page/update">Update</a>'
         "</div>"
+        "<script>try{fetch('/config-pause',{method:'POST',headers:{'Content-Type':'application/json'},"
+        "body:'{}'});}catch(e){}</script>"
     )
 
 # Generate HTML for setup page (same options as app)
