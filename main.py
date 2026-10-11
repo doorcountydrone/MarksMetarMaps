@@ -68,7 +68,7 @@ CYCLE_DELAY = 10  # Seconds between full airport list cycles; loaded from config
 # ===== FIRMWARE VERSION (for OTA update check) =====
 # Device reports this string; GitHub Pages version.json "version" must be higher to offer OTA.
 # After you flash new code, this should match what you published (or stay lower until user updates).
-FIRMWARE_VERSION = "1.1.53"
+FIRMWARE_VERSION = "1.1.55"
 
 # ===== OTA / PLAY BUTTON (GPIO) =====
 # Same pin as force-AP at boot: long hold (3s) during startup = setup AP mode.
@@ -2912,9 +2912,14 @@ try:
             print("OTA bind 8080 failed:", ex)
             return None
 
-    # Defer :8080 bind until TLS METAR works — listen sockets + early HTTPS = ENOMEM cascade.
-    update_socket = None
-    _defer_8080 = True
+    # Bind :8080 as soon as WiFi is up so app/HTML work during METAR startup.
+    # SSL spare (early reserve) is what protects HTTPS — not delaying this socket.
+    update_socket = open_ota_listen_socket()
+    _defer_8080 = False
+    if update_socket is not None:
+        print("OTA update server on port 8080 (listening during METAR startup)")
+    else:
+        print("OTA: will retry binding 8080 every few seconds")
 
     try:
         import network
@@ -2924,7 +2929,7 @@ try:
             print(
                 "MetarMap LAN IP:",
                 _ip,
-                "— :8080 starts after first METAR (TLS heap). Then http://%s:8080"
+                "— http://%s:8080 OTA; GET/POST /config and POST /update-config (same as app Save when URL has no port)"
                 % (_ip,),
             )
     except Exception:
@@ -2933,14 +2938,15 @@ try:
     _ota_rebind_after = 0.0
 
     def _enable_8080_after_metar():
+        """Ensure :8080 is listening (no-op if already bound at startup)."""
         global update_socket, _defer_8080
-        if not _defer_8080:
-            return
         _defer_8080 = False
+        if update_socket is not None:
+            return
         gc.collect()
         update_socket = open_ota_listen_socket()
         if update_socket is not None:
-            print("OTA update server on port 8080 (after first METAR)")
+            print("OTA update server on port 8080 (bound)")
         else:
             print("OTA: will retry binding 8080 every few seconds")
 
@@ -4111,16 +4117,35 @@ try:
                         except Exception:
                             pass
                     return
-                # Default GET / → Setup page (AP-style UI on LAN)
-                if first.startswith("GET "):
+                # GET / or /setup → Setup page (do not fall back to Update — that looked like a bad link)
+                _req_path = "/"
+                try:
+                    _req_path = first.split(" ")[1].split("?")[0]
+                except Exception:
+                    pass
+                if first.startswith("GET ") and (_req_path == "/" or _req_path == "/setup"):
                     try:
                         touch_config_pause()
+                        gc.collect()
                         import wifi_manager as _wm
                         _http_send_html(conn, _wm.get_html_setup_page())
                     except Exception as _home_e:
                         print("GET / setup page:", _home_e)
                         try:
-                            _http_send_html(conn, _get_update_page_html())
+                            _http_send_html(
+                                conn,
+                                "<!DOCTYPE html><html><head><meta charset=\"utf-8\">"
+                                "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
+                                "<title>Setup</title></head>"
+                                "<body style=\"font-family:sans-serif;background:#0B1F3A;color:#F4EBD0;padding:16px\">"
+                                "<h1>Setup</h1>"
+                                "<p>Could not load the full setup page (Pico busy or low memory). "
+                                "Use the Android app <b>WiFi Config</b> tab, or try again in a minute.</p>"
+                                "<p><a href=\"/page/airports\" style=\"color:#E8A838\">Airports</a> · "
+                                "<a href=\"/page/weather\" style=\"color:#E8A838\">Weather</a> · "
+                                "<a href=\"/page/update\" style=\"color:#E8A838\">Update</a></p>"
+                                "</body></html>",
+                            )
                         except Exception:
                             pass
                     try:
@@ -4128,8 +4153,9 @@ try:
                     except Exception:
                         pass
                     return
+                # Unknown path
                 try:
-                    _http_send_html(conn, _get_update_page_html())
+                    conn.send(b"HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nNot found")
                     conn.close()
                 except Exception:
                     pass
