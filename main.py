@@ -13,11 +13,23 @@ import os  # Added missing import
 
 machine.freq(250_000_000)
 
-# Import brightness settings from wifi_manager
+# Do NOT import wifi_manager here — loading it runs NeoPixel init + a huge module and
+# fragments the heap so mbedtls HTTPS gets ENOMEM. Hardcode the one constant we need.
+STARTUP_BRIGHTNESS = 0.2
+
+# Reserve contiguous RAM for TLS BEFORE any other heavy init (see _ssl_gc_prepare).
+_ssl_spare = None
 try:
-    from wifi_manager import STARTUP_BRIGHTNESS
-except ImportError:
-    STARTUP_BRIGHTNESS = 0.2  # Default if not available
+    gc.collect()
+    _ssl_spare = bytearray(40 * 1024)
+except MemoryError:
+    try:
+        _ssl_spare = bytearray(28 * 1024)
+    except MemoryError:
+        try:
+            _ssl_spare = bytearray(16 * 1024)
+        except MemoryError:
+            _ssl_spare = None
 
 try:
     import sans18
@@ -56,7 +68,7 @@ CYCLE_DELAY = 10  # Seconds between full airport list cycles; loaded from config
 # ===== FIRMWARE VERSION (for OTA update check) =====
 # Device reports this string; GitHub Pages version.json "version" must be higher to offer OTA.
 # After you flash new code, this should match what you published (or stay lower until user updates).
-FIRMWARE_VERSION = "1.1.47"
+FIRMWARE_VERSION = "1.1.53"
 
 # ===== OTA / PLAY BUTTON (GPIO) =====
 # Same pin as force-AP at boot: long hold (3s) during startup = setup AP mode.
@@ -422,6 +434,10 @@ if not check_wifi_config() or force_ap_mode:
 print("\n===== MetarMap Starting =====")
 gc.collect()
 print(f"Free memory at start: {gc.mem_free()} bytes")
+if _ssl_spare is not None:
+    print("SSL spare held: %d bytes (released on first HTTPS)" % len(_ssl_spare))
+else:
+    print("SSL spare: not held — HTTPS may hit ENOMEM")
 
 # Set up GPIO pins
 try:
@@ -438,8 +454,8 @@ except Exception as e:
 # NUM_LEDS = pixels clocked on METAR strip GPIO (see wifi_config led_pin; default GPIO 0).
 # STRIP_ACTIVE_LEDS = how many positions (0..active-1) may show airport colors; rest forced black.
 LED_PIN = 0
-NUM_LEDS = 256
-STRIP_ACTIVE_LEDS = 256  # overridden from num_leds in wifi_config.json
+NUM_LEDS = 120  # modest default until wifi_config loads (was 256 — fragments TLS heap)
+STRIP_ACTIVE_LEDS = 120  # overridden from num_leds in wifi_config.json
 
 try:
     led = neopixel.NeoPixel(machine.Pin(LED_PIN), NUM_LEDS)
@@ -588,10 +604,16 @@ try:
                     _p_effective = max(1, min(480, _p_effective))
             if _p_effective is not None:
                 _phys = _p_effective
+            elif DISPLAY_TYPE in ("NONE", "OLED"):
+                # Strip-only / OLED maps: clock airport count only (don't force 256 phantom pixels)
+                _phys = _active
             else:
                 _phys = max(_active, min(480, _DEFAULT_STRIP_PHYS_OMITTED))
         except (TypeError, ValueError):
-            _phys = max(_active, min(480, _DEFAULT_STRIP_PHYS_OMITTED))
+            if DISPLAY_TYPE in ("NONE", "OLED"):
+                _phys = _active
+            else:
+                _phys = max(_active, min(480, _DEFAULT_STRIP_PHYS_OMITTED))
         _phys = max(_active, _phys)
         STRIP_ACTIVE_LEDS = _active
         NUM_LEDS = _phys
@@ -603,6 +625,15 @@ try:
         for i in range(NUM_LEDS):
             led[i] = (0, 0, 0)
         led.write()
+        _phys_note = (
+            _p_effective
+            if _p_effective is not None
+            else (
+                "(unset → num_leds, strip-only)"
+                if DISPLAY_TYPE in ("NONE", "OLED")
+                else "(unset → max(num_leds,256))"
+            )
+        )
         print(
             "METAR strip: GPIO %d, %d WS2812 clocked (physical); airport LEDs = first %d (num_leds). "
             "physical_led_count: %s"
@@ -610,7 +641,7 @@ try:
                 LED_PIN,
                 NUM_LEDS,
                 STRIP_ACTIVE_LEDS,
-                _p_effective if _p_effective is not None else "(unset/<=1/invalid → use max(num_leds,256))",
+                _phys_note,
             )
         )
         if DISPLAY_TYPE == "LED_MATRIX":
@@ -725,12 +756,22 @@ def pause_no_data_watchdog_for_sleep():
     print("No-data watchdog paused for display sleep")
 
 
+_post_first_metar_hook = None  # set during startup; runs once on first successful METAR
+
 def update_data_success():
-    global last_successful_data_time
+    global last_successful_data_time, _post_first_metar_hook
+    was_empty = last_successful_data_time is None
     last_successful_data_time = time.time()
     if no_data_warning_active:
         _clear_no_data_warning()
         print("Data restored - clearing NO DATA warning")
+    if was_empty and _post_first_metar_hook is not None:
+        h = _post_first_metar_hook
+        _post_first_metar_hook = None
+        try:
+            h()
+        except Exception as _h_e:
+            print("post-first-metar hook:", _h_e)
 
 
 def check_data_timeout():
@@ -1596,6 +1637,8 @@ MAX_RETRIES = 1
 # mbedTLS on Pico W often gets this through hotspots with cellular backhaul; treat as transient
 SSL_EOF_MAX_EXTRA_TRIES = 5   # extra connection attempts per "retry" when we see SSL EOF
 SSL_EOF_RETRY_DELAY = 4       # seconds between those attempts (carrier often needs a moment)
+# Contiguous hole to free before TLS — gc.mem_free() can look fine while mbedtls still ENOMEM.
+SSL_HEAP_RESERVE = 40960
 
 def _is_ssl_eof(e):
     if e is None:
@@ -1604,6 +1647,67 @@ def _is_ssl_eof(e):
     if errno is None and getattr(e, "args", None) and e.args:
         errno = e.args[0]
     return errno == -29312 or "MBEDTLS_ERR_SSL" in str(e)
+
+
+def _is_enomem(e):
+    if e is None:
+        return False
+    errno = getattr(e, "errno", None)
+    if errno is None and getattr(e, "args", None) and e.args:
+        errno = e.args[0]
+    if errno == 12:
+        return True
+    s = str(e).upper()
+    return "ENOMEM" in s or "MEMORY" in s
+
+
+def _ssl_gc_prepare(reserve=None):
+    """Release boot-time SSL spare (and any extra hole) so mbedtls can allocate TLS buffers."""
+    global _ssl_spare
+    gc.collect()
+    released = 0
+    if _ssl_spare is not None:
+        released = len(_ssl_spare)
+        del _ssl_spare
+        _ssl_spare = None
+        gc.collect()
+    # If spare was already spent, try punching a fresh hole (may be small when fragmented)
+    sizes = []
+    if reserve is None:
+        sizes = (40960, 32768, 24576, 16384, 8192)
+    else:
+        r = int(reserve)
+        sizes = (r, max(8192, r // 2), 8192)
+    hole = None
+    got = 0
+    for sz in sizes:
+        try:
+            hole = bytearray(sz)
+            got = sz
+            break
+        except MemoryError:
+            hole = None
+            gc.collect()
+    if hole is not None:
+        del hole
+    gc.collect()
+    return released if released else got
+
+
+def _ssl_spare_reclaim():
+    """Try to hold a contiguous block again between HTTPS calls."""
+    global _ssl_spare
+    if _ssl_spare is not None:
+        return len(_ssl_spare)
+    gc.collect()
+    for sz in (40 * 1024, 28 * 1024, 16 * 1024):
+        try:
+            _ssl_spare = bytearray(sz)
+            return sz
+        except MemoryError:
+            _ssl_spare = None
+            gc.collect()
+    return 0
 
 def _metar_obs_time(raw_line):
     """Parse observation time from METAR (DDHHMMZ). Returns (day, minutes_since_midnight) or (0, 0) if unparseable."""
@@ -1694,9 +1798,9 @@ def get_metar_data_with_retry(airport, quick=False):
     while retries < MAX_RETRIES:
         last_error = None
         ssl_retries = 0
-        while True:  # inner loop: extra quick retries on SSL EOF (common on mobile hotspots)
+        while True:  # inner loop: extra quick retries on SSL EOF / ENOMEM
             try:
-                gc.collect()
+                _ssl_gc_prepare()
                 url_raw = "https://aviationweather.gov/api/data/metar?ids={}&hours=1&format=raw".format(airport)
                 response = urequests.get(url_raw, timeout=10)
                 data = response.text
@@ -1712,6 +1816,7 @@ def get_metar_data_with_retry(airport, quick=False):
                     flight_category = _parse_flight_category_from_raw(raw_text)
                     del data
                     gc.collect()
+                    _ssl_spare_reclaim()
                     return flight_category, raw_text
                 del data
                 gc.collect()
@@ -1724,9 +1829,18 @@ def get_metar_data_with_retry(airport, quick=False):
             except Exception as e:
                 last_error = e
                 print(f"Raw fetch failed for {airport}: {e}")
+            # Skip XML fallback after ENOMEM — XML is larger and usually fails the same way.
+            if last_error and _is_enomem(last_error):
+                if ssl_retries < 2:
+                    ssl_retries += 1
+                    print("ENOMEM on SSL for %s — heap prep retry %d" % (airport, ssl_retries))
+                    _ssl_gc_prepare(SSL_HEAP_RESERVE)
+                    time.sleep_ms(150)
+                    continue
+                break
             # Fallback to XML if raw failed or no line found
             try:
-                gc.collect()
+                _ssl_gc_prepare()
                 url_xml = "https://aviationweather.gov/api/data/metar?ids={}&hours=1&format=xml".format(airport)
                 response = urequests.get(url_xml, timeout=10)
                 data = response.text
@@ -1741,6 +1855,7 @@ def get_metar_data_with_retry(airport, quick=False):
                     flight_category = data[fc_start:fc_end]
                     del data
                     gc.collect()
+                    _ssl_spare_reclaim()
                     return flight_category, raw_text
                 del data
                 gc.collect()
@@ -1754,6 +1869,12 @@ def get_metar_data_with_retry(airport, quick=False):
                 last_error = e
                 print(f"Error retrieving data for {airport}: {e}")
             # Both raw and XML failed
+            if last_error and _is_enomem(last_error) and ssl_retries < 2:
+                ssl_retries += 1
+                print("ENOMEM on SSL for %s — heap prep retry %d" % (airport, ssl_retries))
+                _ssl_gc_prepare(SSL_HEAP_RESERVE)
+                time.sleep_ms(150)
+                continue
             if (
                 not quick
                 and last_error
@@ -1763,7 +1884,7 @@ def get_metar_data_with_retry(airport, quick=False):
                 ssl_retries += 1
                 print("SSL closed (hotspot/cellular), retry {} in {}s...".format(ssl_retries, SSL_EOF_RETRY_DELAY))
                 time.sleep(SSL_EOF_RETRY_DELAY)
-                gc.collect()
+                _ssl_gc_prepare()
                 continue
             break
         retries += 1
@@ -1785,12 +1906,18 @@ def fetch_all_metars_once(airports):
     n = min(len(airports), 480)
     if n == 0:
         return []
+    # Large maps: smaller chunks so the TLS response fits after NeoPixel + modules.
+    chunk_sz = 8 if n > 60 else BULK_CHUNK_SIZE
+    _ssl_gc_prepare(SSL_HEAP_RESERVE)
+    if gc.mem_free() < 120000:
+        print("Bulk METAR skipped: low free heap (%d)" % gc.mem_free())
+        return None
     results = [(None, None)] * n
     chunk_start = 0
     total_got = 0
     total_requested = 0
     while chunk_start < n:
-        chunk_end = min(chunk_start + BULK_CHUNK_SIZE, n)
+        chunk_end = min(chunk_start + chunk_sz, n)
         chunk_airports = [airports[i].strip() for i in range(chunk_start, chunk_end) if airports[i] and airports[i].strip()]
         total_requested += len(chunk_airports)
         if not chunk_airports:
@@ -1800,7 +1927,7 @@ def fetch_all_metars_once(airports):
         chunk_ok = False
         for ssl_attempt in range(SSL_EOF_MAX_EXTRA_TRIES + 1):  # extra tries on SSL EOF (hotspot/cellular)
             try:
-                gc.collect()
+                _ssl_gc_prepare(SSL_HEAP_RESERVE)
                 url = "https://aviationweather.gov/api/data/metar?ids={}&hours=1&format=raw".format(ids)
                 response = urequests.get(url, timeout=12)
                 data = response.text
@@ -1834,6 +1961,10 @@ def fetch_all_metars_once(airports):
             except Exception as e:
                 print("Bulk METAR chunk failed ({}–{}): {}".format(chunk_start, chunk_end, e))
                 gc.collect()
+                if _is_enomem(e):
+                    print("Bulk METAR aborted (ENOMEM) — falling back to per-airport fetch")
+                    _ssl_gc_prepare(SSL_HEAP_RESERVE)
+                    return None
                 if _is_ssl_eof(e) and ssl_attempt < SSL_EOF_MAX_EXTRA_TRIES:
                     print("SSL closed (hotspot/cellular), chunk retry {} in {}s...".format(ssl_attempt + 1, SSL_EOF_RETRY_DELAY))
                     time.sleep(SSL_EOF_RETRY_DELAY)
@@ -2654,62 +2785,8 @@ def process_main_loop_batch(batch_airports, batch_start_index, poll_callback=Non
     return any_data_received, sleep_hit
 
 try:
-    # OTA: check before long METAR batches so serial shows result within seconds of WiFi
-    print("OTA: checking GitHub Pages for newer firmware...")
-    try:
-        import updater
-        gc.collect()
-        has_update, version_info = updater.check_for_new_version(FIRMWARE_VERSION)
-        if has_update and version_info:
-            update_available = True
-            update_info = version_info
-            print("OTA: New version available", version_info.get("version"))
-            msg_color = apply_auto_brightness((255, 140, 0))
-            if led_matrix is not None and DISPLAY_TYPE == "LED_MATRIX":
-                scroll_single_text_ultra_smooth("NEW UPDATE AVAILABLE PRESS BUTTON TO INSTALL", msg_color)
-            elif DISPLAY_TYPE == "OLED" and oled is not None:
-                try:
-                    oled.fill(0)
-                    if fonts_available:
-                        wu = writer.Writer(oled, sans18)
-                        wu.set_textpos(0, 0)
-                        wu.printstring("UPDATE")
-                        wu.set_textpos(0, 20)
-                        wu.printstring("AVAILABLE")
-                        wu.set_textpos(0, 40)
-                        wu.printstring("BTN / :8080")
-                    else:
-                        oled.text("UPDATE AVAIL", 0, 0, 1)
-                        oled.text("BTN or :8080", 0, 16, 1)
-                    oled.show()
-                    print("OTA: OLED — update available (6s)")
-                    time.sleep(6)
-                    oled.fill(0)
-                    oled.show()
-                except Exception as ex:
-                    print("OTA OLED banner error:", ex)
-            elif DISPLAY_TYPE == "NONE":
-                # Strip-only: same amber as matrix scroll — full strip 10s so update is visible
-                try:
-                    for i in range(NUM_LEDS):
-                        logical_colors[i] = (255, 140, 0)
-                        led[i] = msg_color
-                    led.write()
-                    print("OTA: strip-only — update color on all LEDs 10s (install: button or :8080)")
-                    time.sleep(10)
-                    for i in range(NUM_LEDS):
-                        logical_colors[i] = (0, 0, 0)
-                        led[i] = (0, 0, 0)
-                    led.write()
-                except Exception as ex:
-                    print("OTA strip banner error:", ex)
-    except SyntaxError as e:
-        print("OTA check error: invalid syntax in updater.py — re-copy pico/updater.py to the Pico.")
-        print(e)
-    except Exception as e:
-        print("OTA check error:", e)
-    gc.collect()
-
+    # Defer GitHub OTA HTTPS until after first METAR pass — early TLS often hits ENOMEM
+    # when the heap is fragmented (NeoPixel + modules), and failed OTA makes METAR worse.
     # OTA HTTP on :8080 — bind NOW so browser/app work during long first/second passes (not only after).
     update_button = None
     if UPDATE_BUTTON_PIN >= 0:
@@ -2728,25 +2805,37 @@ try:
     fc_hist = None
     fc_fcst = None
     history_trigger = None
-    # Use module-level _history_busy only (do not assign a local here — it shadows busy checks)
-    try:
-        import fc_history as _fc_history_mod
-        _hist_n = max(8, min(130, len(airports) if airports else 32))
-        fc_hist = _fc_history_mod.FlightCategoryHistory(max_airports=_hist_n)
-        fc_hist.loops = HISTORY_REPLAY_LOOPS
-        print("fc_history: ready (max_airports=%d, %d bytes buf)" % (_hist_n, _hist_n * 6))
-    except Exception as _fh_e:
-        print("fc_history import failed:", _fh_e)
-        fc_hist = None
-    try:
-        import fc_forecast as _fc_forecast_mod
-        _fcst_n = max(8, min(130, len(airports) if airports else 32))
-        fc_fcst = _fc_forecast_mod.FlightCategoryForecast(max_airports=_fcst_n)
-        fc_fcst.loops = HISTORY_REPLAY_LOOPS
-        print("fc_forecast: ready (max_airports=%d, %d bytes buf)" % (_fcst_n, _fcst_n * 6))
-    except Exception as _ff_e:
-        print("fc_forecast import failed:", _ff_e)
-        fc_fcst = None
+    # Defer fc_history / fc_forecast imports until after first TLS METAR succeeds.
+    # Loading both modules before HTTPS often leaves no contiguous RAM for mbedtls (ENOMEM).
+    _fc_packs_loaded = False
+
+    def _load_fc_packs():
+        global fc_hist, fc_fcst, _fc_packs_loaded
+        if _fc_packs_loaded:
+            return
+        _fc_packs_loaded = True
+        gc.collect()
+        try:
+            import fc_history as _fc_history_mod
+            _hist_n = max(8, min(130, len(airports) if airports else 32))
+            fc_hist = _fc_history_mod.FlightCategoryHistory(max_airports=_hist_n)
+            fc_hist.loops = HISTORY_REPLAY_LOOPS
+            print("fc_history: ready (max_airports=%d, %d bytes buf)" % (_hist_n, _hist_n * 6))
+        except Exception as _fh_e:
+            print("fc_history import failed:", _fh_e)
+            fc_hist = None
+        gc.collect()
+        try:
+            import fc_forecast as _fc_forecast_mod
+            _fcst_n = max(8, min(130, len(airports) if airports else 32))
+            fc_fcst = _fc_forecast_mod.FlightCategoryForecast(max_airports=_fcst_n)
+            fc_fcst.loops = HISTORY_REPLAY_LOOPS
+            print("fc_forecast: ready (max_airports=%d, %d bytes buf)" % (_fcst_n, _fcst_n * 6))
+        except Exception as _ff_e:
+            print("fc_forecast import failed:", _ff_e)
+            fc_fcst = None
+        gc.collect()
+
     if HISTORY_TRIGGER_PIN >= 0 and HISTORY_TRIGGER_PIN != UPDATE_BUTTON_PIN:
         try:
             # Active-high PIR (SR602): pull-down idle low; active-low switch: pull-up idle high
@@ -2761,37 +2850,42 @@ try:
             print("History trigger GPIO init failed:", _ht_e)
             history_trigger = None
 
-    UPDATE_PAGE_HTML = """<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>MetarMap Update</title>
-<style>
-body{font-family:Arial,sans-serif;background:#0B1F3A;color:#F4EBD0;max-width:480px;margin:0 auto;padding:16px;line-height:1.45}
-h1{font-size:1.3rem;color:#E8A838;margin:0 0 12px}
-h2{font-size:1.05rem;color:#E8A838;margin:24px 0 8px}
-.nav{display:flex;flex-wrap:wrap;gap:10px;margin:0 0 16px;padding-bottom:12px;border-bottom:1px solid #16324F}
-.nav a{color:#F4EBD0;text-decoration:none;font-size:.9rem}
-p{margin:8px 0;color:#F4EBD0}
-button{display:block;width:100%;padding:12px 16px;margin:8px 0;font-size:16px;border:none;border-radius:8px;cursor:pointer;font-weight:bold}
-.btn-update{background:#E8A838;color:#0B1F3A}
-.btn-play{background:#198754;color:#fff}
-.btn-forecast{background:#0dcaf0;color:#0B1F3A}
-.btn-refresh{background:#16324F;color:#F4EBD0;border:1px solid #E8A838}
-small{color:#A8B5C4}
-hr{border:none;border-top:1px solid #16324F;margin:24px 0}
-</style></head><body>
-<h1>MetarMap</h1>
-<div class="nav"><a href="/">Setup</a> <a href="/page/airports">Airports</a> <a href="/page/weather">Weather</a> <a href="/page/help">Help</a> <a href="/page/update">Update</a></div>
-<script>try{fetch('/config-pause',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});}catch(e){}</script>
-<p>Firmware is <strong>not</strong> installed automatically; the device only checks at boot. Use this page when you want to download and install.</p>
-<form method="post" action="/start-update"><button class="btn-update" type="submit">Install update</button></form>
-<p><small>Device will reboot and apply after download.</small></p>
-<hr>
-<h2>24-hour flight categories</h2>
-<p>Play the packed history on the LED strip, or download a fresh pack first.</p>
-<form method="post" action="/history-play"><button class="btn-play" type="submit">Play past 24h</button></form>
-<form method="post" action="/history-refresh"><button class="btn-refresh" type="submit">Refresh history</button></form>
-<form method="post" action="/forecast-play"><button class="btn-forecast" type="submit">Play forecast 24h</button></form>
-<form method="post" action="/forecast-refresh"><button class="btn-refresh" type="submit">Refresh forecast</button></form>
-<p><small>Past = METARs. Forecast = TAFs (nearest TAF station if an airport has none). Button: tap = OTA, hold ~0.5s = past, hold ~1.5s = forecast. App sets replay count.</small></p>
-</body></html>"""
+    # Lazy HTML — keep the big page string out of the heap until a browser asks.
+    _update_page_html_cache = None
+
+    def _get_update_page_html():
+        global _update_page_html_cache
+        if _update_page_html_cache is not None:
+            return _update_page_html_cache
+        _update_page_html_cache = (
+            "<!DOCTYPE html><html><head><meta charset=\"utf-8\">"
+            "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
+            "<title>MetarMap Update</title>"
+            "<style>body{font-family:Arial,sans-serif;background:#0B1F3A;color:#F4EBD0;max-width:480px;"
+            "margin:0 auto;padding:16px;line-height:1.45}h1{font-size:1.3rem;color:#E8A838}"
+            "button{display:block;width:100%;padding:12px;margin:8px 0;font-size:16px;border:none;"
+            "border-radius:8px;cursor:pointer;font-weight:bold}.btn-update{background:#E8A838;color:#0B1F3A}"
+            ".btn-play{background:#198754;color:#fff}.btn-forecast{background:#0dcaf0;color:#0B1F3A}"
+            ".btn-refresh{background:#16324F;color:#F4EBD0;border:1px solid #E8A838}</style></head><body>"
+            "<h1>MetarMap</h1>"
+            "<div><a href=\"/\">Setup</a> | <a href=\"/page/airports\">Airports</a> | "
+            "<a href=\"/page/weather\">Weather</a> | <a href=\"/page/help\">Help</a> | "
+            "<a href=\"/page/update\">Update</a></div>"
+            "<script>try{fetch('/config-pause',{method:'POST',headers:{'Content-Type':'application/json'},"
+            "body:'{}'});}catch(e){}</script>"
+            "<p>Firmware is not installed automatically. Use Install when you want an update.</p>"
+            "<form method=\"post\" action=\"/start-update\"><button class=\"btn-update\" type=\"submit\">"
+            "Install update</button></form>"
+            "<form method=\"post\" action=\"/history-play\"><button class=\"btn-play\" type=\"submit\">"
+            "Play past 24h</button></form>"
+            "<form method=\"post\" action=\"/history-refresh\"><button class=\"btn-refresh\" type=\"submit\">"
+            "Refresh history</button></form>"
+            "<form method=\"post\" action=\"/forecast-play\"><button class=\"btn-forecast\" type=\"submit\">"
+            "Play forecast 24h</button></form>"
+            "<form method=\"post\" action=\"/forecast-refresh\"><button class=\"btn-refresh\" type=\"submit\">"
+            "Refresh forecast</button></form></body></html>"
+        )
+        return _update_page_html_cache
 
     def _http_send_html(conn, html_str):
         b = html_str.encode("utf-8") if isinstance(html_str, str) else html_str
@@ -2818,11 +2912,9 @@ hr{border:none;border-top:1px solid #16324F;margin:24px 0}
             print("OTA bind 8080 failed:", ex)
             return None
 
-    update_socket = open_ota_listen_socket()
-    if update_socket is not None:
-        print("OTA update server on port 8080 (listening during METAR startup)")
-    else:
-        print("OTA: will retry binding 8080 every few seconds")
+    # Defer :8080 bind until TLS METAR works — listen sockets + early HTTPS = ENOMEM cascade.
+    update_socket = None
+    _defer_8080 = True
 
     try:
         import network
@@ -2832,13 +2924,25 @@ hr{border:none;border-top:1px solid #16324F;margin:24px 0}
             print(
                 "MetarMap LAN IP:",
                 _ip,
-                "— http://%s:8080 OTA; GET/POST /config and POST /update-config (same as app Save when URL has no port)"
+                "— :8080 starts after first METAR (TLS heap). Then http://%s:8080"
                 % (_ip,),
             )
     except Exception:
         pass
 
     _ota_rebind_after = 0.0
+
+    def _enable_8080_after_metar():
+        global update_socket, _defer_8080
+        if not _defer_8080:
+            return
+        _defer_8080 = False
+        gc.collect()
+        update_socket = open_ota_listen_socket()
+        if update_socket is not None:
+            print("OTA update server on port 8080 (after first METAR)")
+        else:
+            print("OTA: will retry binding 8080 every few seconds")
 
     def _http_wifi_config_json_body():
         """Same JSON shape as wifi_manager GET /config — used on :8080 while main.py runs (no server on port 80)."""
@@ -3200,7 +3304,9 @@ hr{border:none;border-top:1px solid #16324F;margin:24px 0}
             update_data_success()
             _show_fetch_banner(label)
             try:
-                ok = pack.fetch_and_pack(_airports_for_pack(), _history_fetch_poll, chunk_size=5)
+                _ssl_gc_prepare(SSL_HEAP_RESERVE)
+                # 24h raw METAR payloads are large — 8–10 ids/chunk; adaptive shrink in fc_history.
+                ok = pack.fetch_and_pack(_airports_for_pack(), _history_fetch_poll, chunk_size=8)
                 # If 24h API pack failed, seed from live strip colors so PAST can still play
                 if (not ok) and (pack is fc_hist) and hasattr(pack, "seed_flat"):
                     try:
@@ -3422,7 +3528,7 @@ hr{border:none;border-top:1px solid #16324F;margin:24px 0}
                             print("OTA button: no update available (device already current or version.json unreachable)")
                 except Exception as e:
                     print("OTA install error:", e)
-        if update_socket is None:
+        if update_socket is None and not _defer_8080:
             tnow = time.time()
             if tnow >= _ota_rebind_after:
                 _ota_rebind_after = tnow + 5.0
@@ -3888,7 +3994,7 @@ hr{border:none;border-top:1px solid #16324F;margin:24px 0}
                 if first.startswith("GET ") and "/page/update" in first:
                     try:
                         touch_config_pause()
-                        _http_send_html(conn, UPDATE_PAGE_HTML)
+                        _http_send_html(conn, _get_update_page_html())
                     except Exception as _pg_e:
                         print("GET /page/update:", _pg_e)
                     try:
@@ -4014,7 +4120,7 @@ hr{border:none;border-top:1px solid #16324F;margin:24px 0}
                     except Exception as _home_e:
                         print("GET / setup page:", _home_e)
                         try:
-                            _http_send_html(conn, UPDATE_PAGE_HTML)
+                            _http_send_html(conn, _get_update_page_html())
                         except Exception:
                             pass
                     try:
@@ -4023,7 +4129,7 @@ hr{border:none;border-top:1px solid #16324F;margin:24px 0}
                         pass
                     return
                 try:
-                    _http_send_html(conn, UPDATE_PAGE_HTML)
+                    _http_send_html(conn, _get_update_page_html())
                     conn.close()
                 except Exception:
                     pass
@@ -4062,8 +4168,33 @@ hr{border:none;border-top:1px solid #16324F;margin:24px 0}
 
     current_ldr_brightness = map_ldr_to_brightness(read_ldr_value(), MIN_BRIGHTNESS, MAX_BRIGHTNESS)
     last_ldr_refresh_time = time.time()
+    _post_first_metar_hook = _enable_8080_after_metar
+    hole_n = _ssl_gc_prepare()
+    print("SSL heap prep: hole=%d free=%d" % (hole_n, gc.mem_free()))
+    # One airport first — prove TLS before bulk / loading history modules
+    _probe_ap = None
+    for _a in airports:
+        if _a and str(_a).strip():
+            _probe_ap = str(_a).strip().upper()
+            break
+    ssl_ok = False
+    if _probe_ap:
+        print("SSL: probing METAR for", _probe_ap)
+        _pfc, _praw = get_metar_data_with_retry(_probe_ap, quick=False)
+        if _pfc is not None:
+            ssl_ok = True
+            update_data_success()
+            if not MATRIX_ONLY:
+                try:
+                    set_led_color(led, _pfc, 0, MIN_BRIGHTNESS, MAX_BRIGHTNESS)
+                    led.write()
+                except Exception:
+                    pass
+            print("SSL: probe OK (free=%d)" % gc.mem_free())
+        else:
+            print("SSL: probe failed — skip bulk, try first-pass singles")
     bulk_ok = False
-    if not MATRIX_ONLY:
+    if not MATRIX_ONLY and ssl_ok:
         bulk_results = fetch_all_metars_once(airports)
         if bulk_results:
             n = min(len(airports), len(bulk_results), STRIP_ACTIVE_LEDS)
@@ -4114,6 +4245,67 @@ hr{border:none;border-top:1px solid #16324F;margin:24px 0}
     if startup_sleep_hit:
         print("Startup METAR passes paused for sleep window; entering scheduler loop")
     clear_unused_strip_leds(len(airports))
+    _enable_8080_after_metar()
+    _load_fc_packs()
+
+    # OTA version check after METARs have used TLS successfully (avoids startup ENOMEM cascade)
+    print("OTA: checking GitHub for newer firmware...")
+    try:
+        _ssl_gc_prepare(SSL_HEAP_RESERVE)
+        import updater
+        gc.collect()
+        has_update, version_info = updater.check_for_new_version(FIRMWARE_VERSION)
+        if has_update and version_info:
+            update_available = True
+            update_info = version_info
+            print("OTA: New version available", version_info.get("version"))
+            msg_color = apply_auto_brightness((255, 140, 0))
+            if led_matrix is not None and DISPLAY_TYPE == "LED_MATRIX":
+                scroll_single_text_ultra_smooth("NEW UPDATE AVAILABLE PRESS BUTTON TO INSTALL", msg_color)
+            elif DISPLAY_TYPE == "OLED" and oled is not None:
+                try:
+                    oled.fill(0)
+                    if fonts_available:
+                        wu = writer.Writer(oled, sans18)
+                        wu.set_textpos(0, 0)
+                        wu.printstring("UPDATE")
+                        wu.set_textpos(0, 20)
+                        wu.printstring("AVAILABLE")
+                        wu.set_textpos(0, 40)
+                        wu.printstring("BTN / :8080")
+                    else:
+                        oled.text("UPDATE AVAIL", 0, 0, 1)
+                        oled.text("BTN or :8080", 0, 16, 1)
+                    oled.show()
+                    print("OTA: OLED — update available (6s)")
+                    time.sleep(6)
+                    oled.fill(0)
+                    oled.show()
+                except Exception as ex:
+                    print("OTA OLED banner error:", ex)
+            elif DISPLAY_TYPE == "NONE":
+                try:
+                    for i in range(NUM_LEDS):
+                        logical_colors[i] = (255, 140, 0)
+                        led[i] = msg_color
+                    led.write()
+                    print("OTA: strip-only — update color on all LEDs 10s (install: button or :8080)")
+                    time.sleep(10)
+                    for i in range(NUM_LEDS):
+                        logical_colors[i] = (0, 0, 0)
+                        led[i] = (0, 0, 0)
+                    led.write()
+                except Exception as ex:
+                    print("OTA strip banner error:", ex)
+        else:
+            print("OTA: device current (or version.json unreachable)")
+    except SyntaxError as e:
+        print("OTA check error: invalid syntax in updater.py — re-copy pico/updater.py to the Pico.")
+        print(e)
+    except Exception as e:
+        print("OTA check error:", e)
+    gc.collect()
+    _ssl_gc_prepare(SSL_HEAP_RESERVE)
 
     # Download+pack 24h history/forecast after METAR passes — but do not block sleep.
     # If startup hit the sleep window, only queue; main loop runs the fetch after wake.

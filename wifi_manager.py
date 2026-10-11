@@ -183,7 +183,8 @@ def init_strip_leds_from_wifi_config():
         print("Error initializing strip LEDs:", e)
 
 
-init_strip_leds_from_wifi_config()
+# Do not init NeoPixel at import time — main.py only needs constants; strip init
+# runs when start() enters AP/setup (avoids fragmenting TLS heap on normal boot).
 
 def set_leds(r, g, b, brightness_override=None):
     if not leds_initialized or led is None:

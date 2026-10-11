@@ -287,18 +287,33 @@ class FlightCategoryHistory:
             _set_bits(self.buf, airport_idx, h, slots[h])
         return filled
 
-    def _fetch_ids(self, ids_csv, hours, timeout_s):
+    def _fetch_ids(self, ids_csv, hours, timeout_s, max_attempts=3):
         """Return raw METAR text for one or more comma-separated ICAOs, or ''."""
         url = (
             "https://aviationweather.gov/api/data/metar?ids={}&hours={}&format=raw"
             .format(ids_csv, int(hours))
         )
         last_err = ""
-        for attempt in range(3):
+        n_ids = ids_csv.count(",") + 1 if ids_csv else 0
+        # Multi-id 24h bodies are huge — fail fast so we can shrink the chunk.
+        tries = max(1, min(int(max_attempts), 2 if n_ids > 1 else 3))
+        label = ids_csv if len(ids_csv) <= 48 else (ids_csv[:45] + "...")
+        for attempt in range(tries):
+            gc.collect()
+            # Punch a contiguous hole for mbedtls (same idea as main._ssl_gc_prepare)
+            try:
+                _hole = bytearray(20480)
+                del _hole
+            except MemoryError:
+                try:
+                    _hole = bytearray(8192)
+                    del _hole
+                except MemoryError:
+                    pass
             gc.collect()
             resp = None
             try:
-                print("fc_history: %s hours=%d try %d" % (ids_csv, hours, attempt + 1))
+                print("fc_history: %s hours=%d try %d" % (label, hours, attempt + 1))
                 resp = urequests.get(url, timeout=timeout_s)
                 raw = resp.text or ""
                 try:
@@ -308,21 +323,27 @@ class FlightCategoryHistory:
                 resp = None
                 if not _response_looks_like_metar(raw):
                     last_err = "bad body (%d bytes)" % len(raw)
-                    print("fc_history: %s %s" % (ids_csv, last_err))
+                    print("fc_history: %s %s" % (label, last_err))
                     gc.collect()
-                    time.sleep_ms(150)
+                    time.sleep_ms(100)
                     continue
                 return raw
             except Exception as e:
                 last_err = str(e)
-                print("fc_history fetch %s: %s" % (ids_csv, e))
+                print("fc_history fetch %s: %s" % (label, e))
                 if resp is not None:
                     try:
                         resp.close()
                     except Exception:
                         pass
                 gc.collect()
-                time.sleep_ms(250)
+                # Memory/SSL failures on big chunks won't clear by retrying same size
+                el = last_err.lower()
+                if n_ids > 1 and (
+                    "memory" in el or "ENOMEM" in last_err or "eof" in el or "timeout" in el
+                ):
+                    break
+                time.sleep_ms(150)
         self.last_error = last_err or "fetch failed"
         return ""
 
@@ -398,10 +419,10 @@ class FlightCategoryHistory:
         gc.collect()
         return ok
 
-    def fetch_and_pack(self, airports, poll_callback=None, limit=None, chunk_size=5):
+    def fetch_and_pack(self, airports, poll_callback=None, limit=None, chunk_size=8):
         """
-        Download hours=24 METARs in small multi-id chunks (default 5); pack into self.buf.
-        Falls back to one airport per call if a chunk fails (Pico RAM-safe).
+        Download hours=24 METARs in multi-id chunks (default 8); pack into self.buf.
+        Shrinks chunk size on failure (20-id×24h often OOMs); singles only as last resort.
         airports: list of ICAO strings (blank = skip / all VFR zeros).
         """
         self.state = "fetching"
@@ -432,10 +453,11 @@ class FlightCategoryHistory:
             rtc_mins = 0
 
         try:
-            cs = int(chunk_size) if chunk_size is not None else 5
+            cs = int(chunk_size) if chunk_size is not None else 8
         except (TypeError, ValueError):
-            cs = 5
-        cs = max(1, min(8, cs))
+            cs = 8
+        # 24h raw text ≈ dozens of KB per multi-id call — keep ceiling modest.
+        cs = max(1, min(10, cs))
 
         # Build work list of (idx, ICAO); blank slots -> VFR zeros
         work = []
@@ -449,20 +471,25 @@ class FlightCategoryHistory:
 
         ok_count = 0
         fail_count = 0
-        print("fc_history: fetching %d airports chunk_size=%d" % (len(work), cs))
+        print("fc_history: fetching %d airports chunk_size=%d (adaptive)" % (len(work), cs))
         try:
             i = 0
+            cs_cur = cs
             while i < len(work):
                 if poll_callback:
                     try:
                         poll_callback()
                     except Exception:
                         pass
-                chunk = work[i : i + cs]
+                chunk = work[i : i + cs_cur]
                 ids_csv = ",".join(apu for _, apu in chunk)
-                raw = self._fetch_ids(ids_csv, 24, 18 if len(chunk) > 1 else 15)
+                to = 16 if len(chunk) > 1 else 14
+                raw = self._fetch_ids(ids_csv, 24, to, max_attempts=2 if len(chunk) > 1 else 3)
                 if not raw:
-                    raw = self._fetch_ids(ids_csv, 12, 14 if len(chunk) > 1 else 12)
+                    raw = self._fetch_ids(
+                        ids_csv, 12, 14 if len(chunk) > 1 else 12,
+                        max_attempts=2 if len(chunk) > 1 else 3,
+                    )
 
                 if raw and len(chunk) > 1:
                     wanted = [apu for _, apu in chunk]
@@ -490,7 +517,11 @@ class FlightCategoryHistory:
                             ok_count += 1
                         else:
                             fail_count += 1
-                        time.sleep_ms(50)
+                        time.sleep_ms(40)
+                    i += len(chunk)
+                    if cs_cur < cs:
+                        cs_cur = min(cs, cs_cur + 2)
+                    time.sleep_ms(50)
                 elif raw and len(chunk) == 1:
                     idx, apu = chunk[0]
                     by_st = self._split_raw_by_station(raw, [apu])
@@ -505,24 +536,26 @@ class FlightCategoryHistory:
                             _set_bits(self.buf, idx, h, 0)
                     del by_st
                     gc.collect()
+                    i += 1
+                    time.sleep_ms(40)
+                elif cs_cur > 1:
+                    # Don't burn minutes on singles — shrink and retry this window.
+                    new_cs = max(1, cs_cur // 2)
+                    print(
+                        "fc_history: chunk of %d failed, retry with %d (at %d/%d)"
+                        % (cs_cur, new_cs, i, len(work))
+                    )
+                    cs_cur = new_cs
+                    gc.collect()
+                    time.sleep_ms(80)
                 else:
-                    # Chunk failed entirely — fall back one-at-a-time
-                    if len(chunk) > 1:
-                        print("fc_history: chunk failed, fallback singles: %s" % ids_csv)
-                    for idx, apu in chunk:
-                        if poll_callback:
-                            try:
-                                poll_callback()
-                            except Exception:
-                                pass
-                        if self._fetch_and_pack_one(idx, apu, rtc_day, rtc_mins):
-                            ok_count += 1
-                        else:
-                            fail_count += 1
-                        time.sleep_ms(50)
-
-                i += cs
-                time.sleep_ms(80)
+                    idx, apu = chunk[0]
+                    print("fc_history: single failed: %s" % apu)
+                    fail_count += 1
+                    for h in range(HOURS):
+                        _set_bits(self.buf, idx, h, 0)
+                    i += 1
+                    time.sleep_ms(40)
 
             try:
                 self.fetched_at = int(time.time())
