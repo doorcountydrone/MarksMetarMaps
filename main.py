@@ -88,7 +88,7 @@ UPDATE_BUTTON_HINT_ARM_MS = 180  # delay before first hold hint (avoids flash on
 # SR602 on this GPIO: active-HIGH on motion -> play PAST 24h pack only.
 # Keep separate from UPDATE_BUTTON_PIN (hold: tap=OTA, mid=PAST, long=FUTURE).
 # Set to -1 to disable (app/HTTP / hold-button only).
-HISTORY_TRIGGER_PIN = 14
+HISTORY_TRIGGER_PIN = 20
 HISTORY_TRIGGER_ACTIVE_HIGH = True  # SR602 OUT high on detect; False = active-low to GND
 HISTORY_TRIGGER_COOLDOWN_MS = 8000  # ignore re-fires while PIR stays high / after queue
 # Auto-download 24h history after startup METAR passes, then again on this interval (seconds). 0 = startup only.
